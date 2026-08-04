@@ -208,8 +208,18 @@ _known_resources: set[tuple[int, int]] = set()
 # Obstacles are static terrain, so persisting them is safe and makes pathing
 # near-optimal (user asked: persist the terrain of known cells).
 _known_obstacles: set[tuple[int, int]] = set()
+# Persistent enemy-Core positions: a Core seen once is remembered forever so a
+# hunt (or a post-restart re-acquisition) knows where the rival lives. Enemy
+# Units come and go, but a Core is a durable target worth keeping.
+_known_enemy_cores: set[tuple[int, int]] = set()
+# Persistent explored-region set: every cell a friendly vision source has
+# covered (Manhattan within radius). Lets the tactic (a) avoid re-sweeping
+# ground it has already lit, and (b) know which areas to periodically revisit
+# for respawned resources (community Player D pattern). Large but bounded by
+# the explored map; saved with the other state on change.
+_explored_cells: set[tuple[int, int]] = set()
 
-# Persistent resource + terrain memory across process restarts.
+# Persistent resource + terrain + enemy + explored memory across restarts.
 # Every play.py restart re-imports tactic.py and resets in-memory state, so
 # without persistence the resource/obstacle pool is wiped on each deploy and
 # Workers re-scan the map from scratch (observed: user saw map resources like
@@ -219,8 +229,8 @@ _STATE_PATH = Path(__file__).resolve().parent / "tactic_state.json"
 
 
 def _load_persistent_state() -> None:
-    """Restore the persisted resource + obstacle memory at process start."""
-    global _known_resources, _known_obstacles
+    """Restore the persisted resource/obstacle/enemy-core/explored memory."""
+    global _known_resources, _known_obstacles, _known_enemy_cores, _explored_cells
     try:
         data = json.loads(_STATE_PATH.read_text(encoding="utf-8"))
         raw = data.get("known_resources", [])
@@ -237,17 +247,35 @@ def _load_persistent_state() -> None:
                 for a, b in raw_obs
                 if isinstance(a, int) and isinstance(b, int)
             }
+        raw_cores = data.get("known_enemy_cores", [])
+        if isinstance(raw_cores, list):
+            _known_enemy_cores = {
+                (int(a), int(b))
+                for a, b in raw_cores
+                if isinstance(a, int) and isinstance(b, int)
+            }
+        raw_expl = data.get("explored_cells", [])
+        if isinstance(raw_expl, list):
+            _explored_cells = {
+                (int(a), int(b))
+                for a, b in raw_expl
+                if isinstance(a, int) and isinstance(b, int)
+            }
     except (OSError, ValueError, TypeError):
         _known_resources = set()
         _known_obstacles = set()
+        _known_enemy_cores = set()
+        _explored_cells = set()
 
 
 def _save_persistent_state() -> None:
-    """Persist the resource + obstacle memory (called when they change)."""
+    """Persist resource/obstacle/enemy-core/explored memory (on change)."""
     try:
         payload = {
             "known_resources": [list(c) for c in _known_resources],
             "known_obstacles": [list(c) for c in _known_obstacles],
+            "known_enemy_cores": [list(c) for c in _known_enemy_cores],
+            "explored_cells": [list(c) for c in _explored_cells],
         }
         _STATE_PATH.write_text(json.dumps(payload), encoding="utf-8")
     except OSError:
@@ -261,9 +289,17 @@ def _observe_terrain(turn: "Turn") -> None:
     static), making A* pathing and exploration near-optimal. Persists only when
     new walls appear.
     """
-    global _known_obstacles
+    global _known_obstacles, _explored_cells
     before = len(_known_obstacles)
     _known_obstacles.update(turn.obstacle_cells)
+    # Record every cell within a friendly vision source's radius as explored
+    # (Manhattan approximation of vision coverage). Large, so persist only when
+    # new obstacles appear (which also snapshots the explored set).
+    for src, radius in _vision_sources(turn):
+        sx, sy = src
+        for dx in range(-radius, radius + 1):
+            for dy in range(-(radius - abs(dx)), radius - abs(dx) + 1):
+                _explored_cells.add((sx + dx, sy + dy))
     if len(_known_obstacles) != before:
         _save_persistent_state()
 
@@ -1715,10 +1751,15 @@ def _observe_enemies(turn: "Turn") -> None:
     tick = turn.tick
     for e in turn.visible_enemies:
         _last_enemy_pos[str(e.id)] = (tuple(e.position), tick)
+        # Persist enemy Cores permanently (a Core is a durable hunt target).
+        if e.kind == "CORE":
+            _known_enemy_cores.add(tuple(e.position))
     for eid in list(_last_enemy_pos):
         _, seen = _last_enemy_pos[eid]
         if tick - seen > ENEMY_MEMORY_TICKS:
             del _last_enemy_pos[eid]
+    if _known_enemy_cores:
+        _save_persistent_state()
 
 
 def _chase_target(
@@ -1744,17 +1785,28 @@ def _chase_target(
         _chase_start.pop(rid, None)
         _chase_cooldown_until[rid] = tick + CHASE_COOLDOWN_TICKS
         return None
-    # Priority 1: hunt a visible enemy Core near home when we can afford to
-    # rebuild a Ranger if one falls (user reported an enemy Core at (10,246)
-    # going unhandled because it was outside the old drive-off radius).
-    core_targets = [
-        e for e in enemies
-        if e.kind == "CORE" and _manhattan(core_pos, e.position) < 40
-    ]
-    if core_targets and resources >= 60:
-        nearest = min(core_targets, key=lambda e: _manhattan(pos, e.position))
+    # Priority 1: hunt a visible OR remembered enemy Core near home when we
+    # can afford to rebuild a Ranger if one falls. The known_enemy_cores set
+    # persists across restarts so we don't forget the rival after a deploy.
+    core_target = None
+    if resources >= 60:
+        visible_core = next(
+            (e for e in enemies
+             if e.kind == "CORE" and _manhattan(core_pos, e.position) < 40),
+            None,
+        )
+        if visible_core is not None:
+            core_target = tuple(visible_core.position)
+        else:
+            remembered = [
+                cpos for cpos in _known_enemy_cores
+                if _manhattan(core_pos, cpos) < 40
+            ]
+            if remembered:
+                core_target = min(remembered, key=lambda c: _manhattan(pos, c))
+    if core_target is not None:
         _chase_start[rid] = _chase_start.get(rid, tick)
-        return tuple(nearest.position)
+        return core_target
     # Priority 2: drive off any visible enemy within CHASE_RADIUS of the Core.
     candidates = [
         e for e in enemies
