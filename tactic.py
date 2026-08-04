@@ -155,6 +155,12 @@ HARVEST_LOCK_RANGE = 6
 # node used to just keep exploring (observed: workers idled while user-visible
 # resources sat uncollected). Commit to a known node within reach instead.
 MAX_HARVEST_REACH = 20
+# Max Core-to-resource distance worth harvesting. A node 55 cells out means a
+# ~110-tick round trip — a NET LOSS at ~0.1/tick income (observed: d48045
+# harvested (30,274) at dist 55 and the economy stalled on its long delivery).
+# Only actively harvest nodes the Core can reach economically; beyond this a
+# Worker picks one up if it happens to pass through, not by lock.
+MAX_HARVEST_FROM_CORE = 25
 
 # Per-Worker exploration memory, keyed by the Unit UUID string. Each entry is
 # [direction_index_into_DIRECTIONS, steps_taken_in_this_leg]. This is not a
@@ -180,7 +186,7 @@ AVOID_HISTORY = 4
 _last_enemy_pos: dict[str, tuple[tuple[int, int], int]] = {}  # enemy id -> (pos, tick)
 _chase_start: dict[str, int] = {}  # ranger id -> tick the chase began
 _chase_cooldown_until: dict[str, int] = {}  # ranger id -> tick it may chase again
-CHASE_RADIUS = 8          # drive off enemies within this many cells of the Core
+CHASE_RADIUS = 15         # drive off enemies within this many cells of the Core
 CHASE_MAX_TICKS = 8       # give up after chasing this many ticks
 CHASE_COOLDOWN_TICKS = 12
 ENEMY_MEMORY_TICKS = 6    # forget a last-seen enemy position after this many ticks
@@ -850,9 +856,22 @@ def _control_workers(turn: "Turn", core_pos: tuple[int, int]) -> None:
     # Workers now stay on their assigned columns and harvest nodes they
     # encounter via the sweep + the persistent harvest lock.
     chemotaxis_col: int | None = None
+    # Distributed resource claims: each KNOWN resource is claimed by at most
+    # one empty Worker this Tick, so workers fan out across the pool instead of
+    # all converging on the single nearest node (observed: workers clustered on
+    # the south resource while north nodes (13,214)/(16,211) went uncollected).
+    claims: dict[tuple[int, int], int] = {}
     for index, worker in enumerate(turn.workers):
         pos = worker.position
         wid = str(worker.id)
+        # An EMPTY Worker standing on a visible resource cell harvests
+        # IMMEDIATELY, before the boxed-in/STUCK logic that could otherwise
+        # shuttle it away in a move (observed: worker 68a41e parked on
+        # (11,247) — a visible resource — yet got boxed-escaped into a move
+        # instead of harvesting, and drifted off uncollected).
+        if worker.cargo == 0 and pos in resource_cells:
+            worker.harvest()
+            continue
         # Boxed-in detection: the STUCK check below only fires when a Worker
         # stays STILL. A Worker trapped in an obstacle pocket CYCLES between a
         # few cells (A-B-A-B...) — it never stays still, so STUCK never fires
@@ -1013,21 +1032,37 @@ def _control_workers(turn: "Turn", core_pos: tuple[int, int]) -> None:
         # rather than blindly exploring (observed: workers idled while the user
         # saw map-wide resources uncollected).
         known = frozenset(_known_resources)
+        # Sort KNOWN resources by distance to this worker. Pick the nearest one
+        # that has NOT already been claimed by another empty worker — this fans
+        # the fleet across the resource pool instead of converging on the single
+        # closest node.
         visible = sorted(
             known if known else resource_cells,
             key=lambda c: _manhattan(pos, c),
         )
         if visible:
-            nearest = visible[0]
-            lock_dist = MAX_HARVEST_REACH if nearest in known else HARVEST_LOCK_RANGE
-            if _manhattan(pos, nearest) <= lock_dist:
-                lock = nearest
+            for candidate in visible:
+                if candidate in claims:
+                    continue
+                nearest = candidate
+                lock_dist = MAX_HARVEST_REACH if nearest in known else HARVEST_LOCK_RANGE
+                # Skip nodes too far from the Core — the round trip is a net
+                # loss and stalls the economy (observed: (30,274) at dist 55).
+                if _manhattan(core_pos, nearest) > MAX_HARVEST_FROM_CORE:
+                    continue
+                if _manhattan(pos, nearest) <= lock_dist:
+                    lock = nearest
+                    claims[lock] = index + 1
+                    break
         # If we have a lock, keep moving toward it; abandon it only once the
         # Worker is on the cell but it is not a resource (harvested or gone).
         if lock is not None:
             if pos == lock:
-                # On the locked cell but not harvesting this tick -> it was
-                # consumed/contested. Clear and explore.
+                # On the locked cell: if it's still a visible resource, harvest;
+                # otherwise the node was consumed/contested — clear and explore.
+                if pos in resource_cells:
+                    worker.harvest()
+                    continue
                 lock = None
             else:
                 if st is None or len(st) < 4:
@@ -1314,7 +1349,7 @@ def _control_rangers(turn: "Turn", core_pos: tuple[int, int]) -> None:
         # Bounded drive-off (8th review, rank 2): a non-guard Ranger chases a
         # visible or recently-seen enemy near the Core, so inbound raiders are
         # intercepted instead of ignored. Guard (index 0) never chases.
-        chase = _chase_target(pos, core_pos, enemies, rid, turn.tick)
+        chase = _chase_target(pos, core_pos, enemies, rid, turn.tick, turn.resources)
         if chase is not None:
             enemy_cells = frozenset(e.position for e in enemies)
             step = _step_toward(
@@ -1692,11 +1727,15 @@ def _chase_target(
     enemies: tuple[UnitView | CoreView, ...],
     rid: str,
     tick: int,
+    resources: int,
 ) -> tuple[int, int] | None:
-    """Pick an enemy cell for a non-guard Ranger to drive off, or None.
+    """Pick an enemy cell for a non-guard Ranger to drive off or hunt, or None.
 
-    Bounded: chases only enemies within CHASE_RADIUS of the Core, gives up
-    after CHASE_MAX_TICKS, then cools down before chasing again.
+    Priority: (1) a VISIBLE enemy Core within HUNT range (when resources allow
+    rebuilding) — destroying it pays +6 and removes a fleet; (2) any enemy
+    within CHASE_RADIUS of the Core (drive off inbound raiders); (3) a
+    recently-seen enemy within the radius. Bounded: gives up after
+    CHASE_MAX_TICKS, then cools down before chasing again.
     """
     if _chase_cooldown_until.get(rid, 0) > tick:
         return None
@@ -1705,7 +1744,18 @@ def _chase_target(
         _chase_start.pop(rid, None)
         _chase_cooldown_until[rid] = tick + CHASE_COOLDOWN_TICKS
         return None
-    # Visible enemy within CHASE_RADIUS of the Core -> drive it off.
+    # Priority 1: hunt a visible enemy Core near home when we can afford to
+    # rebuild a Ranger if one falls (user reported an enemy Core at (10,246)
+    # going unhandled because it was outside the old drive-off radius).
+    core_targets = [
+        e for e in enemies
+        if e.kind == "CORE" and _manhattan(core_pos, e.position) < 40
+    ]
+    if core_targets and resources >= 60:
+        nearest = min(core_targets, key=lambda e: _manhattan(pos, e.position))
+        _chase_start[rid] = _chase_start.get(rid, tick)
+        return tuple(nearest.position)
+    # Priority 2: drive off any visible enemy within CHASE_RADIUS of the Core.
     candidates = [
         e for e in enemies
         if _manhattan(core_pos, e.position) < CHASE_RADIUS
@@ -1714,7 +1764,7 @@ def _chase_target(
         nearest = min(candidates, key=lambda e: _manhattan(pos, e.position))
         _chase_start[rid] = _chase_start.get(rid, tick)
         return tuple(nearest.position)
-    # Last-known enemy within the radius + slack -> re-acquire.
+    # Priority 3: re-acquire a recently-seen enemy within the radius + slack.
     for epos, seen in _last_enemy_pos.values():
         if _manhattan(core_pos, epos) < CHASE_RADIUS + 6:
             _chase_start[rid] = _chase_start.get(rid, tick)

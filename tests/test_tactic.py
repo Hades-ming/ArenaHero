@@ -1501,3 +1501,41 @@ def test_boxed_in_worker_escapes_pocket() -> None:
     nxt = (5 + action.direction.delta[0], 5 + action.direction.delta[1])
     # It must not walk toward the Core (that would re-enter the pocket).
     assert tactic._manhattan(nxt, (0, 0)) >= tactic._manhattan((5, 5), (0, 0))
+
+
+def test_worker_harvests_resource_before_boxed_escape() -> None:
+    # A worker standing on a visible resource cell must HARVEST even when its
+    # recent positions look boxed-in. Observed: 68a41e parked on (11,247), a
+    # visible resource, yet the boxed-in escape shuttled it into a move and it
+    # drifted off without collecting. Harvest must win over the escape logic.
+    state = _state(
+        objects=[
+            {
+                "kind": "CORE",
+                "id": str(CORE_ID),
+                "controlled": True,
+                "owner_username": "arena_hero",
+                "position": [0, 0],
+                "hp": 5,
+                "shield": 5,
+                "state": "NORMAL",
+            },
+            {
+                "kind": "UNIT",
+                "id": str(WORKER_ID),
+                "controlled": True,
+                "position": [2, 0],
+                "hp": 2,
+                "unit_type": "WORKER",
+                "cargo": 0,
+            },
+            {"kind": "RESOURCE", "positions": [[2, 0]]},
+        ],
+    )
+    # Make the worker look boxed-in so the escape logic WOULD fire.
+    tactic._pos_history[str(WORKER_ID)] = [(2, 0), (1, 0), (2, 0), (1, 0)]
+    turn = _turn(state)
+    decide(turn)
+    action = _action(turn.plan, WORKER_ID)
+    assert action is not None
+    assert action.type == "HARVEST"
