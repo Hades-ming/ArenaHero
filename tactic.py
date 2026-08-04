@@ -161,6 +161,10 @@ MAX_HARVEST_REACH = 30
 # Only actively harvest nodes the Core can reach economically; beyond this a
 # Worker picks one up if it happens to pass through, not by lock.
 MAX_HARVEST_FROM_CORE = 30
+# Sweep radius cap: a worker explores within this Manhattan radius of the Core
+# only. Beyond it the deposit round trip is a net loss and workers were observed
+# stranding 60-88 cells out (never returning). Steers back toward the Core.
+MAX_SWEEP_RADIUS = 40
 
 # Per-Worker exploration memory, keyed by the Unit UUID string. Each entry is
 # [direction_index_into_DIRECTIONS, steps_taken_in_this_leg]. This is not a
@@ -729,6 +733,15 @@ def _explore_step(
         south_init = 0 if worker_index % 2 == 0 else 1
         state = [0, south_init, None, None]
         _explore_state[worker_id] = state
+    # Sweep-radius cap: a worker must not wander beyond economic reach of the
+    # Core (the deposit sink). Past ~40 cells the delivery round trip is a net
+    # loss AND the worker never returns — observed workers stranded 60-88 cells
+    # out (x 30-44, y 276-297) while north resources near the Core sat
+    # uncollected. Steer back toward the Core until back in range.
+    if _manhattan(pos, core_pos) > MAX_SWEEP_RADIUS:
+        step = _step_toward(pos, core_pos, blocked, avoid=avoid)
+        if step is not None:
+            return step
     col_off, south = state[0], state[1]
     target_x = max(chunk_x_lo, min(chunk_x_hi, base_col + col_off))
 
