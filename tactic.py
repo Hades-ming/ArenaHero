@@ -1,0 +1,1799 @@
+"""Balanced tactic for Arena Hero v0.7, tuned to maximize score.
+
+Decisions are separated from connection setup so :func:`decide` can be tested
+without a live credential. See ``references/tactic-authoring.md`` and
+``references/game-rules.md`` (bundled with the arena-hero skill) for the rules
+this tactic follows; no numeric rule is inferred from memory.
+
+Score on Arena Hero is not exposed in the player state; the durable way to
+accumulate it is to keep harvesting and depositing resources, destroy enemy
+objects when cheap, and avoid losing Units or the Core. This tactic therefore
+prioritizes a self-sustaining economy: Workers fan out to *find* resources
+(active exploration when none are visible), haul them home, and the Core
+reinvests into more Workers up to a free-upkeep fleet.
+
+Policy:
+
+* deposit carried Worker cargo when sharing the Core cell;
+* harvest when an empty Worker stands on a currently visible resource cell;
+* move empty Workers toward the nearest visible resource;
+* when NO resource is visible, explore: each Worker keeps a marching direction
+  and turns periodically to sweep new ground, so it does not stall on a bare
+  view (vision radius is small, so standing still never reveals resources);
+* Rangers shoot visible legal targets (Core prioritized), else explore/kite;
+* Vanguards sweep the adjacent cell with the most enemies, else hold near Core;
+* repair Core shield only when under visible threat;
+* spawn Workers toward a soft target while upkeep stays free (population < 20)
+  and the Core cell has room;
+* leave an object on WAIT when no legal useful action is known.
+"""
+
+from __future__ import annotations
+
+import heapq
+import json
+from collections import Counter
+from pathlib import Path
+from typing import TYPE_CHECKING
+
+from arena_hero import (
+    BeaconStatus,
+    Direction,
+    HarvestSource,
+    UnitType,
+)
+
+if TYPE_CHECKING:
+    from arena_hero import Core, CoreView, Turn, Unit, UnitView
+
+# Population at and above which upkeep becomes a real cost. Upkeep is
+# ``tier * (tier + 1) / 2`` where ``tier = floor(population / 20)``; the first
+# tier (0) is free, so staying below 20 Units costs nothing.
+FREE_UPKEEP_CAP = 20
+# Comfortable Worker count the tactic tries to maintain. The fourth review
+# found TARGET_WORKERS=16 was unreachable at the observed harvest rate AND
+# counterproductive: every deposit was immediately spent on a Worker spawn,
+# so Core storage never accumulated (the durable score proxy). The fourth
+# review set this to 8 to let deposits bank. The FIFTH review (economy +
+# skeptic personas) re-measured and found the binding constraint is node
+# DISCOVERY rate (~0.033 res/tick) not the chunk-quota ceiling (2.0/tick,
+# 34-64x headroom): more Workers find nodes faster, directly raising
+# throughput, and upkeep is still 0 below pop 20. Raised 8 -> 12, then
+# 12 -> 15 after r hit the pop-14 capacity ceiling (70): more Workers both
+# raise discovery AND raise Core capacity (each Unit +5), letting r bank
+# past 70. Still free-upkeep (pop 17 < 20). The bank reserve +
+# army-short gate still prevent draining deposits to r0.
+TARGET_WORKERS = 19
+MAX_WORKERS = 21
+# Bank reserve: never spend down to zero on a Worker spawn. A spawn must leave
+# the Core with at least this many resources afterward, so the economy keeps a
+# positive balance and the standing-army bank (toward the 10/12 combat Unit)
+# is not reset by every Worker. The fourth review (economy persona) showed the
+# prior "spend every r5 on a Worker" policy left Core storage oscillating
+# 0->5->0 forever — the single largest economy drain.
+WORKER_SPAWN_RESERVE = 3
+# Standing-army policy (defends against the raid that destroyed the Core on
+# 2026-08-02). The prior tactic spawned combat Units ONLY when a threat was
+# already visible, so a surprise raid met an economy at r0 that could not bank
+# the 10-resource Vanguard cost in time and the Core burned with zero return
+# fire. We now maintain a combat reserve even in peacetime.
+#
+# A Vanguard costs 10 and a Ranger 12 (rules). The fleet builds the standing
+# reserve as soon as a minimal Worker economy (MIN_WORKERS_BEFORE_ARMY) exists,
+# and BEFORE growing Workers past that floor — combat readiness outranks a
+# larger Worker fleet once the economy can sustain the smallest army.
+MIN_WORKERS_BEFORE_ARMY = 4
+# Peacetime standing reserve now SCALES with the Worker fleet via
+# _standing_army_targets (a floor of V1/R1, growing ~one combat pair per 8
+# Workers up to the free-upkeep pop budget). These legacy constants document
+# the floor that scaling starts from. A Vanguard is the cheapest return-fire
+# Unit (1 damage to an adjacent cell, 4 HP body-block) and is built first.
+STANDING_VANGUARDS = 1
+STANDING_RANGERS = 1
+# When a threat is visible, grow the defensive line up to these caps before any
+# further Worker growth. A Ranger's range-3 shot can hit a raider before it
+# reaches the Core cell, so it is the preferred defender once the reserve exists.
+DEFENSE_VANGUARDS = 2
+DEFENSE_RANGERS = 2
+# Ranger range, straight from the rules: a shot is legal at Manhattan distance
+# 1, 2, or 3 on a shared cardinal line with no obstacle between.
+RANGER_MAX_RANGE = 3
+
+DIRECTIONS = (Direction.UP, Direction.DOWN, Direction.LEFT, Direction.RIGHT)
+# Clockwise turn order (kept for Vanguard/Ranger fallback movement).
+_TURN_ORDER = {
+    Direction.UP: Direction.RIGHT,
+    Direction.RIGHT: Direction.DOWN,
+    Direction.DOWN: Direction.LEFT,
+    Direction.LEFT: Direction.UP,
+}
+# Chunk is 32x32 (rules). Workers sweep edge-to-edge across the Core's own
+# chunk: coverage matters far more than short deposit round-trips while the
+# harvest rate is zero (0 * fast_round_trip is still 0).
+CHUNK_SIZE = 32
+# Horizontal column step between successive boustrophedon sweeps. Worker vision
+# radius is 3, so a 6-step column spacing tiles the chunk with one-cell overlap
+# and no unscanned gap.
+_SWEEP_COL_STEP = 6
+# How far north/south a Worker marches before advancing to the next column.
+# A value of 16 covers the full 32-cell chunk height, but Workers rarely reach
+# the boundary (obstacles, anti-backtrack), so col_off never advances and they
+# re-sweep the same column forever. A shorter march span (10) reaches the
+# turn-around far more often, so the Worker tiles multiple columns over time
+# and actually discovers resources spread across the chunk width.
+_SWEEP_HALF_WIDTH = 10
+# Column offset wraps monotonically (east-wrap) rather than reflecting, so each
+# Worker tiles the full chunk width over successive legs instead of oscillating
+# on two columns. The wrap range spans [-HALF, +HALF].
+_SWEEP_COL_WRAP = _SWEEP_HALF_WIDTH
+# A Worker only harvests a resource it can reach in a step or two from its own
+# vision. Chasing a node seen by another Worker makes it leave its band and
+# 2-cycle back when that node leaves the other Worker's vision. Worker vision
+# radius is 3, so a 4-cell reach covers "I can see it and step onto it".
+HARVEST_REACH = 4
+
+
+def _advance_col_off(col_off: int) -> int:
+    """Step a Worker's column offset east by ``_SWEEP_COL_STEP`` and wrap.
+
+    A monotonic east-wrap tiles the full chunk width over successive legs
+    instead of reflecting back and oscillating on two columns. The offset
+    wraps from +_SWEEP_COL_WRAP to -_SWEEP_COL_WRAP so every column in the
+    range is swept eventually.
+    """
+    col_off += _SWEEP_COL_STEP
+    if col_off > _SWEEP_COL_WRAP:
+        col_off = -_SWEEP_COL_WRAP + (col_off - _SWEEP_COL_WRAP - 1)
+    return col_off
+# Distance within which a Worker locks onto a visible resource and commits to
+# walking onto it even across ticks where it leaves the small vision radius.
+# Slightly larger than vision (3) so an edge node can be pursued.
+HARVEST_LOCK_RANGE = 6
+# Distance within which a Worker commits to a REMEMBERED resource (from the
+# persistent _known_resources pool). The user can see map-wide resources the
+# tactic has only partial vision of; a Worker parked 8-16 cells from a known
+# node used to just keep exploring (observed: workers idled while user-visible
+# resources sat uncollected). Commit to a known node within reach instead.
+MAX_HARVEST_REACH = 20
+
+# Per-Worker exploration memory, keyed by the Unit UUID string. Each entry is
+# [direction_index_into_DIRECTIONS, steps_taken_in_this_leg]. This is not a
+# retained controller object (the skill forbids that); it is a small intent
+# hint that is rebuilt from the current live Units each Tick.
+_explore_state: dict[str, list[int]] = {}
+# Recent-positions history per Worker, used to break multi-cell backtracking
+# cycles on the laden deposit return path through obstacle corridors. The
+# fifth review (skeptic persona) found a laden Worker trapped in a permanent
+# 4-cycle (A->B->C->D->A) for 362+ ticks — a single-cell _prev_pos only
+# prevents the immediately-prior cell, not the 3-cells-ago cell that closes a
+# longer cycle. A deque of the last AVOID_HISTORY positions catches longer
+# cycles. Capped at AVOID_HISTORY entries; oldest drops when full.
+_prev_pos: dict[str, tuple[int, int]] = {}  # last pos (kept for stuck detection)
+_pos_history: dict[str, list[tuple[int, int]]] = {}
+AVOID_HISTORY = 4
+
+# Bounded drive-off state for non-guard Rangers (8th review, rank 2): the fleet
+# was 100% passive — it only shot what was already in range, so a raider parked
+# just outside range was never driven off. Record last-seen enemy positions and
+# chase them briefly (bounded ticks + cooldown), never pulling the guard Ranger
+# or the home Vanguard off defense.
+_last_enemy_pos: dict[str, tuple[tuple[int, int], int]] = {}  # enemy id -> (pos, tick)
+_chase_start: dict[str, int] = {}  # ranger id -> tick the chase began
+_chase_cooldown_until: dict[str, int] = {}  # ranger id -> tick it may chase again
+CHASE_RADIUS = 8          # drive off enemies within this many cells of the Core
+CHASE_MAX_TICKS = 8       # give up after chasing this many ticks
+CHASE_COOLDOWN_TICKS = 12
+ENEMY_MEMORY_TICKS = 6    # forget a last-seen enemy position after this many ticks
+
+# Local resource memory pool: remember resource cells even after they leave
+# vision, so Workers don't re-sweep bare ground they already confirmed empty.
+# A cell is added when first seen as a resource. It is removed when:
+# 1. a HARVEST_SUCCEEDED event confirms it was collected (immediate), or
+# 2. any friendly vision source sees the cell and it is NOT in the current
+#    turn.resource_cells (the cell is genuinely bare, not just out of view).
+# Without this, Workers re-scan already-depleted columns (the 5th review
+# identified discovery rate ~0.033 res/tick as the binding constraint —
+# memory directly raises effective discovery by avoiding re-scan of empty
+# cells already known from earlier sweeps).
+_known_resources: set[tuple[int, int]] = set()
+# Persistent obstacle-terrain memory. turn.obstacle_cells only exposes obstacles
+# in current vision; a wall seen once and forgotten makes A* pathing collide
+# with it again and again (workers re-route around the same walls every trip).
+# Obstacles are static terrain, so persisting them is safe and makes pathing
+# near-optimal (user asked: persist the terrain of known cells).
+_known_obstacles: set[tuple[int, int]] = set()
+
+# Persistent resource + terrain memory across process restarts.
+# Every play.py restart re-imports tactic.py and resets in-memory state, so
+# without persistence the resource/obstacle pool is wiped on each deploy and
+# Workers re-scan the map from scratch (observed: user saw map resources like
+# (15,208) that the tactic had forgotten). Mirrors the reference agent's
+# load_persistent_state/save_state.
+_STATE_PATH = Path(__file__).resolve().parent / "tactic_state.json"
+
+
+def _load_persistent_state() -> None:
+    """Restore the persisted resource + obstacle memory at process start."""
+    global _known_resources, _known_obstacles
+    try:
+        data = json.loads(_STATE_PATH.read_text(encoding="utf-8"))
+        raw = data.get("known_resources", [])
+        if isinstance(raw, list):
+            _known_resources = {
+                (int(a), int(b))
+                for a, b in raw
+                if isinstance(a, int) and isinstance(b, int)
+            }
+        raw_obs = data.get("known_obstacles", [])
+        if isinstance(raw_obs, list):
+            _known_obstacles = {
+                (int(a), int(b))
+                for a, b in raw_obs
+                if isinstance(a, int) and isinstance(b, int)
+            }
+    except (OSError, ValueError, TypeError):
+        _known_resources = set()
+        _known_obstacles = set()
+
+
+def _save_persistent_state() -> None:
+    """Persist the resource + obstacle memory (called when they change)."""
+    try:
+        payload = {
+            "known_resources": [list(c) for c in _known_resources],
+            "known_obstacles": [list(c) for c in _known_obstacles],
+        }
+        _STATE_PATH.write_text(json.dumps(payload), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _observe_terrain(turn: "Turn") -> None:
+    """Merge currently-visible obstacles into the persistent obstacle memory.
+
+    Runs each Tick so walls seen once are remembered forever (obstacles are
+    static), making A* pathing and exploration near-optimal. Persists only when
+    new walls appear.
+    """
+    global _known_obstacles
+    before = len(_known_obstacles)
+    _known_obstacles.update(turn.obstacle_cells)
+    if len(_known_obstacles) != before:
+        _save_persistent_state()
+
+
+_load_persistent_state()
+
+
+def _record_pos(wid: str, pos: tuple[int, int]) -> None:
+    """Append ``pos`` to the Worker's recent-position history (capped).
+
+    Deduplicates consecutive duplicates so a Worker that WAITs in place does
+    not fill its history with the same cell and lose the cycle-breaking
+    memory. Used to build the avoid-set for pathing.
+    """
+    hist = _pos_history.get(wid)
+    if hist and hist[-1] == pos:
+        return
+    if hist is None:
+        hist = []
+        _pos_history[wid] = hist
+    hist.append(pos)
+    if len(hist) > AVOID_HISTORY:
+        del hist[0]
+
+
+def _is_boxed_in(wid: str) -> bool:
+    """True if the Worker's recent positions all fit in a tiny box.
+
+    A Worker trapped in an obstacle pocket cycles between 2-3 cells and never
+    stays still, so the STUCK check (which keys on stillness) never fires. If
+    the last AVOID_HISTORY positions span <=2 cells on both axes, it is stuck
+    in a pocket and should break out (see the boxed-in escape in _control_workers).
+    """
+    hist = _pos_history.get(wid)
+    if not hist or len(hist) < AVOID_HISTORY:
+        return False
+    xs = [p[0] for p in hist]
+    ys = [p[1] for p in hist]
+    return (max(xs) - min(xs)) <= 2 and (max(ys) - min(ys)) <= 2
+
+
+def _avoid_set(wid: str) -> frozenset[tuple[int, int]] | None:
+    """Build the avoid-set from the Worker's recent-position history."""
+    hist = _pos_history.get(wid)
+    if not hist:
+        return None
+    return frozenset(hist)
+# Last known position per Worker and how many consecutive ticks it has been
+# unchanged. A Worker stuck in place (boxed in by obstacles + the anti-backtrack
+# cell) would WAIT forever; after STUCK_TICKS we reset its exploration state so
+# it can pick a fresh direction and escape the deadlock.
+_last_pos: dict[str, tuple[int, int]] = {}
+_stuck_ticks: dict[str, int] = {}
+STUCK_TICKS = 4
+
+
+def _manhattan(a: tuple[int, int], b: tuple[int, int]) -> int:
+    return abs(a[0] - b[0]) + abs(a[1] - b[1])
+
+
+def _same_line(a: tuple[int, int], b: tuple[int, int]) -> bool:
+    return a[0] == b[0] or a[1] == b[1]
+
+
+def _obstacles_between(
+    a: tuple[int, int], b: tuple[int, int], obstacles: frozenset[tuple[int, int]]
+) -> bool:
+    """True if any obstacle cell lies strictly between a and b on a cardinal line.
+
+    Only obstacles block a Ranger shot (Units and Cores never do). The
+    supercover line is checked against every intermediate cell.
+    """
+    if not _same_line(a, b):
+        return True
+    if a == b:
+        return False
+    ax, ay = a
+    bx, by = b
+    if ax == bx:
+        step = 1 if by > ay else -1
+        y = ay + step
+        while y != by:
+            if (ax, y) in obstacles:
+                return True
+            y += step
+    else:
+        step = 1 if bx > ax else -1
+        x = ax + step
+        while x != bx:
+            if (x, ay) in obstacles:
+                return True
+            x += step
+    return False
+
+
+def _step_toward(
+    start: tuple[int, int],
+    target: tuple[int, int],
+    blocked: frozenset[tuple[int, int]],
+    avoid: frozenset[tuple[int, int]] | None = None,
+) -> Direction | None:
+    """Pick a single cardinal step toward ``target`` that avoids blocked cells.
+
+    Prefers the axis with the larger remaining gap so progress is monotonic on
+    open ground. Ties break to the x-axis. Falls back to a detour step when
+    the direct route is blocked, so a Worker can route around an obstacle.
+
+    ``avoid`` is a set of cells the Worker recently left (its position
+    history); a step that would return to ANY of them is skipped unless it is
+    the only open cell, so the Worker does not re-enter a cell it visited
+    recently and close a multi-cell backtracking cycle (A->B->C->D->A).
+    """
+    sx, sy = start
+    tx, ty = target
+    dx = tx - sx
+    dy = ty - sy
+    options: list[Direction] = []
+    if abs(dx) >= abs(dy):
+        if dx > 0:
+            options.append(Direction.RIGHT)
+        elif dx < 0:
+            options.append(Direction.LEFT)
+        if dy > 0:
+            options.append(Direction.DOWN)
+        elif dy < 0:
+            options.append(Direction.UP)
+    else:
+        if dy > 0:
+            options.append(Direction.DOWN)
+        elif dy < 0:
+            options.append(Direction.UP)
+        if dx > 0:
+            options.append(Direction.RIGHT)
+        elif dx < 0:
+            options.append(Direction.LEFT)
+    for direction in options:
+        ddx, ddy = direction.delta
+        nxt = (sx + ddx, sy + ddy)
+        if nxt in blocked:
+            continue
+        if avoid is not None and nxt in avoid:
+            continue
+        return direction
+    # The reducing steps were all blocked. Detour: try any open neighbor even
+    # if it does not strictly reduce distance, so a Worker can route around an
+    # obstacle instead of stalling. Prefer steps on the perpendicular axis,
+    # then any remaining open cell.
+    detour: list[Direction] = []
+    perp = (Direction.UP, Direction.DOWN) if abs(dx) >= abs(dy) else (Direction.LEFT, Direction.RIGHT)
+    for direction in (*perp, *DIRECTIONS):
+        if direction not in detour:
+            detour.append(direction)
+    for direction in detour:
+        ddx, ddy = direction.delta
+        nxt = (sx + ddx, sy + ddy)
+        if nxt in blocked:
+            continue
+        if avoid is not None and nxt in avoid:
+            continue
+        return direction
+    # Genuinely boxed in: WAIT rather than step back into the cell just left,
+    # which would 2-cycle and waste every tick. An obstacle or enemy may clear
+    # next tick, letting progress resume.
+    return None
+
+
+def _astar_step(
+    start: tuple[int, int],
+    goal: tuple[int, int],
+    obstacles: frozenset[tuple[int, int]],
+    blocked: frozenset[tuple[int, int]],
+    max_expansions: int = 4000,
+) -> Direction | None:
+    """Return the first cardinal step on an A* path from ``start`` to ``goal``.
+
+    The greedy _step_toward wedges in obstacle-dense terrain: a laden Worker
+    returning to a Core parked in a stone corner can spin 20+ cells out, never
+    finding the gap (observed 67512f/d48045). A* guarantees a path when one
+    exists. ``obstacles`` are permanent terrain; ``blocked`` are dynamic
+    (friendly-full/enemy cells) and the ``goal`` is always enterable (a laden
+    Worker must step onto the Core cell to deposit).
+    """
+    if start == goal:
+        return None
+    frontier: list[tuple[int, int, int, tuple[int, int]]] = [
+        (_manhattan(start, goal), 0, 0, start)
+    ]
+    came_from: dict[tuple[int, int], tuple[int, int] | None] = {start: None}
+    best_cost: dict[tuple[int, int], int] = {start: 0}
+    expansions = 0
+    while frontier and expansions < max_expansions:
+        _, cost, _, current = heapq.heappop(frontier)
+        if cost != best_cost.get(current):
+            continue
+        expansions += 1
+        if current == goal:
+            break
+        for d in DIRECTIONS:
+            ddx, ddy = d.delta
+            nxt = (current[0] + ddx, current[1] + ddy)
+            if nxt in obstacles or (nxt in blocked and nxt != goal):
+                continue
+            new_cost = cost + 1
+            if new_cost >= best_cost.get(nxt, 10**9):
+                continue
+            best_cost[nxt] = new_cost
+            came_from[nxt] = current
+            heapq.heappush(
+                frontier,
+                (new_cost + _manhattan(nxt, goal), new_cost, expansions, nxt),
+            )
+    if goal not in came_from:
+        return None
+    cursor = goal
+    while came_from.get(cursor) != start:
+        parent = came_from.get(cursor)
+        if parent is None:
+            return None
+        cursor = parent
+    ddx = cursor[0] - start[0]
+    ddy = cursor[1] - start[1]
+    for d in DIRECTIONS:
+        if d.delta == (ddx, ddy):
+            return d
+    return None
+
+
+def _step_away_from(
+    pos: tuple[int, int],
+    core_pos: tuple[int, int],
+    blocked: frozenset[tuple[int, int]],
+    avoid: frozenset[tuple[int, int]] | None = None,
+) -> Direction | None:
+    """Pick a cardinal step that moves AWAY from ``core_pos``.
+
+    Used to disperse laden Workers when the Core is at full resource capacity:
+    they cannot deposit (CORE_RESOURCE_FULL), so clustering at home only fills
+    every Core-adjacent cell to 2/2 and deadlocks the Core's spawn. Drifting
+    outward clears the cell so a spawn can spend resources and open room for
+    the deposit next Tick. Prefers the step that maximizes the gain in
+    Manhattan distance; falls back to any open cell when none increases it.
+    """
+    from_here = _manhattan(pos, core_pos)
+    best_dir: Direction | None = None
+    best_gain = -1
+    for d in DIRECTIONS:
+        ddx, ddy = d.delta
+        nxt = (pos[0] + ddx, pos[1] + ddy)
+        if nxt in blocked:
+            continue
+        if avoid is not None and nxt in avoid:
+            continue
+        gain = _manhattan(nxt, core_pos) - from_here
+        if gain > best_gain:
+            best_gain = gain
+            best_dir = d
+    if best_dir is not None:
+        return best_dir
+    # Nothing strictly increases distance (ring of obstacles): take any open
+    # cell rather than stall — lateral drift still thins the cluster.
+    for d in DIRECTIONS:
+        ddx, ddy = d.delta
+        nxt = (pos[0] + ddx, pos[1] + ddy)
+        if nxt in blocked:
+            continue
+        if avoid is not None and nxt in avoid:
+            continue
+        return d
+    return None
+
+
+def _step_direction(direction: Direction, pos: tuple[int, int], blocked: frozenset[tuple[int, int]]) -> Direction | None:
+    """Try to take one step in ``direction``; detour around an obstacle if blocked."""
+    ddx, ddy = direction.delta
+    if (pos[0] + ddx, pos[1] + ddy) not in blocked:
+        return direction
+    # Blocked: try the two perpendicular directions, then the reverse, so the
+    # Worker skirts the obstacle instead of stalling.
+    perp = (Direction.UP, Direction.DOWN) if direction in (Direction.LEFT, Direction.RIGHT) else (Direction.LEFT, Direction.RIGHT)
+    for alt in (*perp, _TURN_ORDER.get(direction, direction)):
+        adx, ady = alt.delta
+        if (pos[0] + adx, pos[1] + ady) not in blocked:
+            return alt
+    return None
+
+
+def _chunk_origin(core_pos: tuple[int, int]) -> tuple[int, int]:
+    """North-west corner of the chunk containing ``core_pos`` (32x32 grid)."""
+    return (core_pos[0] // 32 * 32, core_pos[1] // 32 * 32)
+
+
+def _worker_column(index: int, fleet_size: int, core_pos: tuple[int, int]) -> int:
+    """Chunk-relative column assigned by Worker index, spanning the full chunk.
+
+    The third multi-perspective review found that Core-anchored bands blind the
+    half of the chunk opposite the Core's offset within its chunk (the Core at
+    (181,149) sits at chunk offset (21,21) -- the SE quadrant -- so a symmetric
+    Core-centered sweep never sees the NW half). Anchoring columns to the CHUNK
+    guarantees full-width coverage regardless of where the Core sits. With
+    vision radius 3, evenly-spaced columns tile the 32-cell width with overlap.
+    """
+    chunk_x0, _ = _chunk_origin(core_pos)
+    if fleet_size <= 0:
+        return chunk_x0 + 16
+    # Evenly distribute columns across the full chunk width [chunk_x0+1, chunk_x0+30].
+    # The outermost workers sit near the chunk edges so their vision (radius 3)
+    # covers x=0 and x=31.
+    return chunk_x0 + 1 + int((index) * 29 / max(fleet_size - 1, 1)) if fleet_size > 1 else chunk_x0 + 16
+
+
+def _step_keep_col(
+    direction: Direction,
+    pos: tuple[int, int],
+    blocked: frozenset[tuple[int, int]],
+    target_col: int,
+    avoid: frozenset[tuple[int, int]] | None = None,
+) -> Direction | None:
+    """Step toward ``target_col`` without detouring off the column.
+
+    If the horizontal step is blocked, detour vertically (which keeps progress
+    along the column) rather than perpendicular-horizontal. ``avoid`` skips the
+    cell just left so the vertical detour does not 2-cycle back into it.
+
+    Fourth-review fix: the original only tried the primary horizontal step and
+    the two vertical perpendiculars, then WAITed. A Worker caught in a 3-walled
+    pocket one step short of its column (both perpendiculars are permanent
+    obstacles) would WAIT forever — the STUCK_TICKS reset re-initialized the
+    same state and re-deadlocked because the obstacle geometry is permanent.
+    3 of 7 Workers were lost this way (cbf157 stuck 2780 ticks, 3e47b8 1457
+    ticks). Now, after the vertical detour fails, try the REVERSE horizontal
+    step (step away from the column to escape the pocket) and then any open
+    neighbor, so a Worker can break out of a pocket instead of stalling.
+    """
+    ddx, ddy = direction.delta
+    nxt = (pos[0] + ddx, pos[1] + ddy)
+    if nxt not in blocked and (avoid is None or nxt not in avoid):
+        return direction
+    for alt in (Direction.UP, Direction.DOWN):
+        adx, ady = alt.delta
+        anxt = (pos[0] + adx, pos[1] + ady)
+        if anxt not in blocked and (avoid is None or anxt not in avoid):
+            return alt
+    # Vertical detour blocked: try the REVERSE horizontal step to escape the
+    # pocket (stepping away from the target column is better than WAITing
+    # forever; the Worker re-approaches on a later tick via a different row).
+    rev = _TURN_ORDER.get(_TURN_ORDER.get(direction, direction), direction)
+    rdx, rdy = rev.delta
+    rnxt = (pos[0] + rdx, pos[1] + rdy)
+    if rnxt not in blocked and (avoid is None or rnxt not in avoid):
+        return rev
+    # Last resort: any open neighbor at all, so a boxed-in Worker still moves
+    # rather than 2-cycle or stall. Prefer non-avoid cells.
+    for cand in DIRECTIONS:
+        cdx, cdy = cand.delta
+        cnxt = (pos[0] + cdx, pos[1] + cdy)
+        if cnxt not in blocked and (avoid is None or cnxt not in avoid):
+            return cand
+    return None
+
+
+def _explore_step(
+    worker_index: int,
+    worker_id: str,
+    pos: tuple[int, int],
+    core_pos: tuple[int, int],
+    blocked: frozenset[tuple[int, int]],
+    target_col: int | None = None,
+    avoid: frozenset[tuple[int, int]] | None = None,
+    force_band: int | None = None,
+    fleet_size: int = 1,
+) -> Direction | None:
+    """Return one chunk-anchored boustrophedon step for a Worker.
+
+    The Worker owns a vertical column (an x coordinate) anchored to the CHUNK,
+    not the Core, and sweeps it north/south edge-to-edge across the chunk,
+    shifting one column at the y-boundary. The third review found that
+    Core-anchored bands blind the chunk half opposite the Core's offset; chunk
+    anchoring guarantees full-width coverage regardless of Core position.
+    Turning is dictated by ABSOLUTE chunk-y position. State:
+    [col_offset, going_south_flag, lock_x, lock_y].
+
+    ``target_col`` overrides the Worker's column when set (chemotaxis).
+    ``force_band`` overrides the chunk column assignment.
+    """
+    chunk_x0, chunk_y0 = _chunk_origin(core_pos)
+    chunk_y1 = chunk_y0 + CHUNK_SIZE - 1
+    # Fourth-review fix: clamp the Worker's target column to the home chunk
+    # x-range. _advance_col_off wraps col_off within [-_SWEEP_COL_WRAP,
+    # +_SWEEP_COL_WRAP], which for an edge-assigned Worker (base_col near a
+    # chunk boundary) produces target_x OUTSIDE the home chunk (095d133 drifted
+    # to x=-43, 11 cells into the neighboring poor chunk). Clamp here so a
+    # Worker never marches off the chunk it is supposed to scan.
+    chunk_x_lo = chunk_x0
+    chunk_x_hi = chunk_x0 + CHUNK_SIZE - 1
+    # The Worker's base column is chunk-relative (full-width coverage); the
+    # mutable col_off steps it sideways at each y-boundary to tile the chunk.
+    if target_col is not None:
+        base_col = target_col
+    elif force_band is not None:
+        base_col = core_pos[0] + force_band
+    else:
+        base_col = _worker_column(worker_index, fleet_size, core_pos)
+
+    state = _explore_state.get(worker_id)
+    if state is None or len(state) < 2:
+        # Alternate the initial march direction by Worker index (6th review,
+        # cov-3): all-south init made every Worker sweep the south band first
+        # and never reach the home chunk's north rows (y<234 got 0 visits over
+        # 61 ticks while y>250 got 860). Roughly half the fleet now starts
+        # north so both halves of the chunk are covered.
+        south_init = 1 if worker_index % 2 == 0 else 0
+        state = [0, south_init, None, None]
+        _explore_state[worker_id] = state
+    col_off, south = state[0], state[1]
+    target_x = max(chunk_x_lo, min(chunk_x_hi, base_col + col_off))
+
+    # First reach the assigned column, detouring vertically (never off-column)
+    # if the horizontal step is blocked, and never stepping back onto the cell
+    # just left (which would 2-cycle the vertical detour).
+    if pos[0] != target_x:
+        primary = Direction.RIGHT if target_x > pos[0] else Direction.LEFT
+        return _step_keep_col(primary, pos, blocked, target_col=target_x, avoid=avoid)
+
+    # On the column: march north/south to the CHUNK edge (not Core-relative),
+    # then step the column and reverse.
+    if south and pos[1] >= chunk_y1:
+        south = 0
+        col_off = _advance_col_off(col_off)
+    elif not south and pos[1] <= chunk_y0:
+        south = 1
+        col_off = _advance_col_off(col_off)
+
+    _explore_state[worker_id] = [col_off, south, None, None]
+    new_target_x = max(chunk_x_lo, min(chunk_x_hi, base_col + col_off))
+    # If we just advanced the column, step horizontally onto it.
+    if pos[0] != new_target_x:
+        primary = Direction.RIGHT if new_target_x > pos[0] else Direction.LEFT
+        return _step_keep_col(primary, pos, blocked, target_col=new_target_x, avoid=avoid)
+    # March north/south. If the march cell is blocked, ADVANCE the column
+    # (wrap) and step onto it — do NOT silently flip south, which traps the
+    # Worker in a wall-bounce between two one-sided blockers. Only fall back to
+    # the opposite vertical march if the new column is also blocked.
+    march = Direction.DOWN if south else Direction.UP
+    mdx, mdy = march.delta
+    if (pos[0] + mdx, pos[1] + mdy) not in blocked and (
+        avoid is None or (pos[0] + mdx, pos[1] + mdy) not in avoid
+    ):
+        return march
+    # March blocked (or would backtrack): advance the column and step onto it.
+    col_off = _advance_col_off(col_off)
+    _explore_state[worker_id] = [col_off, south, None, None]
+    target_col_now = base_col + col_off
+    if pos[0] != target_col_now:
+        primary = Direction.RIGHT if target_col_now > pos[0] else Direction.LEFT
+        step = _step_keep_col(primary, pos, blocked, target_col=target_col_now, avoid=avoid)
+        if step is not None:
+            return step
+    # New column also unreachable: try the opposite vertical march as a last
+    # resort, skipping the avoided cell (wait rather than 2-cycle).
+    opp = Direction.UP if south else Direction.DOWN
+    odx, ody = opp.delta
+    onxt = (pos[0] + odx, pos[1] + ody)
+    if onxt not in blocked and (avoid is None or onxt not in avoid):
+        _explore_state[worker_id] = [col_off, 0 if south else 1, None, None]
+        return opp
+    return None
+
+
+def _begin_outbound(worker_id: str, worker_index: int, pos: tuple[int, int], core_pos: tuple[int, int]) -> None:
+    """Resume a Worker's band sweep after a deposit, clearing any harvest lock.
+
+    Preserve the column offset so the Worker resumes in the outer band it had
+    reached rather than re-scanning the empty inner columns from scratch.
+    """
+    state = _explore_state.get(worker_id)
+    col_off = state[0] if state is not None and len(state) >= 1 else 0
+    # Alternate the resumed march direction by Worker index (6th review,
+    # cov-3): a hardcoded south resume keeps returning Workers in the south
+    # band and never covering the north half of the chunk.
+    south = 1 if worker_index % 2 == 0 else 0
+    _explore_state[worker_id] = [col_off, south, None, None]
+
+
+def _select_ranger_target(
+    ranger_pos: tuple[int, int],
+    enemies: tuple[UnitView | CoreView, ...],
+    obstacles: frozenset[tuple[int, int]],
+    core_pos: tuple[int, int],
+) -> UnitView | CoreView | None:
+    """Choose a visible enemy the Ranger can legally shoot this Tick.
+
+    Rules: shared cardinal line, Manhattan distance 1-3, no obstacle strictly
+    between. Enemy Cores are prioritized (Core destruction removes a fleet and
+    pays +6). Among Units, prefer a one-shot-killable (hp==1) and a FLEEING
+    target (farther from the Core than its last-known position) so driven-off
+    raiders are finished, not let to escape (8th review, rank 3).
+    """
+    best: UnitView | CoreView | None = None
+    best_key: tuple[int, int, int, int, str] | None = None
+    for enemy in enemies:
+        cell = enemy.position
+        if not _same_line(ranger_pos, cell):
+            continue
+        dist = _manhattan(ranger_pos, cell)
+        if dist < 1 or dist > RANGER_MAX_RANGE:
+            continue
+        if _obstacles_between(ranger_pos, cell, obstacles):
+            continue
+        is_core = enemy.kind == "CORE"
+        hp = getattr(enemy, "hp", None)
+        finishable = 0 if hp == 1 else 1
+        last = _last_enemy_pos.get(str(enemy.id))
+        fleeing = 1
+        if last is not None:
+            last_pos, _ = last
+            if _manhattan(cell, core_pos) > _manhattan(last_pos, core_pos):
+                fleeing = 0  # moving away from the Core = escaping
+        key = (0 if is_core else 1, finishable, fleeing, dist, str(enemy.id))
+        if best_key is None or key < best_key:
+            best, best_key = enemy, key
+    return best
+
+
+def _vanguard_sweep_target(
+    vanguard_pos: tuple[int, int],
+    enemies: tuple[UnitView | CoreView, ...],
+) -> Direction | None:
+    """Sweep the adjacent cell holding the most enemy objects.
+
+    A sweep hits every enemy Unit and any enemy Core in the one adjacent cell,
+    so a contested adjacent cell is the best use of the action.
+    """
+    best_dir: Direction | None = None
+    best_hits = 0
+    for direction in DIRECTIONS:
+        ddx, ddy = direction.delta
+        cell = (vanguard_pos[0] + ddx, vanguard_pos[1] + ddy)
+        hits = sum(enemy.position == cell for enemy in enemies)
+        if hits > best_hits or (
+            hits == best_hits and hits > 0 and best_dir is not None and direction < best_dir
+        ):
+            best_dir, best_hits = direction, hits
+    return best_dir if best_hits > 0 else None
+
+
+def _threats_to_core(
+    core_pos: tuple[int, int],
+    enemies: tuple[UnitView | CoreView, ...],
+) -> list[UnitView | CoreView]:
+    """Visible enemies within raiding range of the Core are treated as threats.
+
+    A Ranger can hit the Core or its Workers from range 3, and a raiding party
+    often sits a few cells out before striking. Treating anything within 6 as a
+    threat lets the Core start spawning defenders and repairing before the
+    enemy is on the Core cell.
+    """
+    return [e for e in enemies if _manhattan(core_pos, e.position) <= 6]
+
+
+def _control_workers(turn: "Turn", core_pos: tuple[int, int]) -> None:
+    resource_cells = turn.resource_cells
+    # Base blocked set: obstacle terrain plus visible enemy Core/Unit cells.
+    # A Worker that steps onto an enemy cell fails with MOVE_DESTINATION_OCCUPIED
+    # every tick and deadlocks, so enemy positions must be routed around.
+    # Merge persistent obstacle memory so pathing avoids walls seen in the
+    # past as well as the current view (obstacles are static terrain).
+    base_blocked = frozenset(turn.obstacle_cells) | _known_obstacles | frozenset(
+        e.position for e in turn.visible_enemies
+    )
+    # Fourth-review fix: do NOT blanket-block every friendly Unit cell. The
+    # rules (game-rules.md) say a cell holds up to two occupying entities and
+    # same-player objects may co-occupy; the prior code treated every friendly
+    # cell as impassable, forcing laden Workers returning home to detour around
+    # outbound Workers and contributing to the Core-proximity orbit. Only block
+    # a friendly cell that is genuinely FULL (2 occupants), so a Worker can
+    # path through a singly-occupied friendly cell as the rules allow.
+    from collections import Counter as _Counter
+    friendly_occupancy: dict[tuple[int, int], int] = _Counter(
+        tuple(u.position) for u in turn.units
+    )
+    friendly_full = frozenset(
+        cell for cell, count in friendly_occupancy.items() if count >= 2
+    )
+    # Chemotaxis DISABLED (fourth review, coverage+strategy personas): the
+    # chunk-anchored column assignment already tiles the full chunk width, and
+    # chemotaxis collapsed the fleet onto the single nearest visible node's
+    # column whenever one appeared, abandoning coverage of the far half (where
+    # most nodes actually sat). The node is usually harvested by the lowest-UUID
+    # Worker before others arrive, so convergence wastes the followers' ticks.
+    # Workers now stay on their assigned columns and harvest nodes they
+    # encounter via the sweep + the persistent harvest lock.
+    chemotaxis_col: int | None = None
+    for index, worker in enumerate(turn.workers):
+        pos = worker.position
+        wid = str(worker.id)
+        # Boxed-in detection: the STUCK check below only fires when a Worker
+        # stays STILL. A Worker trapped in an obstacle pocket CYCLES between a
+        # few cells (A-B-A-B...) — it never stays still, so STUCK never fires
+        # and it spins forever (observed: worker ce6788 cycled between
+        # (12,215)/(12,216)/(13,216) for 20+ ticks). Detect the pocket by the
+        # recent-position history all fitting in a tiny box; break the loop by
+        # switching the sweep to a DIFFERENT column (clearing explore state
+        # alone re-initializes to the SAME column and re-enters the pocket) and
+        # stepping outward.
+        if _is_boxed_in(wid):
+            st = _explore_state.get(wid)
+            col_off = st[0] if st is not None and len(st) >= 1 else 0
+            _explore_state[wid] = [col_off + _SWEEP_COL_STEP, 1, None, None]
+            _pos_history.pop(wid, None)
+            _prev_pos.pop(wid, None)
+            _last_pos.pop(wid, None)
+            _stuck_ticks[wid] = 0
+            step = _step_away_from(pos, core_pos, base_blocked, avoid=None)
+            if step is not None:
+                _prev_pos[wid] = pos
+                _record_pos(wid, pos)
+                worker.move(step)
+                continue
+        # Detect a stuck Worker (no movement for STUCK_TICKS): reset its
+        # exploration state and anti-backtrack memory so it can pick a fresh
+        # direction instead of WAITing forever in a self-made deadlock.
+        if _last_pos.get(wid) == pos:
+            _stuck_ticks[wid] = _stuck_ticks.get(wid, 0) + 1
+        else:
+            _stuck_ticks[wid] = 0
+            _last_pos[wid] = pos
+        if _stuck_ticks.get(wid, 0) >= STUCK_TICKS:
+            _explore_state.pop(wid, None)
+            _prev_pos.pop(wid, None)
+            _pos_history.pop(wid, None)  # clear cycle memory too
+            # Fourth-review fix (#5): also clear _last_pos so the next tick does
+            # not immediately re-increment stuck_ticks against the stale value
+            # and re-trigger a reset that produces no move (the reset was
+            # incomplete, leaving cbf157 deadlocked for 2780 ticks).
+            _last_pos.pop(wid, None)
+            _stuck_ticks[wid] = 0
+        # Each Worker paths around obstacles, enemies, and FULL friendly cells
+        # (2 occupants), but may step onto a singly-occupied friendly cell or
+        # its own current cell or the Core (to deposit).
+        blocked = (base_blocked | friendly_full) - {pos, core_pos}
+        # A full Worker deposits if it is home, else heads home.
+        if worker.cargo > 0:
+            core_full = turn.resources >= turn.resource_capacity
+            if pos == core_pos and turn.core is not None and turn.core.view.state == "NORMAL":
+                if core_full:
+                    # Deadlock escape: Core at full capacity. This laden Worker
+                    # on the Core cell cannot deposit (CORE_RESOURCE_FULL) but
+                    # its occupancy blocks Core spawn (CELL_UNIT_LIMIT). Step
+                    # outward into any open cell rather than deposit, so the
+                    # spawn fires and spends resources — then next Tick the cap
+                    # has room and this Worker (still laden) returns to deposit.
+                    avoid = _avoid_set(wid)
+                    step = _step_away_from(pos, core_pos, blocked, avoid=avoid)
+                    if step is None:
+                        step = _step_away_from(pos, core_pos, blocked, avoid=None)
+                    if step is not None:
+                        _prev_pos[wid] = pos
+                        _record_pos(wid, pos)
+                        worker.move(step)
+                        continue
+                worker.deposit()
+                # Deposited: resume the assigned scan row, clearing any lock.
+                _begin_outbound(wid, index, pos, core_pos)
+                _prev_pos[wid] = pos
+                _pos_history.pop(wid, None)  # fresh start after deposit
+            else:
+                if core_full:
+                    # Disperse: when the Core is full, laden Workers returning
+                    # home only cluster around the Core and fill every adjacent
+                    # cell to 2/2, deadlocking spawn. Step away from Core
+                    # instead of toward it to let the cluster thin.
+                    avoid = _avoid_set(wid)
+                    step = _step_away_from(pos, core_pos, blocked, avoid=avoid)
+                    if step is None:
+                        step = _step_away_from(pos, core_pos, blocked, avoid=None)
+                    if step is not None:
+                        _prev_pos[wid] = pos
+                        _record_pos(wid, pos)
+                        worker.move(step)
+                    continue
+                # Deposit admission (user suggestion): when the Core cell is
+                # occupied, keep at least ONE adjacent cell open so the occupant
+                # can always leave. If laden workers filled the whole adjacent
+                # ring (occ 2/2), the Core-cell unit is walled in and r freezes
+                # (observed: empty worker 414e50 trapped by 8 laden workers).
+                # When the ring has only 1 free slot left, BACK OFF to distance 2
+                # instead of taking the last exit; when there are >=2 free slots,
+                # WAIT in place is harmless (the occupant still has a way out).
+                core_colocated = sum(
+                    1 for u in turn.units if u.position == core_pos
+                )
+                if core_colocated >= 1 and _manhattan(pos, core_pos) <= 1:
+                    free_adjacent = 0
+                    for d in DIRECTIONS:
+                        nxt = (core_pos[0] + d.delta[0], core_pos[1] + d.delta[1])
+                        if nxt == pos:
+                            continue  # the slot we occupy is not an exit
+                        if nxt in base_blocked:
+                            continue
+                        if friendly_occupancy.get(nxt, 0) < 2:
+                            free_adjacent += 1
+                    if free_adjacent <= 1:
+                        step = _step_away_from(pos, core_pos, blocked, avoid=_avoid_set(wid))
+                        if step is None:
+                            step = _step_away_from(pos, core_pos, blocked, avoid=None)
+                        if step is not None:
+                            _prev_pos[wid] = pos
+                            _record_pos(wid, pos)
+                            worker.move(step)
+                    continue
+                # A* path back to the Core. Greedy _step_toward wedges in
+                # obstacle-dense stone-corner terrain: a laden Worker 20+ cells
+                # out can spin in circles and never find the gap to the Core
+                # (observed 67512f/d48045). A* guarantees a route when one
+                # exists; fall back to the greedy step if A* finds none.
+                step = _astar_step(
+                    pos, core_pos, base_blocked, blocked,
+                )
+                if step is None:
+                    step = _step_toward(pos, core_pos, blocked, avoid=_avoid_set(wid))
+                    if step is None:
+                        step = _step_toward(pos, core_pos, blocked, avoid=None)
+                        _pos_history.pop(wid, None)
+                if step is not None:
+                    _prev_pos[wid] = pos
+                    _record_pos(wid, pos)
+                    worker.move(step)
+            continue
+        # An EMPTY Worker must not enter the Core cell: it only occupies the
+        # 2/2 slot and deadlocks laden deposits (observed: empty worker 414e50
+        # parked on the Core for 25+ ticks, r frozen). Keep core_pos in the
+        # blocked set for empty Workers so their harvest-lock and sweep paths
+        # never step onto it. Only laden Workers may enter to deposit.
+        blocked_empty = blocked | {core_pos}
+        # An empty Worker on a visible resource cell harvests now. The cell set
+        # is the current visible view, not permanent terrain.
+        if pos in resource_cells:
+            worker.harvest()
+            continue
+
+        # Persistent harvest lock: commit to the nearest KNOWN resource and
+        # keep walking toward it even on ticks where it leaves this Worker's
+        # small vision, until the Worker stands on the cell. This kills the
+        # flicker 2-cycle where a Worker steps toward an edge-of-vision node,
+        # loses sight of it next tick, and steps back. State index 2,3 hold the
+        # locked target coordinates (None when unlocked).
+        st = _explore_state.get(wid)
+        lock = (st[2], st[3]) if st is not None and len(st) >= 4 and st[2] is not None else None
+        # Candidate targets: currently-visible resources PLUS the local memory
+        # pool (remembered cells that left vision). The lock distance is larger
+        # for KNOWN resources (20 cells) than for currently-visible ones (6),
+        # so a Worker parked ~8-16 cells from a known resource commits to it
+        # rather than blindly exploring (observed: workers idled while the user
+        # saw map-wide resources uncollected).
+        known = frozenset(_known_resources)
+        visible = sorted(
+            known if known else resource_cells,
+            key=lambda c: _manhattan(pos, c),
+        )
+        if visible:
+            nearest = visible[0]
+            lock_dist = MAX_HARVEST_REACH if nearest in known else HARVEST_LOCK_RANGE
+            if _manhattan(pos, nearest) <= lock_dist:
+                lock = nearest
+        # If we have a lock, keep moving toward it; abandon it only once the
+        # Worker is on the cell but it is not a resource (harvested or gone).
+        if lock is not None:
+            if pos == lock:
+                # On the locked cell but not harvesting this tick -> it was
+                # consumed/contested. Clear and explore.
+                lock = None
+            else:
+                if st is None or len(st) < 4:
+                    st = [0, 1, lock[0], lock[1]]
+                else:
+                    st[2], st[3] = lock[0], lock[1]
+                _explore_state[wid] = st
+                step = _step_toward(pos, lock, blocked_empty, avoid=_avoid_set(wid))
+                if step is not None:
+                    _prev_pos[wid] = pos
+                    _record_pos(wid, pos)
+                    worker.move(step)
+                continue
+        # No lock and no nearby resource: explore using the chunk-anchored
+        # boustrophedon. Pass the fleet size and Worker index so columns are
+        # distributed evenly across the full chunk width.
+        step = _explore_step(
+            index, wid, pos, core_pos, blocked_empty,
+            target_col=chemotaxis_col, avoid=_avoid_set(wid),
+            fleet_size=len(turn.workers),
+        )
+        if step is not None:
+            _prev_pos[wid] = pos
+            _record_pos(wid, pos)
+            worker.move(step)
+        else:
+            # The sweep found no legal step (trapped in an obstacle pocket or
+            # parked on the Core cell). WAITing here loops forever: STUCK
+            # resets the explore state every 4 ticks but the pocket still has no
+            # column-reachable step (observed: ce6788 waited-then-moved between
+            # (12,215)/(12,216)/(13,216) for 20+ ticks). Force a step toward any
+            # open adjacent cell using base_blocked (not blocked_empty), so the
+            # Core cell is reachable as a last-resort exit — moving beats a
+            # permanent stall.
+            step = _step_away_from(pos, core_pos, base_blocked, avoid=None)
+            if step is None:
+                step = _step_toward(pos, core_pos, base_blocked, avoid=None)
+            if step is not None:
+                _prev_pos[wid] = pos
+                _record_pos(wid, pos)
+                worker.move(step)
+
+
+def _control_vanguards(turn: "Turn", core_pos: tuple[int, int]) -> None:
+    enemies = turn.visible_enemies
+    obstacles = frozenset(turn.obstacle_cells) | _known_obstacles
+    # Count friendly occupants per cell so a Vanguard steps to a cell that is
+    # not already at capacity (2/2) and, when possible, not onto a laden Worker
+    # that needs the Core-cell path clear to deposit.
+    from collections import Counter as _Counter
+    friendly_occ: dict[tuple[int, int], int] = _Counter(
+        tuple(u.position) for u in turn.units
+    )
+    laden_positions = frozenset(
+        tuple(w.position) for w in turn.workers if w.cargo > 0
+    )
+    enemy_positions = frozenset(e.position for e in enemies)
+    for vanguard in turn.vanguards:
+        sweep_dir = _vanguard_sweep_target(vanguard.position, enemies)
+        if sweep_dir is not None:
+            vanguard.sweep(sweep_dir)
+            continue
+        # With nothing to sweep, hold near the Core to body-block raiders.
+        if vanguard.position == core_pos:
+            # The Vanguard spawned on the Core cell (Core + Vanguard = 2/2
+            # capacity), which BLOCKS laden Workers from stepping onto the
+            # Core cell to deposit (UNIT_MOVE_FAILED.CELL_UNIT_LIMIT). Step
+            # off to an adjacent open cell so deposits can resume while still
+            # body-blocking raiders next to the Core. Prefer a cell that is
+            # empty (no friendly occupant) and not occupied by a laden Worker,
+            # so the Vanguard does not re-block the deposit path.
+            best: Direction | None = None
+            best_key: tuple[int, int] | None = None
+            for direction in DIRECTIONS:
+                ddx, ddy = direction.delta
+                nxt = (core_pos[0] + ddx, core_pos[1] + ddy)
+                if nxt in obstacles or nxt in enemy_positions:
+                    continue
+                if friendly_occ.get(nxt, 0) >= 2:
+                    continue  # cell full, cannot enter
+                is_laden_cell = nxt in laden_positions
+                occ = friendly_occ.get(nxt, 0)
+                # Rank: prefer non-laden, then fewer occupants.
+                key = (1 if is_laden_cell else 0, occ)
+                if best_key is None or key < best_key:
+                    best_key, best = key, direction
+            if best is not None:
+                vanguard.move(best)
+                continue
+        if _manhattan(vanguard.position, core_pos) > 1 and turn.core is not None:
+            # Approach the Core body-block WITHOUT stepping onto the Core cell
+            # (blocks deposits) or into a full 2/2 friendly cell (8th review,
+            # rank 4). friendly_full is computed from the same occupancy
+            # counter above.
+            friendly_full = frozenset(
+                cell for cell, count in friendly_occ.items() if count >= 2
+            )
+            step = _step_toward(
+                vanguard.position, core_pos,
+                obstacles | friendly_full | {core_pos},
+            )
+            if step is not None:
+                vanguard.move(step)
+
+
+def _ring_patrol_step(
+    pos: tuple[int, int],
+    core_pos: tuple[int, int],
+    blocked: frozenset[tuple[int, int]],
+    inner: int = 8,
+    outer: int = 16,
+) -> Direction | None:
+    """Step to keep a non-guard Ranger patrolling a home band around the Core.
+
+    8th review rank 5: roaming Rangers were full-chunk scouts, often far from
+    the Core when a raid hit. Keeping one Ranger patrolling a band 8-16 cells
+    out makes it a close-in interceptor for the drive-off while the others
+    still scout far. Too close -> drift out; too far -> return; inside the
+    band -> step to a neighbor that keeps the distance (ring patrol).
+    """
+    dist = _manhattan(pos, core_pos)
+    if dist < inner:
+        return _step_away_from(pos, core_pos, blocked, avoid=None)
+    if dist > outer:
+        return _step_toward(pos, core_pos, blocked, avoid=None)
+    best: Direction | None = None
+    best_keep = 10**9
+    for d in DIRECTIONS:
+        nxt = (pos[0] + d.delta[0], pos[1] + d.delta[1])
+        if nxt in blocked:
+            continue
+        nd = _manhattan(nxt, core_pos)
+        if inner <= nd <= outer:
+            if abs(nd - dist) < best_keep:
+                best_keep = abs(nd - dist)
+                best = d
+    return best
+
+
+def _can_shoot(
+    shooter: tuple[int, int],
+    target: tuple[int, int],
+    obstacles: frozenset[tuple[int, int]],
+) -> bool:
+    """True if a Ranger at ``shooter`` can legally shoot ``target``.
+
+    Rules (v0.7): shared cardinal line, Manhattan 1-3, no obstacle strictly
+    between. The reference agent and SDK 0.2.8 suggest the live server may
+    also accept 45-degree diagonal fire (|dx|==|dy|, range 1-3); we include
+    both and let the server decide (worst case: SHOT_MISSED, no penalty).
+    """
+    dist = _manhattan(shooter, target)
+    if dist < 1 or dist > 3:
+        return False
+    sx, sy = shooter
+    tx, ty = target
+    if sx == tx or sy == ty:
+        return not _obstacles_between(shooter, target, obstacles)
+    # Diagonal: |dx| == |dy| <= 3. The server may or may not support this
+    # (v0.7: no; likely v0.8: yes). Include it as a free probe — if the
+    # server rejects it the result is SHOT_MISSED, no penalty. Include the
+    # obstacle check for when/if it lands.
+    dx = abs(tx - sx)
+    dy = abs(ty - sy)
+    if dx == dy:
+        return not _obstacles_between(shooter, target, obstacles)
+    return False
+
+
+def _guard_step(
+    pos: tuple[int, int],
+    core_pos: tuple[int, int],
+    blocked: frozenset[tuple[int, int]],
+    obstacles: frozenset[tuple[int, int]],
+    enemies: tuple[UnitView | CoreView, ...],
+    friendly_full: frozenset[tuple[int, int]],
+    avoid: frozenset[tuple[int, int]] | None = None,
+) -> Direction | None:
+    """Step to keep a guard Ranger at a defensive choke near the Core.
+
+    The guard's goal is to ALWAYS have a legal shot to the Core cell (so any
+    raider stepping onto the Core meets return fire) AND toward the likely
+    approach vector. 8th review found the old ring-orbit guard was
+    direction-blind: it scored nothing but Manhattan distance, allowed dist-4
+    cells that cannot reach the Core cell (range cap 3), and had no obstacle
+    / occupancy awareness. New design:
+    - Far (>5): return toward Core.
+    - Adjacent (<3): drift outward UNLESS every dist-3 cell is blocked (in an
+      obstacle corner the adjacent cell may be the only legal spot — hold it).
+    - At dist 2-3: score candidate cells by (i) clear cardinal line to Core,
+      (ii) clear line toward a visible enemy (threat-side bias), (iii) avoid
+      laden workers and full cells (deposit leave-one-exit rule).
+    - Never accept a cell at dist-4 or with no LOS to the Core.
+    """
+    dist = _manhattan(pos, core_pos)
+    if dist > 5:
+        return _step_toward(pos, core_pos, blocked, avoid=avoid)
+    if dist < 2:
+        # Adjacent to the Core: drift outward to a dist-2/3 cell that can
+        # shoot the Core; in a corner the adjacent cell may be the only legal
+        # spot, so hold it if nothing reachable has a line to the Core.
+        step = _step_away_from(pos, core_pos, blocked, avoid=avoid)
+        if step is not None:
+            nxt = (pos[0] + step.delta[0], pos[1] + step.delta[1])
+            if _manhattan(nxt, core_pos) <= 3 and _can_shoot(nxt, core_pos, obstacles):
+                return step
+        return None
+    # At dist 2-3: score candidate cells.
+    best_dir: Direction | None = None
+    best_score: int | None = None
+    for d in DIRECTIONS:
+        nxt = (pos[0] + d.delta[0], pos[1] + d.delta[1])
+        if nxt in blocked or nxt in friendly_full:
+            continue
+        if avoid is not None and nxt in avoid:
+            continue
+        nd = _manhattan(nxt, core_pos)
+        if nd < 2 or nd > 3:
+            continue  # too close or too far — cannot cover the Core
+        if not _can_shoot(nxt, core_pos, obstacles):
+            continue  # cannot shoot the Core cell -> useless guard position
+        # Score: count enemies within range 3 of this cell (on cardinals).
+        enemy_score = sum(
+            1 for e in enemies if _can_shoot(nxt, e.position, obstacles)
+        )
+        score = (enemy_score, nd)  # prefer more enemy coverage, then closer
+        if best_score is None or score > best_score:
+            best_score = score
+            best_dir = d
+    # Fall back to any dist-3 cell with LOS to the Core if no shootable
+    # enemy exists.
+    if best_dir is None:
+        for d in DIRECTIONS:
+            nxt = (pos[0] + d.delta[0], pos[1] + d.delta[1])
+            if nxt in blocked or nxt in friendly_full:
+                continue
+            if avoid is not None and nxt in avoid:
+                continue
+            nd = _manhattan(nxt, core_pos)
+            if nd < 2 or nd > 3:
+                continue
+            if _can_shoot(nxt, core_pos, obstacles):
+                best_dir = d
+                break
+    return best_dir
+
+
+def _control_rangers(turn: "Turn", core_pos: tuple[int, int]) -> None:
+    obstacles = frozenset(turn.obstacle_cells) | _known_obstacles
+    enemies = turn.visible_enemies
+    for index, ranger in enumerate(turn.rangers):
+        target = _select_ranger_target(ranger.position, enemies, obstacles, core_pos)
+        if target is not None:
+            ranger.shoot(target)
+            continue
+        # The FIRST Ranger is the dedicated Core guard: hold a choke near the
+        # Core with a clear cardinal line to the Core cell, preferring cells
+        # that cover visible enemies too. 8th review: old ring-orbit guard
+        # scored nothing but Manhattan distance, allowed dist-4 cells that
+        # cannot shoot the Core cell (range cap 3), and had no obstacle or
+        # occupancy awareness — the new _guard_step is LOS/choke-aware.
+        if index == 0:
+            # Friendly-full cells block the guard's ring, but the guard must
+            # not block the deposit lane (leave-one-exit rule).
+            friendly_full = frozenset(
+                cell for cell, count
+                in Counter(tuple(u.position) for u in turn.units).items()
+                if count >= 2
+            )
+            step = _guard_step(
+                ranger.position, core_pos,
+                obstacles, obstacles,
+                turn.visible_enemies, friendly_full,
+                avoid=_avoid_set(str(ranger.id)),
+            )
+            if step is not None:
+                ranger.move(step)
+            continue
+        # Otherwise explore like a Worker (a Ranger's vision radius of 5 is the
+        # best scout): use the deterministic scan-row sweep so it covers ground
+        # instead of milling near the Core.
+        pos = ranger.position
+        rid = str(ranger.id)
+        # Bounded drive-off (8th review, rank 2): a non-guard Ranger chases a
+        # visible or recently-seen enemy near the Core, so inbound raiders are
+        # intercepted instead of ignored. Guard (index 0) never chases.
+        chase = _chase_target(pos, core_pos, enemies, rid, turn.tick)
+        if chase is not None:
+            enemy_cells = frozenset(e.position for e in enemies)
+            step = _step_toward(
+                pos, chase,
+                obstacles | enemy_cells,
+                avoid=_avoid_set(rid),
+            )
+            if step is None:
+                step = _step_toward(pos, chase, obstacles, avoid=None)
+            if step is not None:
+                _record_pos(rid, pos)
+                ranger.move(step)
+            continue
+        # Boxed-in escape (same pocket-cycle trap as workers): if the Ranger's
+        # recent positions fit a tiny box, it is spinning in an obstacle pocket
+        # — break out by stepping away from the Core.
+        if _is_boxed_in(rid):
+            _explore_state.pop(rid, None)
+            _pos_history.pop(rid, None)
+            step = _step_away_from(pos, core_pos, obstacles, avoid=None)
+            if step is not None:
+                _record_pos(rid, pos)
+                ranger.move(step)
+            continue
+        step = _explore_step(index + 10, rid, pos, core_pos, obstacles)
+        if step is not None:
+            _record_pos(rid, pos)
+            ranger.move(step)
+        elif index == 1:
+            # The 2nd non-guard Ranger holds a home-band patrol ring so a raid
+            # always has a close-in interceptor; only the OTHER roaming Ranger
+            # (index >= 2) scouts far (8th review, rank 5).
+            step = _ring_patrol_step(pos, core_pos, obstacles)
+            if step is not None:
+                _record_pos(rid, pos)
+                ranger.move(step)
+
+
+def _standing_army_targets(n_workers: int) -> tuple[int, int]:
+    """Scale the standing combat reserve with the Worker economy.
+
+    User requirement: as the Worker fleet grows, the standing army must grow
+    with it, so a raid meets more return fire the more valuable the Core is
+    (the 2026-08-02 Core loss was a raid against an economy with no army).
+    Roughly one combat pair (Vanguard + Ranger) per 8 Workers, a floor of 1,
+    then shrunk to fit the free-upkeep population budget (W + V + R <= 19,
+    i.e. budget = FREE_UPKEEP_CAP - 1) so growth never overflows into upkeep
+    tier 1.
+    """
+    pairs = max(1, n_workers // 8)
+    vanguards = pairs
+    rangers = pairs
+    budget = FREE_UPKEEP_CAP - 1
+    while n_workers + vanguards + rangers > budget:
+        if vanguards > rangers and vanguards > 1:
+            vanguards -= 1
+        elif rangers > 0:
+            rangers -= 1
+        else:
+            # At the W=19 edge with V=1, R=0: total = 20, exceeds budget.
+            # Clamp vanguard floor to 0 for this single edge case so the
+            # invariant W+V+R <= 19 holds; the army will be rebuilt as soon
+            # as a Worker dies or later when the army target is applied
+            # dynamically (budget-aware wants_worker in _control_core).
+            if vanguards == 1 and rangers == 0:
+                vanguards = 0
+            break
+    return vanguards, rangers
+
+
+def _control_pop_demotion(turn: "Turn") -> None:
+    """Shrink the fleet back under the free-upkeep cap when growth overshoots.
+
+    Can happen when the Core spawns faster than the population gate expected
+    (e.g. after a full-capacity deadlock unblocks and multiple spawns land in
+    quick succession): population passes FREE_UPKEEP_CAP-1, upkeep enters tier
+    1 and drains resources every Tick, and the live server destroys Units with
+    UPKEEP_DEFICIT when resources cannot cover the charge — an over-budget
+    fleet bleeds out by random attrition, possibly taking the standing army.
+    Self-destruct ALL surplus EMPTY Workers this Tick (empty so no cargo drops;
+    SELF_DESTRUCT resolves before upkeep, so the drain stops the same Tick).
+    Choose the surplus Workers NEAREST the Core so the most distant sweep
+    coverage survives. Combat Units are never culled: the standing army stays
+    intact (user requirement).
+    """
+    surplus = turn.state.population - (FREE_UPKEEP_CAP - 1)
+    if surplus <= 0:
+        return
+    core = turn.core
+    if core is None:
+        return
+    core_pos = core.position
+    candidates = sorted(
+        (w for w in turn.workers if w.cargo == 0),
+        key=lambda w: _manhattan(w.position, core_pos),
+    )
+    for worker in candidates[:surplus]:
+        worker.self_destruct()
+
+
+def _control_core(turn: "Turn", threats: list[UnitView | CoreView]) -> None:
+    core = turn.core
+    if core is None:
+        return
+    # A migrating Core cannot spawn, repair, or receive deposits; let the move
+    # resolve rather than queue an action that would fail with CORE_ALREADY_MOVING.
+    if core.view.state == "MOVING":
+        return
+
+    resources = turn.resources
+    # Repair shield first when under threat and there is space and a spare
+    # resource. Holding the Beacon raises the cap to 10, so use the live cap.
+    if threats and resources >= 1:
+        cap = 10 if turn.beacon.status == BeaconStatus.CARRIED else 5
+        if core.shield < cap:
+            core.repair_shield()
+            return
+
+    # Spawn Workers toward the target fleet so the economy grows and explores
+    # faster, staying in the free-upkeep band (population < 20). Only spawn
+    # when the Core cell has room (Core + at most one colocated Unit) so it
+    # does not fail with CELL_UNIT_LIMIT.
+    #
+    # EXCEPTION: when the Core is at full resource capacity AND the only
+    # occupant is a LADEN Worker, skip the colocated guard: the Worker's
+    # deposit would fail (CORE_RESOURCE_FULL) so _control_workers steps it OFF
+    # the Core cell this same Tick, and Unit movement resolves BEFORE Core
+    # spawn (rules: moves step 5, spawn step 9), clearing the cell so the spawn
+    # succeeds. The spawn spends 5 resources, opening room for the Worker's
+    # deposit next Tick. An empty Worker or a combat Unit stays put, so
+    # spawning would only fail CELL_UNIT_LIMIT — keep the guard for those.
+    population = turn.state.population
+    core_full = resources >= turn.resource_capacity
+    colocated = sum(u.position == core.position for u in turn.units)
+    laden_on_core = sum(
+        w.cargo > 0 for w in turn.workers if w.position == core.position
+    )
+    can_clear_occupied = core_full and colocated == laden_on_core and laden_on_core > 0
+    if colocated >= 1 and not can_clear_occupied:
+        return
+    if population >= FREE_UPKEEP_CAP - 1:
+        return
+    # Deposits resolve before spawn in the same Tick (rules: resolution order),
+    # so a colocated Worker's cargo counts toward the spawn cost.
+    pending_deposit = sum(
+        w.cargo for w in turn.workers if w.position == core.position
+    )
+    effective_resources = resources + pending_deposit
+
+    # Standing-army priorities. Combat Units are built BEFORE growing the Worker
+    # fleet past the economy floor, so a surprise raid always meets return fire.
+    # The target combat counts step up when a threat is actually visible.
+    #
+    # Order: below MIN_WORKERS_BEFORE_ARMY, Workers come first so the economy
+    # can sustain the army; at or above the floor, combat Units take priority
+    # (and Worker growth is bank-throttled — see the army_short gate below) so
+    # the standing reserve completes before the fleet grows past the floor.
+    threatened = bool(threats)
+    if threatened:
+        # Under a visible threat, escalate the defensive line to the combat
+        # caps regardless of the peacetime standing scale.
+        target_vanguards = DEFENSE_VANGUARDS
+        target_rangers = DEFENSE_RANGERS
+    else:
+        # Peacetime standing reserve scales with the Worker economy (user
+        # requirement): a bigger fleet must field a bigger army so a raid
+        # meets more return fire the more valuable the Core is. Growth is
+        # capped by the free-upkeep population budget below 20.
+        target_vanguards, target_rangers = _standing_army_targets(
+            len(turn.workers)
+        )
+    economy_floor_met = len(turn.workers) >= MIN_WORKERS_BEFORE_ARMY
+
+    if economy_floor_met:
+        # Rangers are the strongest defender (range-3 return fire from a
+        # 5-vision scout) but cost 12, so build the cheap Vanguard body-block
+        # first, then the Ranger.
+        wants_vanguard = len(turn.vanguards) < target_vanguards
+        wants_ranger = len(turn.rangers) < target_rangers
+        if wants_vanguard and effective_resources >= 10:
+            core.spawn(UnitType.VANGUARD)
+            return
+        if wants_ranger and effective_resources >= 12:
+            core.spawn(UnitType.RANGER)
+            return
+
+    # Budget-aware Worker target (6th review, strategy STRAT-5): the effective
+    # ceiling is the free-upkeep population budget minus the standing army's pop
+    # cost. A fixed TARGET_WORKERS=19 ignored the army (e.g. V1R3 leaves room
+    # for only 15 Workers) and pushed the fleet into tier-1 upkeep. TARGET_WORKERS
+    # remains as a legacy constant for the never-reached pre-army ceiling.
+    worker_target = FREE_UPKEEP_CAP - 1 - (
+        len(turn.vanguards) + len(turn.rangers)
+    )
+    wants_worker = len(turn.workers) < worker_target
+    army_short = (
+        len(turn.vanguards) < target_vanguards
+        or len(turn.rangers) < target_rangers
+    )
+    # Above the economy floor, if the combat reserve is STILL short, do NOT
+    # spend 5 on another Worker — bank the resource toward the 10/12 combat Unit
+    # instead, or the economy stalls at ~5 and never affords return fire (the
+    # exact trap that lost the Core on 2026-08-02).
+    if economy_floor_met and army_short:
+        return
+    # Bank reserve: only spawn a Worker if the Core keeps at least
+    # WORKER_SPAWN_RESERVE resources afterward, so the economy never drains to
+    # zero and the standing-army bank is not reset each spawn.
+    if wants_worker and effective_resources >= 5 + WORKER_SPAWN_RESERVE:
+        core.spawn(UnitType.WORKER)
+        return
+
+
+def _sync_explore_state(turn: "Turn") -> None:
+    """Drop exploration hints for Units that are no longer alive.
+
+    A Worker that died or a fresh respawn (new UUIDs) must not keep stale state.
+    This keeps the intent dict aligned with the current live Units.
+    """
+    live = {str(u.id) for u in turn.units}
+    for uid in list(_explore_state):
+        if uid not in live:
+            del _explore_state[uid]
+    for uid in list(_prev_pos):
+        if uid not in live:
+            del _prev_pos[uid]
+    for uid in list(_pos_history):
+        if uid not in live:
+            del _pos_history[uid]
+    for uid in list(_last_pos):
+        if uid not in live:
+            del _last_pos[uid]
+            del _stuck_ticks[uid]
+
+
+def _vision_sources(turn: "Turn") -> list[tuple[tuple[int, int], int]]:
+    """Yield (position, vision_radius) pairs for all friendly vision sources.
+
+    Core vision radius 5, Worker 3, Vanguard 4, Ranger 5 (game rules).
+    """
+    sources: list[tuple[tuple[int, int], int]] = []
+    core = turn.core
+    if core is not None:
+        sources.append((core.position, 5))
+    for u in turn.units:
+        if u.unit_type == "WORKER":
+            sources.append((u.position, 3))
+        elif u.unit_type == "VANGUARD":
+            sources.append((u.position, 4))
+        elif u.unit_type == "RANGER":
+            sources.append((u.position, 5))
+    return sources
+
+
+def _supercover_line(
+    start: tuple[int, int], target: tuple[int, int]
+) -> list[tuple[int, int]]:
+    """Integer supercover line cells from ``start`` to ``target`` inclusive.
+
+    Same as the reference agent's implementation: when the ray passes exactly
+    through a cell corner, both adjacent cells are considered traversed, so an
+    obstacle on either blocks the line.
+    """
+    x, y = start
+    tx, ty = target
+    dx = abs(tx - x)
+    dy = abs(ty - y)
+    sx = 1 if tx > x else -1
+    sy = 1 if ty > y else -1
+    covered = [(x, y)]
+    px = 0
+    py = 0
+    while px < dx or py < dy:
+        horizontal = (1 + 2 * px) * dy
+        vertical = (1 + 2 * py) * dx
+        if horizontal == vertical:
+            prev_x, prev_y = x, y
+            x += sx
+            px += 1
+            covered.append((x, y))
+            covered.append((prev_x, prev_y + sy))
+            y += sy
+            py += 1
+            covered.append((x, y))
+        elif horizontal < vertical:
+            x += sx
+            px += 1
+            covered.append((x, y))
+        else:
+            y += sy
+            py += 1
+            covered.append((x, y))
+    return covered
+
+
+def _any_vision_sees(
+    cell: tuple[int, int],
+    sources: list[tuple[tuple[int, int], int]],
+    obstacles: frozenset[tuple[int, int]],
+) -> bool:
+    """True if any vision source can see ``cell`` (within radius and with a
+    clear supercover line — an obstacle on any traversed cell blocks vision).
+    """
+    for pos, radius in sources:
+        if _manhattan(pos, cell) > radius:
+            continue
+        if _manhattan(pos, cell) == 0:
+            return True
+        blocked = any(
+            (x, y) in obstacles
+            for (x, y) in _supercover_line(pos, cell)[1:-1]
+        )
+        if not blocked:
+            return True
+    return False
+
+
+def _observe_resources(turn: "Turn") -> None:
+    """Update the local resource memory pool from the current Tick's state.
+
+    Add newly-visible resources; remove cells confirmed bare (visible and NOT
+    a resource); remove cells harvested successfully this Tick.
+    """
+    global _known_resources
+    # Add all currently visible resources.
+    _known_resources.update(turn.resource_cells)
+    # Remove cells harvested this Tick (the event carries the harvest cell).
+    for event in turn.events:
+        if event.event_type == "HARVEST_SUCCEEDED" and event.position is not None:
+            _known_resources.discard(tuple(event.position))
+    # Remove cells that a friendly vision source can see and are confirmed
+    # not to hold a resource (visible but not in turn.resource_cells).
+    sources = _vision_sources(turn)
+    obstacles = turn.obstacle_cells
+    for cell in list(_known_resources):
+        if cell in turn.resource_cells:
+            continue  # still a resource, keep it
+        if _any_vision_sees(cell, sources, obstacles):
+            _known_resources.discard(cell)
+    # Prune cells far beyond the Core (Chebyshev > 80). When the Core migrates
+    # (the user does this manually), stale cells from the abandoned chunk
+    # persist in the pool and workers detour to them instead of sweeping fresh
+    # territory (7th review, MIG-3). Loose bound: a normal chunk-anchored sweep
+    # never triggers it, a migration does.
+    core = turn.core
+    if core is not None:
+        cx, cy = core.position
+        _known_resources = {
+            cell
+            for cell in _known_resources
+            if max(abs(cell[0] - cx), abs(cell[1] - cy)) < 80
+        }
+    _save_persistent_state()
+
+
+def _observe_enemies(turn: "Turn") -> None:
+    """Record last-seen enemy positions and prune stale memory.
+
+    Feeds the bounded drive-off for non-guard Rangers (8th review, rank 2):
+    with only current-visible enemies, a raider parked just outside range is
+    never driven off. Remembering positions lets Rangers chase briefly.
+    """
+    tick = turn.tick
+    for e in turn.visible_enemies:
+        _last_enemy_pos[str(e.id)] = (tuple(e.position), tick)
+    for eid in list(_last_enemy_pos):
+        _, seen = _last_enemy_pos[eid]
+        if tick - seen > ENEMY_MEMORY_TICKS:
+            del _last_enemy_pos[eid]
+
+
+def _chase_target(
+    pos: tuple[int, int],
+    core_pos: tuple[int, int],
+    enemies: tuple[UnitView | CoreView, ...],
+    rid: str,
+    tick: int,
+) -> tuple[int, int] | None:
+    """Pick an enemy cell for a non-guard Ranger to drive off, or None.
+
+    Bounded: chases only enemies within CHASE_RADIUS of the Core, gives up
+    after CHASE_MAX_TICKS, then cools down before chasing again.
+    """
+    if _chase_cooldown_until.get(rid, 0) > tick:
+        return None
+    start = _chase_start.get(rid)
+    if start is not None and tick - start > CHASE_MAX_TICKS:
+        _chase_start.pop(rid, None)
+        _chase_cooldown_until[rid] = tick + CHASE_COOLDOWN_TICKS
+        return None
+    # Visible enemy within CHASE_RADIUS of the Core -> drive it off.
+    candidates = [
+        e for e in enemies
+        if _manhattan(core_pos, e.position) < CHASE_RADIUS
+    ]
+    if candidates:
+        nearest = min(candidates, key=lambda e: _manhattan(pos, e.position))
+        _chase_start[rid] = _chase_start.get(rid, tick)
+        return tuple(nearest.position)
+    # Last-known enemy within the radius + slack -> re-acquire.
+    for epos, seen in _last_enemy_pos.values():
+        if _manhattan(core_pos, epos) < CHASE_RADIUS + 6:
+            _chase_start[rid] = _chase_start.get(rid, tick)
+            return epos
+    return None
+
+
+def _process_events(turn: "Turn") -> None:
+    """Read the previous Tick's resolution events.
+
+    Per the bundled rules, ``turn.events`` explains how the new state came
+    about and must not be replayed as patches. We use them only to inform the
+    run observer (see play.py) and to surface notable outcomes; they do not
+    change the queued plan.
+    """
+    for event in turn.events:
+        if event.event_type == "WORKER_CARGO_DROPPED":
+            continue
+        if event.harvest_source is HarvestSource.DROPPED_CARGO:
+            continue
+        if event.event_type == "CORE_DAMAGED":
+            continue
+
+
+def _clear_exploration_state() -> None:
+    """Reset all per-worker exploration memory and the resource pool.
+
+    Called when the Core finishes migrating (the user moves it manually into
+    obstacle corners). After a move, the memory pool and sweep state refer to
+    the abandoned neighborhood — workers detour to stale harvested cells and
+    cluster near the Core instead of sweeping fresh territory (observed: 15
+    workers parked within a few cells of a moved Core, r stuck for hundreds
+    of ticks). Clearing forces a clean re-sweep of the new neighborhood.
+    """
+    _known_resources.clear()
+    _explore_state.clear()
+    _pos_history.clear()
+    _prev_pos.clear()
+    _last_pos.clear()
+    _stuck_ticks.clear()
+
+
+def decide(turn: "Turn") -> None:
+    """Queue a complete plan for one Turn based only on its authoritative state.
+
+    This reads ``turn`` only and never retains controller objects across
+    Turns. At most one action is queued per object; objects with no useful
+    legal action are left to resolve as ``WAIT``.
+    """
+    _process_events(turn)
+    # The user migrates the Core manually (often into obstacle corners). When a
+    # move resolves, every sweep column and remembered resource points at the
+    # old neighborhood — clear so workers re-sweep the new one instead of
+    # clustering at stale cells near the moved Core.
+    if any(e.event_type == "CORE_MOVE_SUCCEEDED" for e in turn.events):
+        _clear_exploration_state()
+    _sync_explore_state(turn)
+    _observe_terrain(turn)
+    _observe_resources(turn)
+    _observe_enemies(turn)
+
+    core = turn.core
+    if core is None:
+        # Respawning: submit no invented actions. An empty plan is a valid
+        # complete replacement that leaves every object on WAIT.
+        return
+
+    core_pos = core.position
+    threats = _threats_to_core(core_pos, turn.visible_enemies)
+
+    # Defense first: react to visible nearby enemies and Core damage before
+    # pursuing the economy or distant goals.
+    _control_rangers(turn, core_pos)
+    _control_vanguards(turn, core_pos)
+    _control_core(turn, threats)
+    _control_workers(turn, core_pos)
+    # Cull LAST: the SDK unit action slot is last-set-wins, so if the demotion
+    # ran first, _control_workers would overwrite the queued SELF_DESTRUCT with
+    # a MOVE and the over-budget fleet would never actually cull (6th review,
+    # skeptic F1). Running after every other unit command guarantees the cull
+    # survives into the submitted plan.
+    _control_pop_demotion(turn)

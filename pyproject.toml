@@ -1,0 +1,21 @@
+[project]
+name = "arena-hero-tactic"
+version = "0.1.0"
+description = "Balanced starter tactic for Arena Hero v0.7"
+requires-python = ">=3.11"
+dependencies = [
+    "arena-hero>=0.2.4,<0.3",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.4.2",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["."]
+only-include = ["tactic.py", "play.py"]

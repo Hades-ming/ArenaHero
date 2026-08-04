@@ -1,0 +1,12 @@
+.env
+.venv/
+__pycache__/
+.pytest_cache/
+game.log
+game.log.*
+play.out
+play.out.*
+play.pid
+tactic_state.json
+.claude/
+.DS_Store
