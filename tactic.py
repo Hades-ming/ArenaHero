@@ -1108,17 +1108,28 @@ def _control_workers(turn: "Turn", core_pos: tuple[int, int]) -> None:
                     continue
                 lock = None
             else:
-                if st is None or len(st) < 4:
-                    st = [0, 1, lock[0], lock[1]]
+                # Revalidate the lock each tick (9th review, rank 4): if the
+                # locked cell is no longer a known/visible resource (e.g.
+                # harvested by another worker), drop it immediately instead of
+                # walking up to 20 cells into a dead end.
+                if lock not in _known_resources and lock not in resource_cells:
+                    if st is not None and len(st) >= 4:
+                        st[2] = None
+                        st[3] = None
+                        _explore_state[wid] = st
+                    lock = None
                 else:
-                    st[2], st[3] = lock[0], lock[1]
-                _explore_state[wid] = st
-                step = _step_toward(pos, lock, blocked_empty, avoid=_avoid_set(wid))
-                if step is not None:
-                    _prev_pos[wid] = pos
-                    _record_pos(wid, pos)
-                    worker.move(step)
-                continue
+                    if st is None or len(st) < 4:
+                        st = [0, 1, lock[0], lock[1]]
+                    else:
+                        st[2], st[3] = lock[0], lock[1]
+                    _explore_state[wid] = st
+                    step = _step_toward(pos, lock, blocked_empty, avoid=_avoid_set(wid))
+                    if step is not None:
+                        _prev_pos[wid] = pos
+                        _record_pos(wid, pos)
+                        worker.move(step)
+                    continue
         # No lock and no nearby resource: explore using the chunk-anchored
         # boustrophedon. Pass the fleet size and Worker index so columns are
         # distributed evenly across the full chunk width.
@@ -1744,6 +1755,15 @@ def _observe_resources(turn: "Turn") -> None:
             cell
             for cell in _known_resources
             if max(abs(cell[0] - cx), abs(cell[1] - cy)) < 80
+        }
+        # Economy-pool hygiene (9th review, rank 5): drop nodes so far from the
+        # Core they are never collectable (the round trip is a net loss). They
+        # are re-added if a vision source re-lights them later. Prevents a
+        # sparse pool from pulling an edge Worker into a wasted approach.
+        _known_resources = {
+            cell
+            for cell in _known_resources
+            if _manhattan((cx, cy), cell) <= MAX_HARVEST_FROM_CORE + HARVEST_REACH
         }
     _save_persistent_state()
 
