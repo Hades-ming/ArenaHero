@@ -980,12 +980,17 @@ def _control_workers(turn: "Turn", core_pos: tuple[int, int]) -> None:
                 _pos_history.pop(wid, None)  # fresh start after deposit
             else:
                 if core_full:
-                    # Disperse: when the Core is full, laden Workers returning
-                    # home only cluster around the Core and fill every adjacent
-                    # cell to 2/2, deadlocking spawn. Step away from Core
-                    # instead of toward it to let the cluster thin.
-                    avoid = _avoid_set(wid)
-                    step = _step_away_from(pos, core_pos, blocked, avoid=avoid)
+                    # Core full: laden Workers cannot deposit. Instead of
+                    # orbiting the Core (dead time), resume the boustrophedon
+                    # sweep to keep discovering nodes; once a slot frees
+                    # (spawn/casualty) the Worker returns to deposit (9th
+                    # review rank 1). This preserves discovery during the
+                    # saturation window.
+                    step = _explore_step(
+                        index, wid, pos, core_pos, blocked,
+                        target_col=chemotaxis_col, avoid=_avoid_set(wid),
+                        fleet_size=len(turn.workers),
+                    )
                     if step is None:
                         step = _step_away_from(pos, core_pos, blocked, avoid=None)
                     if step is not None:
