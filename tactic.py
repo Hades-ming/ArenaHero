@@ -1068,28 +1068,35 @@ def _control_workers(turn: "Turn", core_pos: tuple[int, int]) -> None:
         # rather than blindly exploring (observed: workers idled while the user
         # saw map-wide resources uncollected).
         known = frozenset(_known_resources)
-        # Sort KNOWN resources by distance to this worker. Pick the nearest one
-        # that has NOT already been claimed by another empty worker — this fans
-        # the fleet across the resource pool instead of converging on the single
-        # closest node.
-        visible = sorted(
-            known if known else resource_cells,
-            key=lambda c: _manhattan(pos, c),
-        )
-        if visible:
-            for candidate in visible:
-                if candidate in claims:
-                    continue
-                nearest = candidate
-                lock_dist = MAX_HARVEST_REACH if nearest in known else HARVEST_LOCK_RANGE
-                # Skip nodes too far from the Core — the round trip is a net
-                # loss and stalls the economy (observed: (30,274) at dist 55).
-                if _manhattan(core_pos, nearest) > MAX_HARVEST_FROM_CORE:
-                    continue
-                if _manhattan(pos, nearest) <= lock_dist:
-                    lock = nearest
-                    claims[lock] = index + 1
-                    break
+        # Claim exemption: if this worker ALREADY holds a valid lock on a known
+        # resource (and it's still economically reachable), keep it — another
+        # worker must not yank a mid-walk target (community Player C's pacing
+        # anti-pattern: "a far worker steals the node at a near worker's feet").
+        if lock is not None and lock in known and _manhattan(core_pos, lock) <= MAX_HARVEST_FROM_CORE:
+            claims[lock] = index + 1
+        else:
+            # Sort KNOWN resources by distance to this worker. Pick the nearest
+            # one that has NOT already been claimed by another empty worker —
+            # this fans the fleet across the pool instead of converging on the
+            # single closest node.
+            visible = sorted(
+                known if known else resource_cells,
+                key=lambda c: _manhattan(pos, c),
+            )
+            if visible:
+                for candidate in visible:
+                    if candidate in claims:
+                        continue
+                    nearest = candidate
+                    lock_dist = MAX_HARVEST_REACH if nearest in known else HARVEST_LOCK_RANGE
+                    # Skip nodes too far from the Core — the round trip is a net
+                    # loss and stalls the economy (observed: (30,274) at dist 55).
+                    if _manhattan(core_pos, nearest) > MAX_HARVEST_FROM_CORE:
+                        continue
+                    if _manhattan(pos, nearest) <= lock_dist:
+                        lock = nearest
+                        claims[lock] = index + 1
+                        break
         # If we have a lock, keep moving toward it; abandon it only once the
         # Worker is on the cell but it is not a resource (harvested or gone).
         if lock is not None:
