@@ -1287,13 +1287,12 @@ def test_resource_memory_pool_remembers_and_confirms() -> None:
 
 
 def test_worker_sweep_directions_alternate_by_index() -> None:
-    # 6th review cov-3: all Workers used to start sweeping SOUTH (south=1),
-    # so the home chunk's north rows were never covered. Now even-index
-    # Workers start south, odd-index start north, so both halves get swept.
+    # 10th review: half-zone bias — even-index Workers sweep the NORTH half
+    # first (start north), odd the south half, so both halves get covered.
     tactic._begin_outbound("worker0", 0, (0, 0), (0, 0))
     tactic._begin_outbound("worker1", 1, (0, 0), (0, 0))
-    assert tactic._explore_state["worker0"][1] == 1  # even -> south first
-    assert tactic._explore_state["worker1"][1] == 0  # odd  -> north first
+    assert tactic._explore_state["worker0"][1] == 0  # even -> north first
+    assert tactic._explore_state["worker1"][1] == 1  # odd  -> south first
 
 
 def test_guard_ranger_holds_near_core() -> None:

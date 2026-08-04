@@ -721,12 +721,12 @@ def _explore_step(
 
     state = _explore_state.get(worker_id)
     if state is None or len(state) < 2:
-        # Alternate the initial march direction by Worker index (6th review,
-        # cov-3): all-south init made every Worker sweep the south band first
-        # and never reach the home chunk's north rows (y<234 got 0 visits over
-        # 61 ticks while y>250 got 860). Roughly half the fleet now starts
-        # north so both halves of the chunk are covered.
-        south_init = 1 if worker_index % 2 == 0 else 0
+        # Half-zone initial direction: even-index workers start NORTH (matching
+        # their north-half sweep band), odd start south. This is load-bearing —
+        # starting even workers south (the old cov-3) sent them into the south
+        # apron first and north coverage never happened (observed 13-14/15
+        # workers stuck south, north half nearly empty).
+        south_init = 0 if worker_index % 2 == 0 else 1
         state = [0, south_init, None, None]
         _explore_state[worker_id] = state
     col_off, south = state[0], state[1]
@@ -792,10 +792,10 @@ def _begin_outbound(worker_id: str, worker_index: int, pos: tuple[int, int], cor
     """
     state = _explore_state.get(worker_id)
     col_off = state[0] if state is not None and len(state) >= 1 else 0
-    # Alternate the resumed march direction by Worker index (6th review,
-    # cov-3): a hardcoded south resume keeps returning Workers in the south
-    # band and never covering the north half of the chunk.
-    south = 1 if worker_index % 2 == 0 else 0
+    # Resume toward the worker's half zone: even -> north, odd -> south (must
+    # match the south_init in _explore_step, or a deposit pulls the worker
+    # south again and north coverage collapses).
+    south = 1 if worker_index % 2 == 1 else 0
     _explore_state[worker_id] = [col_off, south, None, None]
 
 
@@ -936,7 +936,9 @@ def _control_workers(turn: "Turn", core_pos: tuple[int, int]) -> None:
         if _is_boxed_in(wid):
             st = _explore_state.get(wid)
             col_off = st[0] if st is not None and len(st) >= 1 else 0
-            _explore_state[wid] = [col_off + _SWEEP_COL_STEP, 1, None, None]
+            # Keep the half-zone direction on escape (even -> north, odd ->
+            # south), otherwise a boxed escape re-sends even workers south.
+            _explore_state[wid] = [col_off + _SWEEP_COL_STEP, 1 if index % 2 == 1 else 0, None, None]
             _pos_history.pop(wid, None)
             _prev_pos.pop(wid, None)
             _last_pos.pop(wid, None)
