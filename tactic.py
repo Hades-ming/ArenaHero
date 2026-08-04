@@ -160,7 +160,7 @@ MAX_HARVEST_REACH = 20
 # harvested (30,274) at dist 55 and the economy stalled on its long delivery).
 # Only actively harvest nodes the Core can reach economically; beyond this a
 # Worker picks one up if it happens to pass through, not by lock.
-MAX_HARVEST_FROM_CORE = 25
+MAX_HARVEST_FROM_CORE = 30
 
 # Per-Worker exploration memory, keyed by the Unit UUID string. Each entry is
 # [direction_index_into_DIRECTIONS, steps_taken_in_this_leg]. This is not a
@@ -686,14 +686,20 @@ def _explore_step(
     """
     chunk_x0, chunk_y0 = _chunk_origin(core_pos)
     chunk_y1 = chunk_y0 + CHUNK_SIZE - 1
+    # 10th review rank 1: extend the sweep beyond the home chunk so edge
+    # workers tile the reachable aprons of the four neighbor chunks (virgin
+    # ground; the home chunk is exhausted). Collecting still respects
+    # MAX_HARVEST_FROM_CORE, so far-apron cells are lit but not locked.
+    chunk_y_lo = chunk_y0 - 12
+    chunk_y_hi = chunk_y1 + 12
     # Fourth-review fix: clamp the Worker's target column to the home chunk
     # x-range. _advance_col_off wraps col_off within [-_SWEEP_COL_WRAP,
     # +_SWEEP_COL_WRAP], which for an edge-assigned Worker (base_col near a
     # chunk boundary) produces target_x OUTSIDE the home chunk (095d133 drifted
     # to x=-43, 11 cells into the neighboring poor chunk). Clamp here so a
     # Worker never marches off the chunk it is supposed to scan.
-    chunk_x_lo = chunk_x0
-    chunk_x_hi = chunk_x0 + CHUNK_SIZE - 1
+    chunk_x_lo = chunk_x0 - 12
+    chunk_x_hi = chunk_x0 + CHUNK_SIZE + 12 - 1
     # The Worker's base column is chunk-relative (full-width coverage); the
     # mutable col_off steps it sideways at each y-boundary to tile the chunk.
     if target_col is not None:
@@ -725,10 +731,10 @@ def _explore_step(
 
     # On the column: march north/south to the CHUNK edge (not Core-relative),
     # then step the column and reverse.
-    if south and pos[1] >= chunk_y1:
+    if south and pos[1] >= chunk_y_hi:
         south = 0
         col_off = _advance_col_off(col_off)
-    elif not south and pos[1] <= chunk_y0:
+    elif not south and pos[1] <= chunk_y_lo:
         south = 1
         col_off = _advance_col_off(col_off)
 
