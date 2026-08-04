@@ -154,7 +154,7 @@ HARVEST_LOCK_RANGE = 6
 # tactic has only partial vision of; a Worker parked 8-16 cells from a known
 # node used to just keep exploring (observed: workers idled while user-visible
 # resources sat uncollected). Commit to a known node within reach instead.
-MAX_HARVEST_REACH = 20
+MAX_HARVEST_REACH = 30
 # Max Core-to-resource distance worth harvesting. A node 55 cells out means a
 # ~110-tick round trip — a NET LOSS at ~0.1/tick income (observed: d48045
 # harvested (30,274) at dist 55 and the economy stalled on its long delivery).
