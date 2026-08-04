@@ -690,8 +690,18 @@ def _explore_step(
     # workers tile the reachable aprons of the four neighbor chunks (virgin
     # ground; the home chunk is exhausted). Collecting still respects
     # MAX_HARVEST_FROM_CORE, so far-apron cells are lit but not locked.
-    chunk_y_lo = chunk_y0 - 12
-    chunk_y_hi = chunk_y1 + 12
+    # Half-zone bias: even-index workers sweep the NORTH half mainly, odd the
+    # SOUTH half, so both halves stay covered. Without it, workers returning
+    # to deposit cluster south of the Core (Core y=234 is near the chunk's
+    # north edge, and the south apron is deeper), leaving north-refilled
+    # resources undiscovered (observed: 13/15 workers south, north nearly
+    # empty).
+    if worker_index % 2 == 0:
+        sweep_y_lo = chunk_y0 - 12
+        sweep_y_hi = core_pos[1] + 10   # north half + a little past the midline
+    else:
+        sweep_y_lo = core_pos[1] - 10
+        sweep_y_hi = chunk_y1 + 12      # south half + a little past the midline
     # Fourth-review fix: clamp the Worker's target column to the home chunk
     # x-range. _advance_col_off wraps col_off within [-_SWEEP_COL_WRAP,
     # +_SWEEP_COL_WRAP], which for an edge-assigned Worker (base_col near a
@@ -731,10 +741,10 @@ def _explore_step(
 
     # On the column: march north/south to the CHUNK edge (not Core-relative),
     # then step the column and reverse.
-    if south and pos[1] >= chunk_y_hi:
+    if south and pos[1] >= sweep_y_hi:
         south = 0
         col_off = _advance_col_off(col_off)
-    elif not south and pos[1] <= chunk_y_lo:
+    elif not south and pos[1] <= sweep_y_lo:
         south = 1
         col_off = _advance_col_off(col_off)
 
