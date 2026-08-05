@@ -36,14 +36,17 @@
 
 ## 实时监控与迭代闭环
 
-1. `play.py` 每 tick 把战况写进 `game.log`。
+完整治理合同见 `OPTIMIZATION_LOOP.md`，当前唯一任务板见 `ITERATION_PLAN.md`。
+
+1. 只允许一个 `play.py`；每个唯一 tick 的战况写进 `game.log`。
 2. `meta/monitor.py` 解析日志算出 KPI，并累计资源分配、可见/历史来源、动态阻塞、
    冷却、不可达、实际采集量与交付量，同时检测 idle 资源 / 单位拥堵 / 护核失败 /
    有敌未突袭等瓶颈。
-3. 遇到瓶颈或定时，多个**专家子代理**并行评审 `tactic.py` + 日志，提出改进。
-4. 采纳改进 → 跑测试 → `git commit` + `git push` 到 GitHub。
+3. 遇到瓶颈或定时，多个**专家子代理**并行评审规则、`tactic.py` 与日志，提出可证伪假设。
+4. 主代理批准任务，执行 Agent 在隔离 worktree 实现；主代理审查、测试和 live canary 后才
+   `git commit` + `git push` 到 GitHub。
 5. 踩坑记入 `LESSONS.md`，避免重犯。
-6. 每 6 小时 heartbeat 检查 SDK、规则文档与 live KPI；每轮人工审查仍显式复核。
+6. 每 6 小时或每 200 个唯一成功 Tick 检查 SDK、规则文档与 live KPI；每轮人工审查仍显式复核。
 
 ## 运行
 

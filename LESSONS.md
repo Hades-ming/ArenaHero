@@ -263,3 +263,21 @@
      upkeep、生产成本和防御风险时，才用滚动窗口 ROI 决定扩人口。
 - **状态**：✅ 阻塞漏分配、历史提示可信度和监控闭环已修；A* 往返 EV 与 Worker 级时延待 live
   数据支撑后实施。
+
+## L16 — 多个 Agent 客户端会互相覆盖计划，重复 Tick 不能做实验
+- **现象**：同时存在 LaunchAgent 和两个孤儿 `play.py`，同一 Tick 在 `game.log` 出现 2-5 次，
+  且不同进程为同一 Worker 生成了不同路线。表面上 monitor 有 202 条样本，实际只有约 41 个
+  唯一 Tick。
+- **规则根因**：同一玩家的所有 Agent 客户端共享一个 Agent 计划槽；同 Tick 后提交的完整计划
+  覆盖先提交计划，不会合并。多个客户端既污染日志，又真正改变服务器最终执行的计划。
+- **处置**：只保留 `io.arenahero.tactic` 管理的进程，终止两个孤儿进程并重启 LaunchAgent；
+  新日志从 `t57607` 单条记录重新起算，首条含 `DEPOSIT_SUCCEEDED[1]`，无协议错误。
+- **方法修正**：
+  1. 每次测试/live 前同时核验 LaunchAgent PID 与系统 `play.py` 进程数，必须恰好为 1。
+  2. KPI 按唯一 Tick 聚合并单独报告重复 Tick；旧的重复日志只作故障证据，不作 A/B 基线。
+  3. 执行 Agent 不得启动 live 或操作 LaunchAgent；只有主代理可以重启、canary、commit 和 push。
+  4. 外部 Agent 的提交即使测试通过，也必须按最新 `HEAD` 重新做规则、连续 Tick 和 live 审查；
+     纯函数目标值不能证明生产策略在真实人口门槛下可达。
+- **治理落地**：新增 `OPTIMIZATION_LOOP.md` 与 `ITERATION_PLAN.md`，明确专家只读、执行隔离、
+  主代理验收、样本门槛和回滚条件。
+- **状态**：✅ 单实例已恢复；唯一 Tick 与耗时 telemetry 列为 `OBS-001` 首个执行任务。

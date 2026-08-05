@@ -9,5 +9,6 @@ play.out
 play.out.*
 play.pid
 tactic_state.json
+.agent-runs/
 .claude/
 .DS_Store
