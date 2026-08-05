@@ -195,6 +195,16 @@ CHASE_MAX_TICKS = 8       # give up after chasing this many ticks
 CHASE_COOLDOWN_TICKS = 12
 ENEMY_MEMORY_TICKS = 6    # forget a last-seen enemy position after this many ticks
 
+# 9th review rank 1: per-Worker lock-progress watchdog. The anti-backtrack
+# avoid-set + an obstacle box can defeat greedy _step_toward pursuit of a valid
+# harvest lock (c8c1c2 4-cycled 20+ ticks around (28,247), never reaching it,
+# r frozen 42 ticks). Track the current lock, the Manhattan distance when the
+# worker locked it, and the lock tick. If the SAME lock is held >
+# LOCK_STALL_TICKS without the worker getting closer, drop the lock and clear
+# _pos_history so the A* path can form a fresh route instead of re-cycling.
+_lock_meta: dict[str, tuple[tuple[int, int], int, int]] = {}  # wid -> (lock, dist_at_lock, tick)
+LOCK_STALL_TICKS = 15
+
 # Local resource memory pool: remember resource cells even after they leave
 # vision, so Workers don't re-sweep bare ground they already confirmed empty.
 # A cell is added when first seen as a resource. It is removed when:
@@ -738,8 +748,15 @@ def _explore_step(
     # loss AND the worker never returns — observed workers stranded 60-88 cells
     # out (x 30-44, y 276-297) while north resources near the Core sat
     # uncollected. Steer back toward the Core until back in range.
+    # 9th review rank 3: use A* (same laden-return pattern) + clear anti-
+    # backtrack history so the avoid-set cannot re-enter the obstacle corner trap
+    # (67512f oscillated 70+ ticks at d=67-71 around the enemy Core at (38,278)).
     if _manhattan(pos, core_pos) > MAX_SWEEP_RADIUS:
-        step = _step_toward(pos, core_pos, blocked, avoid=avoid)
+        _pos_history.pop(worker_id, None)
+        _prev_pos.pop(worker_id, None)
+        step = _astar_step(pos, core_pos, blocked, blocked)
+        if step is None:
+            step = _step_toward(pos, core_pos, blocked)
         if step is not None:
             return step
     col_off, south = state[0], state[1]
@@ -934,7 +951,17 @@ def _control_workers(turn: "Turn", core_pos: tuple[int, int]) -> None:
         # shuttle it away in a move (observed: worker 68a41e parked on
         # (11,247) — a visible resource — yet got boxed-escaped into a move
         # instead of harvesting, and drifted off uncollected).
-        if worker.cargo == 0 and pos in resource_cells:
+        # 9th review rank 2: gate the on-cell harvest by Core distance. The
+        # lock path already refuses nodes beyond MAX_HARVEST_FROM_CORE, but
+        # this on-cell path fired unconditionally — 3ae099 harvested (35,251)
+        # at d=37 and spent 53+ ticks hauling cargo 1 home (a net loss). A
+        # worker standing on a node beyond the economic radius skips it and
+        # stays in the sweep fleet; a closer worker finds it or it refills.
+        if (
+            worker.cargo == 0
+            and pos in resource_cells
+            and _manhattan(core_pos, pos) <= MAX_HARVEST_FROM_CORE
+        ):
             worker.harvest()
             continue
         # Boxed-in detection: the STUCK check below only fires when a Worker
@@ -1085,7 +1112,9 @@ def _control_workers(turn: "Turn", core_pos: tuple[int, int]) -> None:
         blocked_empty = blocked | {core_pos}
         # An empty Worker on a visible resource cell harvests now. The cell set
         # is the current visible view, not permanent terrain.
-        if pos in resource_cells:
+        # 9th review rank 2: gate by Core distance (same as the immediate
+        # harvest at L940) so a distant node is left for discovery/sweep.
+        if pos in resource_cells and _manhattan(core_pos, pos) <= MAX_HARVEST_FROM_CORE:
             worker.harvest()
             continue
 
@@ -1160,7 +1189,33 @@ def _control_workers(turn: "Turn", core_pos: tuple[int, int]) -> None:
                     else:
                         st[2], st[3] = lock[0], lock[1]
                     _explore_state[wid] = st
-                    step = _step_toward(pos, lock, blocked_empty, avoid=_avoid_set(wid))
+                    # 9th review rank 1: the anti-backtrack avoid-set + obstacle
+                    # box defeats greedy _step_toward on the lock approach — c8c1c2
+                    # 4-cycled 20+ ticks around (28,247), never reaching it, and r
+                    # froze 42 ticks while the node stayed visible. Use the proven
+                    # laden-return A* pattern (L1067) with a greedy fallback.
+                    step = _astar_step(pos, lock, base_blocked, blocked_empty)
+                    if step is None:
+                        step = _step_toward(pos, lock, blocked_empty, avoid=_avoid_set(wid))
+                    if step is not None:
+                        # Watchdog: if this lock has been held > LOCK_STALL_TICKS
+                        # without the worker getting closer, the avoid-set is
+                        # re-cycling the same box. Drop the lock AND clear the
+                        # position history so a fresh A* route can form next tick.
+                        meta = _lock_meta.get(wid)
+                        if meta is None or meta[0] != lock:
+                            _lock_meta[wid] = (lock, _manhattan(pos, lock), turn.tick)
+                        else:
+                            _, dist_at_lock, lock_tick = meta
+                            if (
+                                turn.tick - lock_tick > LOCK_STALL_TICKS
+                                and _manhattan(pos, lock) >= dist_at_lock
+                            ):
+                                _lock_meta.pop(wid, None)
+                                _pos_history.pop(wid, None)
+                                _explore_state.pop(wid, None)
+                                lock = None
+                                step = None
                     if step is not None:
                         _prev_pos[wid] = pos
                         _record_pos(wid, pos)
@@ -1322,6 +1377,46 @@ def _can_shoot(
     return False
 
 
+def _guard_reposition_step(
+    pos: tuple[int, int],
+    core_pos: tuple[int, int],
+    blocked: frozenset[tuple[int, int]],
+    obstacles: frozenset[tuple[int, int]],
+    friendly_full: frozenset[tuple[int, int]],
+    avoid: frozenset[tuple[int, int]] | None = None,
+) -> Direction | None:
+    """Return one step toward the nearest legal dist-2/3 LOS choke for the guard.
+
+    9th review rank 5: when the guard sits out of Ranger range (dist 4-5) with
+    no adjacent cell that lands on a dist-2/3 LOS choke, it previously froze
+    (observed at (13,237), dist 5, zero return fire for 43+ ticks). This finds
+    the nearest passable cell within Manhattan 2-3 of the Core that has a clear
+    line to the Core cell, then A*-routes toward it (falling back to a greedy
+    step), so the guard re-enters range instead of standing still.
+    """
+    # Enumerate all dist-2/3 cells around the Core with a clear shot to it.
+    candidates: list[tuple[int, tuple[int, int]]] = []
+    for ddx in range(-3, 4):
+        for ddy in range(-3, 4):
+            cell = (core_pos[0] + ddx, core_pos[1] + ddy)
+            nd = abs(ddx) + abs(ddy)
+            if nd < 2 or nd > 3:
+                continue
+            if cell in blocked or cell in friendly_full:
+                continue
+            if not _can_shoot(cell, core_pos, obstacles):
+                continue
+            candidates.append((_manhattan(pos, cell), cell))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: item[0])
+    goal = candidates[0][1]
+    step = _astar_step(pos, goal, obstacles, blocked)
+    if step is None:
+        step = _step_toward(pos, goal, blocked, avoid=avoid)
+    return step
+
+
 def _guard_step(
     pos: tuple[int, int],
     core_pos: tuple[int, int],
@@ -1348,8 +1443,18 @@ def _guard_step(
     - Never accept a cell at dist-4 or with no LOS to the Core.
     """
     dist = _manhattan(pos, core_pos)
-    if dist > 5:
-        return _step_toward(pos, core_pos, blocked, avoid=avoid)
+    if dist > 3:
+        # 9th review rank 5: at dist 4-5 the adjacent-cell scoring below
+        # returns None (no neighbor lands at dist 2-3), so the guard froze at
+        # (13,237), dist 5, with ZERO ranged return fire for 43+ ticks. When
+        # out of range and no adjacent dist-2/3 LOS step exists, A* toward the
+        # nearest legal dist-2/3 LOS choke instead of standing still.
+        step = _guard_reposition_step(pos, core_pos, blocked, obstacles, friendly_full, avoid)
+        if step is not None:
+            return step
+        if dist > 5:
+            return _step_toward(pos, core_pos, blocked, avoid=avoid)
+        return None
     if dist < 2:
         # Adjacent to the Core: drift outward to a dist-2/3 cell that can
         # shoot the Core; in a corner the adjacent cell may be the only legal
@@ -1673,6 +1778,9 @@ def _sync_explore_state(turn: "Turn") -> None:
         if uid not in live:
             del _last_pos[uid]
             del _stuck_ticks[uid]
+    for uid in list(_lock_meta):
+        if uid not in live:
+            del _lock_meta[uid]
 
 
 def _vision_sources(turn: "Turn") -> list[tuple[tuple[int, int], int]]:
@@ -1920,6 +2028,7 @@ def _clear_exploration_state() -> None:
     _prev_pos.clear()
     _last_pos.clear()
     _stuck_ticks.clear()
+    _lock_meta.clear()
 
 
 def decide(turn: "Turn") -> None:

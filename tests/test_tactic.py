@@ -48,6 +48,7 @@ def _reset_explore_state() -> None:
     tactic._prev_pos.clear()
     tactic._last_pos.clear()
     tactic._stuck_ticks.clear()
+    tactic._lock_meta.clear()
     yield
     tactic._explore_state.clear()
     tactic._known_resources.clear()
@@ -58,6 +59,7 @@ def _reset_explore_state() -> None:
     tactic._prev_pos.clear()
     tactic._last_pos.clear()
     tactic._stuck_ticks.clear()
+    tactic._lock_meta.clear()
 
 
 def _state(
@@ -356,10 +358,11 @@ def test_worker_retargets_when_old_resource_disappears() -> None:
     decide(turn)
     action = _action(turn.plan, WORKER_ID)
     assert action.type == "MOVE"
-    # (0,4) is up-left; from (2,0) both axes reduce distance, dx=2 dy=4 so y
-    # axis is preferred first -> DOWN is wrong way; UP reduces y from 0 to -1?
-    # Position (0,4): target y=4, start y=0, so dy>0 -> DOWN. Step DOWN.
-    assert action.direction == Direction.DOWN
+    # From (2,0) toward (0,4): both LEFT (dx-1) and DOWN (dy+1) reduce Manhattan
+    # distance. The old greedy _step_toward picked DOWN by axis-preference; A* (9th
+    # review rank 1) picks whichever shortest-path tie-breaker wins. Either is valid
+    # and reduces the gap.
+    assert action.direction in (Direction.LEFT, Direction.DOWN)
 
 
 def test_dropped_cargo_pile_is_treated_as_resource_cell() -> None:
