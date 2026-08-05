@@ -1,16 +1,32 @@
-"""Balanced tactic for Arena Hero v0.7, tuned to maximize score.
+"""Goal-driven tactic for Arena Hero — FINAL OBJECTIVE: accumulate the most resources.
 
 Decisions are separated from connection setup so :func:`decide` can be tested
 without a live credential. See ``references/tactic-authoring.md`` and
 ``references/game-rules.md`` (bundled with the arena-hero skill) for the rules
 this tactic follows; no numeric rule is inferred from memory.
 
-Score on Arena Hero is not exposed in the player state; the durable way to
-accumulate it is to keep harvesting and depositing resources, destroy enemy
-objects when cheap, and avoid losing Units or the Core. This tactic therefore
-prioritizes a self-sustaining economy: Workers fan out to *find* resources
-(active exploration when none are visible), haul them home, and the Core
-reinvests into more Workers up to a free-upkeep fleet.
+FINAL GOAL — maximize resource accumulation
+-------------------------------------------
+Score is not exposed in the player state, so every behavior is justified by how
+it grows or protects the resource economy ("most resources" = highest durable
+resource throughput and net stockpile, not idle hoarding):
+
+* **Find & harvest** — Workers fan out to *discover* resources (active
+  exploration when none are visible) and haul them home. Discovery is the #1
+  lever on income; standing still earns nothing.
+* **Deposit & reinvest** — carried cargo is deposited on the Core cell; the Core
+  spends into more Workers (free-upkeep fleet) so income compounds.
+* **Protect the economy** — losing the Core forfeits ALL stored resources, and
+  losing Units forfeits their cargo. Defense (shield repair, a standing army,
+  a Wall) is therefore an *investment in the goal*, never waste.
+* **Build attack units in time (vs. other enemies)** — when enemies are visible,
+  the army is raised immediately (even below the economy floor) so a raid meets
+  return fire and the economy is not raided.
+* **Raid enemy Cores for +6** — a visible enemy Core is a resource jackpot
+  (+6 on destroy, shipped home). When one is in vision the tactic forms a strike
+  force to capture it instead of passively defending.
+* **Avoid idle gold** — resources on hand earn nothing; the reserve/wall logic
+  spends surplus into economy, defense, or army so capital is always working.
 
 Policy:
 
@@ -20,11 +36,12 @@ Policy:
 * when NO resource is visible, explore: each Worker keeps a marching direction
   and turns periodically to sweep new ground, so it does not stall on a bare
   view (vision radius is small, so standing still never reveals resources);
-* Rangers shoot visible legal targets (Core prioritized), else explore/kite;
+* Rangers shoot visible legal targets (enemy Core prioritized), else explore/kite;
 * Vanguards sweep the adjacent cell with the most enemies, else hold near Core;
 * repair Core shield only when under visible threat;
 * spawn Workers toward a soft target while upkeep stays free (population < 20)
   and the Core cell has room;
+* when enemies or an enemy Core are visible, prioritize attack-unit production;
 * leave an object on WAIT when no legal useful action is known.
 """
 
@@ -161,6 +178,16 @@ MAX_HARVEST_REACH = 30
 # Only actively harvest nodes the Core can reach economically; beyond this a
 # Worker picks one up if it happens to pass through, not by lock.
 MAX_HARVEST_FROM_CORE = 30
+# Wider band used when the economy is STARVED: nearby-but-distant nodes that are
+# a net loss in a healthy economy become worth taking when nothing closer exists
+# (expert review L2: late-game the Core sat at r0/95 because the only visible
+# nodes were d=41-46 and were hard-filtered). Keeps income alive instead of idling.
+MAX_HARVEST_FROM_CORE_STARVED = 55
+# If no harvest succeeds for this many ticks, treat the economy as starved and
+# permit harvesting out to MAX_HARVEST_FROM_CORE_STARVED.
+STARVE_TICKS = 50
+# Tick of the most recent successful harvest (module-level, reset on Core move).
+_last_harvest_tick: int = -10**9
 # Sweep radius cap: a worker explores within this Manhattan radius of the Core
 # only. Beyond it the deposit round trip is a net loss and workers were observed
 # stranding 60-88 cells out (never returning). Steers back toward the Core.
@@ -960,7 +987,7 @@ def _control_workers(turn: "Turn", core_pos: tuple[int, int]) -> None:
         if (
             worker.cargo == 0
             and pos in resource_cells
-            and _manhattan(core_pos, pos) <= MAX_HARVEST_FROM_CORE
+            and _manhattan(core_pos, pos) <= _harvest_radius(turn)
         ):
             worker.harvest()
             continue
@@ -1114,7 +1141,7 @@ def _control_workers(turn: "Turn", core_pos: tuple[int, int]) -> None:
         # is the current visible view, not permanent terrain.
         # 9th review rank 2: gate by Core distance (same as the immediate
         # harvest at L940) so a distant node is left for discovery/sweep.
-        if pos in resource_cells and _manhattan(core_pos, pos) <= MAX_HARVEST_FROM_CORE:
+        if pos in resource_cells and _manhattan(core_pos, pos) <= _harvest_radius(turn):
             worker.harvest()
             continue
 
@@ -1155,8 +1182,10 @@ def _control_workers(turn: "Turn", core_pos: tuple[int, int]) -> None:
                     nearest = candidate
                     lock_dist = MAX_HARVEST_REACH if nearest in known else HARVEST_LOCK_RANGE
                     # Skip nodes too far from the Core — the round trip is a net
-                    # loss and stalls the economy (observed: (30,274) at dist 55).
-                    if _manhattan(core_pos, nearest) > MAX_HARVEST_FROM_CORE:
+                    # loss and stalls the economy in a healthy state (observed:
+                    # (30,274) at dist 55). When starved, the radius widens so a
+                    # distant node is still taken rather than idling.
+                    if _manhattan(core_pos, nearest) > _harvest_radius(turn):
                         continue
                     if _manhattan(pos, nearest) <= lock_dist:
                         lock = nearest
@@ -1645,7 +1674,11 @@ def _control_pop_demotion(turn: "Turn") -> None:
         worker.self_destruct()
 
 
-def _control_core(turn: "Turn", threats: list[UnitView | CoreView]) -> None:
+def _control_core(
+    turn: "Turn",
+    threats: list[UnitView | CoreView],
+    enemy_core_visible: bool = False,
+) -> None:
     core = turn.core
     if core is None:
         return
@@ -1716,9 +1749,24 @@ def _control_core(turn: "Turn", threats: list[UnitView | CoreView]) -> None:
         target_vanguards, target_rangers = _standing_army_targets(
             len(turn.workers)
         )
-    economy_floor_met = len(turn.workers) >= MIN_WORKERS_BEFORE_ARMY
+    # FINAL GOAL: a visible enemy Core is a +6 resource jackpot — form a strike
+    # force (extra Vanguards to tank + Rangers to snipe the Core) to capture it
+    # rather than only defending. This directly grows the resource economy.
+    if enemy_core_visible:
+        target_vanguards = max(target_vanguards, DEFENSE_VANGUARDS + 2)
+        target_rangers = max(target_rangers, DEFENSE_RANGERS + 2)
 
-    if economy_floor_met:
+    # FINAL GOAL (build attack units in time): when ANY enemy is visible, the
+    # army must form immediately — drop the economy floor so a Vanguard/Ranger
+    # is built even with a young Worker fleet, instead of waiting for 4 Workers
+    # while the enemy raids unchecked.
+    enemy_present = threatened or enemy_core_visible
+    economy_floor_met = len(turn.workers) >= MIN_WORKERS_BEFORE_ARMY
+    army_floor_met = len(turn.workers) >= (
+        MIN_WORKERS_BEFORE_ARMY if not enemy_present else 2
+    )
+
+    if economy_floor_met or army_floor_met:
         # Rangers are the strongest defender (range-3 return fire from a
         # 5-vision scout) but cost 12, so build the cheap Vanguard body-block
         # first, then the Ranger.
@@ -1744,11 +1792,12 @@ def _control_core(turn: "Turn", threats: list[UnitView | CoreView]) -> None:
         len(turn.vanguards) < target_vanguards
         or len(turn.rangers) < target_rangers
     )
-    # Above the economy floor, if the combat reserve is STILL short, do NOT
-    # spend 5 on another Worker — bank the resource toward the 10/12 combat Unit
-    # instead, or the economy stalls at ~5 and never affords return fire (the
-    # exact trap that lost the Core on 2026-08-02).
-    if economy_floor_met and army_short:
+    # Above the economy floor (and whenever an enemy is present), if the combat
+    # reserve is STILL short, do NOT spend 5 on another Worker — bank the
+    # resource toward the 10/12 combat Unit instead, or the economy stalls at
+    # ~5 and never affords return fire (the exact trap that lost the Core on
+    # 2026-08-02).
+    if (economy_floor_met or enemy_present) and army_short:
         return
     # Bank reserve: only spawn a Worker if the Core keeps at least
     # WORKER_SPAWN_RESERVE resources afterward, so the economy never drains to
@@ -2010,6 +2059,11 @@ def _process_events(turn: "Turn") -> None:
             continue
         if event.event_type == "CORE_DAMAGED":
             continue
+        # Track the last successful harvest so the harvest radius can widen when
+        # the economy goes starved (no income for a while).
+        if event.event_type == "HARVEST_SUCCEEDED":
+            global _last_harvest_tick
+            _last_harvest_tick = turn.tick
 
 
 def _clear_exploration_state() -> None:
@@ -2029,6 +2083,23 @@ def _clear_exploration_state() -> None:
     _last_pos.clear()
     _stuck_ticks.clear()
     _lock_meta.clear()
+    global _last_harvest_tick
+    _last_harvest_tick = -10**9
+
+
+def _harvest_radius(turn: "Turn") -> int:
+    """Effective Core-to-resource harvest radius for this Turn.
+
+    Healthy economy: ``MAX_HARVEST_FROM_CORE`` (30) — distant nodes are a net
+    loss. Starved economy (no harvest for ``STARVE_TICKS`` ticks, or no known
+    resources at all): widen to ``MAX_HARVEST_FROM_CORE_STARVED`` (55) so the
+    Core keeps earning instead of idling at r0 (expert review L2).
+    """
+    if not _known_resources:
+        return MAX_HARVEST_FROM_CORE_STARVED
+    if turn.tick - _last_harvest_tick > STARVE_TICKS:
+        return MAX_HARVEST_FROM_CORE_STARVED
+    return MAX_HARVEST_FROM_CORE
 
 
 def decide(turn: "Turn") -> None:
@@ -2058,12 +2129,24 @@ def decide(turn: "Turn") -> None:
 
     core_pos = core.position
     threats = _threats_to_core(core_pos, turn.visible_enemies)
+    # FINAL GOAL signal: a visible enemy Core is a +6 resource jackpot. Mark it so
+    # the Core controller forms a strike force (extra Vanguards/Rangers) to raid
+    # it instead of only defending. Any visible enemy triggers prompt attacker
+    # production (req: build attack units in time vs. other enemies).
+    #
+    # Enemy Cores expose `kind == "CORE"` (not `unit_type`); `_observe_enemies`
+    # already latches any seen Core into `_known_enemy_cores` (a set), so a
+    # fleeting sighting still drives a raid over the many ticks it takes to build
+    # and march the strike force.
+    enemy_core_visible = any(
+        getattr(e, "kind", "") == "CORE" for e in turn.visible_enemies
+    ) or bool(_known_enemy_cores)
 
     # Defense first: react to visible nearby enemies and Core damage before
     # pursuing the economy or distant goals.
     _control_rangers(turn, core_pos)
     _control_vanguards(turn, core_pos)
-    _control_core(turn, threats)
+    _control_core(turn, threats, enemy_core_visible=enemy_core_visible)
     _control_workers(turn, core_pos)
     # Cull LAST: the SDK unit action slot is last-set-wins, so if the demotion
     # ran first, _control_workers would overwrite the queued SELF_DESTRUCT with
