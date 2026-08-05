@@ -283,6 +283,7 @@ _resource_telemetry: dict[str, int] = {}
 _RESOURCE_COOLDOWN_BASE = 4
 _RESOURCE_COOLDOWN_CAP = 64
 _RESOURCE_FAILURE_CAP = 5
+_RESOURCE_CONFIRM_SAVE_STEP = 64
 _PERSISTED_TICK_CAP = 2**63 - 1
 _persistent_state_dirty = False
 # Persistent obstacle-terrain memory. turn.obstacle_cells only exposes obstacles
@@ -937,14 +938,14 @@ def _step_toward(
     return None
 
 
-def _astar_step(
+def _astar_step_result(
     start: tuple[int, int],
     goal: tuple[int, int],
     obstacles: frozenset[tuple[int, int]],
     blocked: frozenset[tuple[int, int]],
     max_expansions: int = 4000,
     allow_blocked_goal: bool = False,
-) -> Direction | None:
+) -> tuple[Direction | None, bool]:
     """Return the first cardinal step on an A* path from ``start`` to ``goal``.
 
     The greedy _step_toward wedges in obstacle-dense terrain: a laden Worker
@@ -953,9 +954,12 @@ def _astar_step(
     exists. ``obstacles`` are permanent terrain; ``blocked`` are dynamic
     (friendly-full/enemy cells). ``allow_blocked_goal`` is reserved for a laden
     Worker entering its own Core cell to deposit.
+
+    返回值的第二项表示搜索是否仅因展开预算耗尽而停止；这与已确认
+    开放集耗尽的“不可达”不同。
     """
     if start == goal:
-        return None
+        return None, False
     frontier: list[tuple[int, int, int, tuple[int, int]]] = [
         (_manhattan(start, goal), 0, 0, start)
     ]
@@ -986,19 +990,39 @@ def _astar_step(
                 (new_cost + _manhattan(nxt, goal), new_cost, expansions, nxt),
             )
     if goal not in came_from:
-        return None
+        return None, bool(frontier) and expansions >= max_expansions
     cursor = goal
     while came_from.get(cursor) != start:
         parent = came_from.get(cursor)
         if parent is None:
-            return None
+            return None, False
         cursor = parent
     ddx = cursor[0] - start[0]
     ddy = cursor[1] - start[1]
     for d in DIRECTIONS:
         if d.delta == (ddx, ddy):
-            return d
-    return None
+            return d, False
+    return None, False
+
+
+def _astar_step(
+    start: tuple[int, int],
+    goal: tuple[int, int],
+    obstacles: frozenset[tuple[int, int]],
+    blocked: frozenset[tuple[int, int]],
+    max_expansions: int = 4000,
+    allow_blocked_goal: bool = False,
+) -> Direction | None:
+    """返回 A* 路径第一步；保留现有调用方的简单接口。"""
+    step, _ = _astar_step_result(
+        start,
+        goal,
+        obstacles,
+        blocked,
+        max_expansions=max_expansions,
+        allow_blocked_goal=allow_blocked_goal,
+    )
+    return step
 
 
 def _step_away_from(
@@ -1408,6 +1432,7 @@ def _control_workers(turn: "Turn", core_pos: tuple[int, int]) -> None:
     explore_targets = _assign_explore_targets(
         idle_workers, core_pos, dynamically_blocked
     )
+    fallback_workers = list(idle_workers)
     sorted_workers = sorted(turn.workers, key=lambda worker: str(worker.id))
     for orig_index, worker in enumerate(sorted_workers):
         pos = worker.position
@@ -1430,6 +1455,20 @@ def _control_workers(turn: "Turn", core_pos: tuple[int, int]) -> None:
             and resource_assignments.get(wid) == pos
         ):
             worker.harvest()
+            continue
+        if (
+            worker.cargo > 0
+            and pos == core_pos
+            and turn.core is not None
+            and turn.core.view.state == "NORMAL"
+            and turn.resources < turn.resource_capacity
+        ):
+            # 已经到核且存在容量时，交付必须先于循环/卡死恢复；历史轨迹
+            # 只能影响移动，不能把可立即兑现的货物再次带离 Core。
+            worker.deposit()
+            _begin_outbound(wid, orig_index, pos, core_pos)
+            _prev_pos[wid] = pos
+            _pos_history.pop(wid, None)
             continue
         # Boxed-in detection: the STUCK check below only fires when a Worker
         # stays STILL. A Worker trapped in an obstacle pocket CYCLES between a
@@ -1586,16 +1625,29 @@ def _control_workers(turn: "Turn", core_pos: tuple[int, int]) -> None:
 
         target = resource_assignments.get(wid)
         if target is not None:
-            step = _astar_step(pos, target, base_blocked, blocked_empty)
-            if step is None and target not in resource_cells:
+            step, budget_exhausted = _astar_step_result(
+                pos, target, base_blocked, blocked_empty
+            )
+            target_sealed = all(
+                (
+                    target[0] + direction.delta[0],
+                    target[1] + direction.delta[1],
+                )
+                in blocked_empty
+                for direction in DIRECTIONS
+            )
+            if (
+                step is None
+                and target not in resource_cells
+                and (target_sealed or not budget_exhausted)
+            ):
                 # 历史提示无法通过完整已知地图到达时，暂停追逐并回到前沿。
                 # 当前可见资源是真实目标，仍允许下面的贪心兜底。
                 _cooldown_resource(target, turn.tick)
                 _explore_targets.pop(wid, None)
-                explore_targets.update(
-                    _assign_explore_targets(
-                        [(wid, tuple(pos))], core_pos, dynamically_blocked
-                    )
+                fallback_workers.append((wid, tuple(pos)))
+                explore_targets = _assign_explore_targets(
+                    fallback_workers, core_pos, dynamically_blocked
                 )
             elif step is None:
                 step = _step_toward(pos, target, blocked_empty, avoid=_avoid_set(wid))
@@ -2320,21 +2372,34 @@ def _observe_resources(turn: "Turn") -> None:
             if event.event_type == "DEPOSIT_SUCCEEDED"
         ),
     }
+    changed = False
     # Remove cells harvested this Tick (the event carries the harvest cell).
     for event in turn.events:
         if event.event_type == "HARVEST_SUCCEEDED" and event.position is not None:
             cell = tuple(event.position)
+            changed = changed or cell in _known_resources or cell in _resource_hints
             _known_resources.discard(cell)
             _resource_hints.pop(cell, None)
     # The complete current state is authoritative over previous-Tick events.
     # A dropped-cargo pile can remain after a partial harvest, and a natural
     # node can refill at the same coordinate.
-    _known_resources.update(turn.resource_cells)
     for cell in turn.resource_cells:
-        _resource_hints[cell] = ResourceHint(
-            last_confirmed_tick=turn.tick,
-            source="visible",
-        )
+        if cell not in _known_resources:
+            _known_resources.add(cell)
+            changed = True
+        hint = _resource_hints.get(cell)
+        if (
+            hint is None
+            or hint.source != "visible"
+            or hint.failure_count > 0
+            or hint.cooldown_until > 0
+            or turn.tick - hint.last_confirmed_tick >= _RESOURCE_CONFIRM_SAVE_STEP
+        ):
+            _resource_hints[cell] = ResourceHint(
+                last_confirmed_tick=turn.tick,
+                source="visible",
+            )
+            changed = True
     # Remove cells that a friendly vision source can see and are confirmed
     # not to hold a resource (visible but not in turn.resource_cells).
     sources = _vision_sources(turn)
@@ -2345,7 +2410,9 @@ def _observe_resources(turn: "Turn") -> None:
         if _any_vision_sees(cell, sources, obstacles):
             _known_resources.discard(cell)
             _resource_hints.pop(cell, None)
-    _mark_persistent_state_dirty()
+            changed = True
+    if changed:
+        _mark_persistent_state_dirty()
 
 
 def _observe_enemies(turn: "Turn") -> None:

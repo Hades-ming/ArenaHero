@@ -222,20 +222,31 @@
      同一 Tick 自动匹配到第二资源。已经站在该资源上的空载 Worker 仍保留采集权。
   2. 新增 `ResourceHint(last_confirmed_tick, source, failure_count, cooldown_until)`；旧版
      `known_resources: [[x,y]]` 自动升级为 `source=legacy`，不丢历史地图。
-  3. A* 和贪心都无法给出下一步时采用 4/8/16/32/64 Tick 指数冷却，失败次数在运算前封顶；
-     冷却只暂停分配，不删除 `_known_resources`。当前 Turn 再次看见资源时，失败与冷却立即清零。
+  3. 历史目标被已知障碍/动态占位封死，或 A* 明确耗尽开放集时，采用 4/8/16/32/64 Tick
+     指数冷却，失败次数在运算前封顶；冷却只暂停分配，不删除 `_known_resources`。当前 Turn
+     再次看见资源时，失败与冷却立即清零。
   4. 只有友方视野重新照亮该格且当前 `resource_cells` 不含它时才删除提示，符合“当前完整 state
      胜过历史”的规则。
   5. `resource_hints` 是元数据而不是资源事实源：孤立 hint 不能反向制造幽灵资源；单条损坏字段
      回退默认值，不再清空资源、障碍、敌核和探索地图。
   6. 冷却只标记持久状态 dirty，`decide()` 末尾合并落盘一次，避免多个不可达 Worker 在 15 秒
      命令窗口内重复序列化整张探索图。
+  7. A* 的 4000 次展开预算耗尽不等于不可达：超远但可达的历史资源继续用贪心前进一步，不进入
+     冷却；单个 Worker 回退时用完整 idle Worker 集合重算，不清除其他 Worker 的稳定前沿。
+  8. 可见资源的 `last_confirmed_tick` 每 64 Tick 批量刷新；没有资源集合、失败/冷却或确认批次
+     变化时不写整张状态，避免探索地图增长后每 Tick 产生无意义序列化。
+  9. 正常 Core 同格且容量可用时，带货 Worker 必须在 boxed/stuck 恢复之前直接 `DEPOSIT`；
+     历史循环轨迹只能影响移动，不能把已经到核的货物重新带走。
 - **Telemetry（已落地）**：`play.py` 每 Tick 输出
   `eco[a,av,ah,blk,cool,unr,harv,dep]`；`meta/monitor.py` 已解析并累计到文本与 JSON KPI。
   这些字段分别表示总分配、可见分配、历史分配、动态阻塞、冷却候选、不可达目标、实际采集量、
   实际交付量，且日志路径不读取或拼接 API key。
-- **验证**：`79 passed`，覆盖友方满占改派、敌占改派、旧状态升级、元数据往返、坏字段隔离、
+- **验证**：`85 passed`，覆盖友方满占改派、敌占改派、旧状态升级、元数据往返、坏字段隔离、
   孤立 hint、失败上界、冷却重启/到期、再次可见恢复、合并落盘和 monitor 解析。
+- **Live 证据**：最终进程 PID `32572` 连续提交且无新认证、协议或提交错误；`t56410` 记录
+  `HARVEST_SUCCEEDED[1]/harv1`，随后 `t56414` 带货 Worker `e098a6` 到 Core 后明确下发
+  `deposit`，`t56415` 收到 `DEPOSIT_SUCCEEDED[1]/dep1`，Core `r35 -> r36`。同段日志出现
+  `a4,av3,ah1` 与 `a5,av4,ah1`，证明当前可见资源和持久历史提示正并行参与分配。
 - **后续优化方向（按证据依赖排序）**：
   1. 连续积累 100-200 个有资源机会的 live Tick，先以 `deposit resource/tick` 为主指标，
      同时看 `blk/cool/unr`；没有样本前不凭感觉调距离或冷却常量。

@@ -606,6 +606,53 @@ def test_unreachable_history_hint_is_cooled_and_worker_returns_to_frontier() -> 
     assert _action(turn.plan, UUID(int=0x6000)).type == "MOVE"
 
 
+def test_astar_budget_exhaustion_does_not_cool_reachable_history_hint() -> None:
+    cell = (5000, 0)
+    tactic._known_resources.add(cell)
+    tactic._resource_hints[cell] = tactic.ResourceHint(
+        last_confirmed_tick=5,
+        source="history",
+    )
+    turn = _turn(_workers_state([(1, 0)]), tick=20)
+
+    decide(turn)
+
+    hint = tactic._resource_hints[cell]
+    assert hint.failure_count == 0
+    assert hint.cooldown_until == 0
+    assert tactic._resource_telemetry.get("unreachable", 0) == 0
+    assert _action(turn.plan, UUID(int=0x6000)).direction == Direction.RIGHT
+
+
+def test_unreachable_resource_fallback_preserves_other_frontier_targets() -> None:
+    cell = (10, 0)
+    first_worker = str(UUID(int=0x6000))
+    second_worker = str(UUID(int=0x6001))
+    stable_target = (0, 15)
+    tactic._known_resources.add(cell)
+    tactic._resource_hints[cell] = tactic.ResourceHint(5, "history")
+    tactic._known_obstacles.update({(9, 0), (11, 0), (10, -1), (10, 1)})
+    tactic._explore_targets[second_worker] = stable_target
+    turn = _turn(_workers_state([(1, 0), (0, 10)]), tick=20)
+
+    decide(turn)
+
+    assert first_worker in tactic._explore_targets
+    assert tactic._explore_targets[second_worker] == stable_target
+
+
+def test_unchanged_visible_hint_does_not_dirty_full_persistent_map() -> None:
+    cell = (3, 0)
+    tactic._known_resources.add(cell)
+    tactic._resource_hints[cell] = tactic.ResourceHint(10, "visible")
+    turn = _turn(_workers_state([(0, 0)], resources=[cell]), tick=11)
+
+    tactic._observe_resources(turn)
+
+    assert tactic._resource_hints[cell].last_confirmed_tick == 10
+    assert tactic._persistent_state_dirty is False
+
+
 def test_resource_telemetry_log_is_monitorable_and_never_contains_api_key(
     tmp_path, monkeypatch, capsys
 ) -> None:
@@ -901,6 +948,45 @@ def test_worker_with_cargo_home_deposits() -> None:
     )
     turn = _turn(state)
     decide(turn)
+    assert _action(turn.plan, WORKER_ID).type == "DEPOSIT"
+
+
+def test_boxed_history_cannot_override_ready_deposit() -> None:
+    tactic._pos_history[str(WORKER_ID)] = [
+        (0, 0),
+        (1, 0),
+        (1, 1),
+        (0, 1),
+    ]
+    state = _state(
+        resources=5,
+        population=1,
+        objects=[
+            {
+                "kind": "CORE",
+                "id": str(CORE_ID),
+                "controlled": True,
+                "owner_username": "arena_hero",
+                "position": [0, 0],
+                "hp": 5,
+                "shield": 5,
+                "state": "NORMAL",
+            },
+            {
+                "kind": "UNIT",
+                "id": str(WORKER_ID),
+                "controlled": True,
+                "position": [0, 0],
+                "hp": 2,
+                "unit_type": "WORKER",
+                "cargo": 1,
+            },
+        ],
+    )
+    turn = _turn(state)
+
+    decide(turn)
+
     assert _action(turn.plan, WORKER_ID).type == "DEPOSIT"
 
 

@@ -4,6 +4,7 @@ __pycache__/
 .pytest_cache/
 game.log
 game.log.*
+monitor.live.log
 play.out
 play.out.*
 play.pid
