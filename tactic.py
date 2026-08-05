@@ -162,6 +162,57 @@ def _advance_col_off(col_off: int) -> int:
     if col_off > _SWEEP_COL_WRAP:
         col_off = -_SWEEP_COL_WRAP + (col_off - _SWEEP_COL_WRAP - 1)
     return col_off
+
+
+def _next_explore_col_off(
+    col_off: int,
+    base_col: int,
+    sweep_y_lo: int,
+    sweep_y_hi: int,
+    chunk_x_lo: int,
+    chunk_x_hi: int,
+) -> int:
+    """Advance a Worker's explore column, finally *consuming* the persistent map.
+
+    ``_explored_cells`` (written every tick in ``_observe_terrain`` and persisted
+    to disk) was being saved but never read back — exploration steered purely on
+    the chunk boustrophedon + per-Worker column offsets, so the user's persisted
+    map was dead weight. This helper reads it: when the next boustrophedon column
+    is already fully lit in memory, jump to the nearest reachable column that
+    still holds unseen cells instead of re-sweeping dead ground. If *every*
+    reachable column is explored, fall back to the plain boustrophedon so Workers
+    still revisit ground for respawned resources (purpose (b) of the map). With
+    no explored memory yet it is byte-for-byte identical to ``_advance_col_off``.
+    """
+    natural = _advance_col_off(col_off)
+    if not _explored_cells:
+        return natural
+
+    def _unexplored(off: int) -> int:
+        x = base_col + off
+        if x < chunk_x_lo or x > chunk_x_hi:
+            return -1  # outside this Worker's reachable band
+        return sum(
+            1 for y in range(sweep_y_lo, sweep_y_hi + 1) if (x, y) not in _explored_cells
+        )
+
+    # Keep the natural next column whenever it still has any fresh cells, so the
+    # steady-state sweep is unchanged.
+    if _unexplored(natural) > 0:
+        return natural
+
+    # Every reachable column is explored: fall back to the plain boustrophedon
+    # so Workers still revisit ground for respawned resources (purpose (b)).
+    best_off, best_dist = natural, 10**9
+    for off in range(chunk_x_lo - base_col, chunk_x_hi - base_col + 1):
+        if _unexplored(off) <= 0:
+            continue
+        d = abs(off - col_off)  # jump to the NEAREST fresh ground, not the
+        if d < best_dist:       # farthest, to avoid cross-map marches.
+            best_dist, best_off = d, off
+    return best_off
+
+
 # Distance within which a Worker locks onto a visible resource and commits to
 # walking onto it even across ticks where it leaves the small vision radius.
 # Slightly larger than vision (3) so an edge node can be pursued.
@@ -263,6 +314,12 @@ _known_enemy_cores: set[tuple[int, int]] = set()
 # for respawned resources (community Player D pattern). Large but bounded by
 # the explored map; saved with the other state on change.
 _explored_cells: set[tuple[int, int]] = set()
+# How many NEW explored cells accrue before we snapshot the map to disk again.
+# Obstacles are saved on appearance; the explored set grows every tick, so we
+# persist it in coarse batches to keep a restart from losing the whole map
+# without thrashing disk each tick.
+_EXPLORED_SAVE_STEP = 1000
+_last_saved_explored: int = 0
 
 # Persistent resource + terrain + enemy + explored memory across restarts.
 # Every play.py restart re-imports tactic.py and resets in-memory state, so
@@ -334,7 +391,7 @@ def _observe_terrain(turn: "Turn") -> None:
     static), making A* pathing and exploration near-optimal. Persists only when
     new walls appear.
     """
-    global _known_obstacles, _explored_cells
+    global _known_obstacles, _explored_cells, _last_saved_explored
     before = len(_known_obstacles)
     _known_obstacles.update(turn.obstacle_cells)
     # Record every cell within a friendly vision source's radius as explored
@@ -347,6 +404,13 @@ def _observe_terrain(turn: "Turn") -> None:
                 _explored_cells.add((sx + dx, sy + dy))
     if len(_known_obstacles) != before:
         _save_persistent_state()
+        _last_saved_explored = len(_explored_cells)
+    elif len(_explored_cells) - _last_saved_explored >= _EXPLORED_SAVE_STEP:
+        # The explored map is the part the user actually wanted persisted; flush
+        # it in coarse batches so a play.py restart resumes near where it left off
+        # instead of re-scanning from scratch.
+        _save_persistent_state()
+        _last_saved_explored = len(_explored_cells)
 
 
 _load_persistent_state()
@@ -804,10 +868,10 @@ def _explore_step(
     # then step the column and reverse.
     if south and pos[1] >= sweep_y_hi:
         south = 0
-        col_off = _advance_col_off(col_off)
+        col_off = _next_explore_col_off(col_off, base_col, sweep_y_lo, sweep_y_hi, chunk_x_lo, chunk_x_hi)
     elif not south and pos[1] <= sweep_y_lo:
         south = 1
-        col_off = _advance_col_off(col_off)
+        col_off = _next_explore_col_off(col_off, base_col, sweep_y_lo, sweep_y_hi, chunk_x_lo, chunk_x_hi)
 
     _explore_state[worker_id] = [col_off, south, None, None]
     new_target_x = max(chunk_x_lo, min(chunk_x_hi, base_col + col_off))
@@ -2101,8 +2165,14 @@ def _clear_exploration_state() -> None:
     _last_pos.clear()
     _stuck_ticks.clear()
     _lock_meta.clear()
-    global _last_harvest_tick
+    global _explored_cells, _last_saved_explored, _last_harvest_tick
+    # The explored map belongs to the abandoned neighborhood too; drop it so the
+    # next sweep re-lights fresh ground instead of trusting stale cells, and
+    # write the cleared state through so a later restart can't reload it.
+    _explored_cells.clear()
+    _last_saved_explored = 0
     _last_harvest_tick = -10**9
+    _save_persistent_state()
 
 
 def _harvest_radius(turn: "Turn") -> int:
