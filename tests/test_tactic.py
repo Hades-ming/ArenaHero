@@ -2294,27 +2294,32 @@ def test_standing_army_scales_with_worker_fleet() -> None:
     # raid meets more return fire the larger the fleet. 8 Workers -> V1 R1;
     # 16 Workers -> V2 R1 (fits the free-upkeep pop budget 16+2+1=19, favoring
     # the cheap Vanguard body-block over the pricier Ranger when the budget
-    # must shrink). Never overflows the budget for any fleet size.
+    # must shrink).
+    #
+    # 10th review (rank 1): a HARD floor of V>=1,R>=1 prevents the ratchet
+    # where a raid that kills combat units never triggers a rebuild because
+    # the worker count is unchanged and the target matches the current count.
+    # When the budget would overflow (e.g. W=18 gives V=1,R=1=20 total), the
+    # soft target is overridden — the pop gate in _control_core prevents
+    # actual over-spawn. The army is rebuilt as soon as pop drops below 19.
     assert tactic._standing_army_targets(4) == (1, 1)
     assert tactic._standing_army_targets(8) == (1, 1)
     assert tactic._standing_army_targets(12) == (1, 1)
     assert tactic._standing_army_targets(16) == (2, 1)
     assert tactic._standing_army_targets(17) == (1, 1)
-    assert tactic._standing_army_targets(18) == (1, 0)
-    # W=19 has no room for any army under the budget; Vanguard floor gives way
-    # so the invariant W+V+R <= 19 holds (6th review, strategy STRAT-4).
-    assert tactic._standing_army_targets(19) == (0, 0)
+    # W=18: hard floor forces (1,1) even though total 20 exceeds budget 19;
+    # _control_core's pop gate prevents actual over-spawn
+    assert tactic._standing_army_targets(18) == (1, 1)
+    # W=19: hard floor keeps V=1,R=1; pop gate stops all spawns at pop>=19,
+    # army rebuilds when population drops
+    assert tactic._standing_army_targets(19) == (1, 1)
     for w in range(4, tactic.FREE_UPKEEP_CAP):
         v, r = tactic._standing_army_targets(w)
-        # Free-upkeep guarantee: the total never reaches the upkeep tier-1
-        # boundary (20). 6th review corrected the old <=20 bound.
-        assert w + v + r <= tactic.FREE_UPKEEP_CAP - 1, (
-            f"pop budget overflow at {w}: W{v}R{r}"
+        # Floor guarantee: no Worker count should ever suggest zero combat
+        # units. 10th review overturned the old "W=19 → V=0,R=0" edge case.
+        assert v >= 1 and r >= 1, (
+            f"army floor broken at {w}: V{v}R{r}"
         )
-        if w <= 17:
-            assert v >= 1 and r >= 1, f"army floor broken at {w}"
-        elif w == 18:
-            assert v >= 1, f"vanguard floor broken at {w}"
 
 
 def test_pop_over_budget_does_not_destroy_units_or_capacity() -> None:

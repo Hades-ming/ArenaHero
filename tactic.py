@@ -1347,7 +1347,14 @@ def _select_ranger_target(
             last_pos, _ = last
             if _manhattan(cell, core_pos) > _manhattan(last_pos, core_pos):
                 fleeing = 0  # moving away from the Core = escaping
-        key = (0 if is_core else 1, finishable, fleeing, dist, str(enemy.id))
+        key = (
+            0 if is_core else 1,
+            0 if _manhattan(cell, core_pos) <= 2 else 1,
+            finishable,
+            fleeing,
+            dist,
+            str(enemy.id),
+        )
         if best_key is None or key < best_key:
             best, best_key = enemy, key
     return best
@@ -1762,7 +1769,20 @@ def _control_vanguards(turn: "Turn", core_pos: tuple[int, int]) -> None:
     )
     enemy_positions = frozenset(enemy.position for enemy in enemies)
     targets = _vanguard_guard_targets(turn, core_pos)
+    resources = turn.resources
+    core_normal = turn.core is not None and turn.core.view.state == "NORMAL"
     for vanguard in sorted(turn.vanguards, key=lambda unit: str(unit.id)):
+        # HEAL at the Core: post-combat HP recovery costs 1 resource per HP
+        # (SDK arena-hero 0.2.8, v0.8 rules). A 1-HP Vanguard (max 4) recovers
+        # 3 HP for 3 resources vs 10 to rebuild — 3.3x ROI.
+        if (
+            core_normal
+            and vanguard.position == core_pos
+            and vanguard.hp <= 1
+            and resources >= 3
+        ):
+            vanguard.heal()
+            continue
         sweep_dir = _vanguard_sweep_target(vanguard.position, enemies)
         if sweep_dir is not None:
             vanguard.sweep(sweep_dir)
@@ -1981,7 +2001,20 @@ def _guard_step(
 def _control_rangers(turn: "Turn", core_pos: tuple[int, int]) -> None:
     obstacles = frozenset(turn.obstacle_cells) | _known_obstacles
     enemies = turn.visible_enemies
+    resources = turn.resources
+    core_normal = turn.core is not None and turn.core.view.state == "NORMAL"
     for index, ranger in enumerate(turn.rangers):
+        # HEAL at the Core: post-combat HP recovery costs 1 resource per HP
+        # (SDK arena-hero 0.2.8, v0.8 rules). A 1-HP Ranger (max 2) recovers
+        # to full for 1 resource vs 12 to rebuild — 12x ROI.
+        if (
+            core_normal
+            and ranger.position == core_pos
+            and ranger.hp <= 1
+            and resources >= 1
+        ):
+            ranger.heal()
+            continue
         target = _select_ranger_target(ranger.position, enemies, obstacles, core_pos)
         if target is not None:
             ranger.shoot(target)
@@ -2000,9 +2033,10 @@ def _control_rangers(turn: "Turn", core_pos: tuple[int, int]) -> None:
                 in Counter(tuple(u.position) for u in turn.units).items()
                 if count >= 2
             )
+            enemy_positions = frozenset(e.position for e in enemies)
             step = _guard_step(
                 ranger.position, core_pos,
-                obstacles, obstacles,
+                obstacles | enemy_positions, obstacles,
                 turn.visible_enemies, friendly_full,
                 avoid=_avoid_set(str(ranger.id)),
             )
@@ -2076,26 +2110,27 @@ def _standing_army_targets(n_workers: int) -> tuple[int, int]:
     then shrunk to fit the free-upkeep population budget (W + V + R <= 19,
     i.e. budget = FREE_UPKEEP_CAP - 1) so growth never overflows into upkeep
     tier 1.
+
+    Ratchet-proof (10th review, rank 1): a raid that kills a Vanguard/Ranger
+    does NOT lower the Worker count, so the old formula returned the same
+    target and the dead combat Unit was never rebuilt. The floor V>=1,R>=1 is
+    now HARD — the budget loop only shrinks above it, and the worker_target in
+    _control_core absorbs the budget pressure by lowering the Worker ceiling
+    instead. The W=19 V=0,R=0 edge case is removed.
     """
     pairs = max(1, n_workers // 8)
     vanguards = pairs
     rangers = pairs
+    floor_v, floor_r = 1, 1  # hard floor — a dead combat Unit must be rebuilt
     budget = FREE_UPKEEP_CAP - 1
     while n_workers + vanguards + rangers > budget:
-        if vanguards > rangers and vanguards > 1:
+        if vanguards > max(rangers, floor_v):
             vanguards -= 1
-        elif rangers > 0:
+        elif rangers > floor_r:
             rangers -= 1
         else:
-            # At the W=19 edge with V=1, R=0: total = 20, exceeds budget.
-            # Clamp vanguard floor to 0 for this single edge case so the
-            # invariant W+V+R <= 19 holds; the army will be rebuilt as soon
-            # as a Worker dies or later when the army target is applied
-            # dynamically (budget-aware wants_worker in _control_core).
-            if vanguards == 1 and rangers == 0:
-                vanguards = 0
             break
-    return vanguards, rangers
+    return max(vanguards, floor_v), max(rangers, floor_r)
 
 
 def _control_core(
