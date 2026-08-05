@@ -141,6 +141,7 @@ def _log_line(turn, accepted) -> str:
         f"res{len(turn.resource_cells)}[{','.join(f'{c[0]},{c[1]}' for c in sorted(turn.resource_cells))}] "
         f"obs{len(turn.obstacle_cells)} "
         f"beacon{turn.beacon.position[0]},{turn.beacon.position[1]} "
+        f"eco[{tactic._resource_telemetry_summary()}] "
         f"ev[{_summarize_events(turn.events)}] "
         f"plan[{_summarize_plan(turn.plan)}]"
     )

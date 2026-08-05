@@ -210,3 +210,45 @@
   `O[15,235,14,235,15,236]`，原 `[15,235]` 从两个 Vanguard 的 2/2 降为单 Vanguard 1/2，
   第二个稳定在距 Core 2 的 `[14,235]` 支援位；无认证、协议或提交错误。
 - **状态**：✅ 算法与实战均验证。
+
+## L15 — 持久资源是“带可信度的提示”，不是永久任务
+- **现象**：全局 Hungarian 匹配完成后才过滤敌占或友方 2/2 满占资源。被过滤的 Worker 会直接
+  转去探索，即使地图上还有第二个可采资源；雾中的历史资源又没有年龄、失败或冷却信息，可能
+  长期占用 Worker。
+- **根因**：资源事实只有 `_known_resources: set[position]`，把“曾经看见”和“当前可采”混成
+  同一种状态；动态可进入性没有进入匹配候选集，匹配后过滤也没有重跑分配。
+- **修复（已落地）**：
+  1. 在 Hungarian 前计算敌方占位与友方满占；不可进入资源先从候选集移除，因此 Worker 会在
+     同一 Tick 自动匹配到第二资源。已经站在该资源上的空载 Worker 仍保留采集权。
+  2. 新增 `ResourceHint(last_confirmed_tick, source, failure_count, cooldown_until)`；旧版
+     `known_resources: [[x,y]]` 自动升级为 `source=legacy`，不丢历史地图。
+  3. A* 和贪心都无法给出下一步时采用 4/8/16/32/64 Tick 指数冷却，失败次数在运算前封顶；
+     冷却只暂停分配，不删除 `_known_resources`。当前 Turn 再次看见资源时，失败与冷却立即清零。
+  4. 只有友方视野重新照亮该格且当前 `resource_cells` 不含它时才删除提示，符合“当前完整 state
+     胜过历史”的规则。
+  5. `resource_hints` 是元数据而不是资源事实源：孤立 hint 不能反向制造幽灵资源；单条损坏字段
+     回退默认值，不再清空资源、障碍、敌核和探索地图。
+  6. 冷却只标记持久状态 dirty，`decide()` 末尾合并落盘一次，避免多个不可达 Worker 在 15 秒
+     命令窗口内重复序列化整张探索图。
+- **Telemetry（已落地）**：`play.py` 每 Tick 输出
+  `eco[a,av,ah,blk,cool,unr,harv,dep]`；`meta/monitor.py` 已解析并累计到文本与 JSON KPI。
+  这些字段分别表示总分配、可见分配、历史分配、动态阻塞、冷却候选、不可达目标、实际采集量、
+  实际交付量，且日志路径不读取或拼接 API key。
+- **验证**：`79 passed`，覆盖友方满占改派、敌占改派、旧状态升级、元数据往返、坏字段隔离、
+  孤立 hint、失败上界、冷却重启/到期、再次可见恢复、合并落盘和 monitor 解析。
+- **后续优化方向（按证据依赖排序）**：
+  1. 连续积累 100-200 个有资源机会的 live Tick，先以 `deposit resource/tick` 为主指标，
+     同时看 `blk/cool/unr`；没有样本前不凭感觉调距离或冷却常量。
+  2. 记录 Worker 级“首次分配 Tick、采集 Tick、入核 Tick”，计算发现→采集、采集→入核的
+     P50/P95；当前 telemetry 只有每 Tick 漏斗计数，还不能诊断时间花在出站还是返航。
+  3. 在每个 Worker 的 Manhattan 前 K 个候选上缓存 A*，将成本升级为
+     `confidence * yield / (outbound + harvest + return + deposit_wait)`；禁止全量
+     `Worker × Resource` A*，避免错过 15 秒窗口。
+  4. 为探索加入“虚拟收益候选”，用历史资源可信收益与前沿预期发现收益竞争；当旧提示太远、
+     太老或多次冷却时，部分 Worker 应继续扩图，而不是全员追逐历史坐标。
+  5. Core 满仓时让载货 Worker 进入距 Core 1-2 格的缓冲队列，并结合本 Tick spawn/消费计划
+     预测下一 Tick 的可交付空间，避免带货 Worker 被派远后错过入核窗口。
+  6. 暂不突破人口 19。进入 20 人后每 Tick upkeep=1；只有实测边际 Worker 的增量入核率能覆盖
+     upkeep、生产成本和防御风险时，才用滚动窗口 ROI 决定扩人口。
+- **状态**：✅ 阻塞漏分配、历史提示可信度和监控闭环已修；A* 往返 EV 与 Worker 级时延待 live
+  数据支撑后实施。

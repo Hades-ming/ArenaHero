@@ -7,6 +7,7 @@ bundled ``references/tactic-authoring.md``.
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID
@@ -42,6 +43,9 @@ def _reset_explore_state() -> None:
     tactic._explore_state.clear()
     tactic._explore_targets.clear()
     tactic._known_resources.clear()
+    tactic._resource_hints.clear()
+    tactic._resource_telemetry.clear()
+    tactic._persistent_state_dirty = False
     tactic._known_obstacles.clear()
     tactic._known_enemy_cores.clear()
     tactic._explored_cells.clear()
@@ -53,6 +57,9 @@ def _reset_explore_state() -> None:
     tactic._explore_state.clear()
     tactic._explore_targets.clear()
     tactic._known_resources.clear()
+    tactic._resource_hints.clear()
+    tactic._resource_telemetry.clear()
+    tactic._persistent_state_dirty = False
     tactic._known_obstacles.clear()
     tactic._known_enemy_cores.clear()
     tactic._explored_cells.clear()
@@ -282,6 +289,359 @@ def test_global_resource_matching_excludes_laden_workers_and_is_unique() -> None
     assert str(UUID(int=0x6000)) not in assignments
     assert len(assignments) == 2
     assert len(set(assignments.values())) == 2
+
+
+def test_blocked_resource_is_excluded_before_global_matching() -> None:
+    blocked = (1, 0)
+    available = (0, 3)
+    turn = _turn(_workers_state([(0, 0)], resources=[blocked, available]))
+
+    assignments = tactic._worker_resource_assignments(
+        turn, blocked_resources=frozenset({blocked})
+    )
+
+    assert assignments == {str(UUID(int=0x6000)): available}
+
+
+def test_friendly_full_resource_retargets_worker_to_available_resource() -> None:
+    worker_id = UUID(int=0x6000)
+    first_guard = UUID(int=0x7000)
+    second_guard = UUID(int=0x7001)
+    state = _state(
+        population=3,
+        objects=[
+            {
+                "kind": "CORE",
+                "id": str(CORE_ID),
+                "controlled": True,
+                "owner_username": "arena_hero",
+                "position": [0, 0],
+                "hp": 5,
+                "shield": 5,
+                "state": "NORMAL",
+            },
+            {
+                "kind": "UNIT",
+                "id": str(worker_id),
+                "controlled": True,
+                "position": [0, 1],
+                "hp": 2,
+                "unit_type": "WORKER",
+                "cargo": 0,
+            },
+            {
+                "kind": "UNIT",
+                "id": str(first_guard),
+                "controlled": True,
+                "position": [1, 1],
+                "hp": 4,
+                "unit_type": "VANGUARD",
+            },
+            {
+                "kind": "UNIT",
+                "id": str(second_guard),
+                "controlled": True,
+                "position": [1, 1],
+                "hp": 4,
+                "unit_type": "VANGUARD",
+            },
+            {"kind": "RESOURCE", "positions": [[1, 1], [0, 3]]},
+        ],
+    )
+    turn = _turn(state)
+
+    decide(turn)
+
+    action = _action(turn.plan, worker_id)
+    assert action.type == "MOVE"
+    assert action.direction == Direction.DOWN
+
+
+def test_enemy_occupied_resource_retargets_worker_to_available_resource() -> None:
+    state = _workers_state([(0, 1)], resources=[(1, 1), (0, 3)])
+    enemy = UnitView.model_validate(
+        {
+            "kind": "UNIT",
+            "id": str(ENEMY_UNIT_ID),
+            "controlled": False,
+            "position": [1, 1],
+            "hp": 4,
+            "unit_type": "VANGUARD",
+        }
+    )
+    state = state.model_copy(update={"objects": (*state.objects, enemy)})
+    turn = _turn(state)
+
+    decide(turn)
+
+    action = _action(turn.plan, UUID(int=0x6000))
+    assert action.type == "MOVE"
+    assert action.direction == Direction.DOWN
+
+
+def test_legacy_resource_state_loads_with_default_hint_metadata(
+    tmp_path, monkeypatch
+) -> None:
+    state_path = tmp_path / "tactic_state.json"
+    state_path.write_text(
+        '{"known_resources":[[7,8]],"known_obstacles":[],"known_enemy_cores":[],"explored_cells":[]}',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(tactic, "_STATE_PATH", state_path)
+
+    tactic._load_persistent_state()
+
+    assert tactic._known_resources == {(7, 8)}
+    hint = tactic._resource_hints[(7, 8)]
+    assert hint.last_confirmed_tick == 0
+    assert hint.source == "legacy"
+    assert hint.failure_count == 0
+    assert hint.cooldown_until == 0
+
+
+def test_resource_hint_metadata_round_trips_to_persistent_state(
+    tmp_path, monkeypatch
+) -> None:
+    state_path = tmp_path / "tactic_state.json"
+    monkeypatch.setattr(tactic, "_STATE_PATH", state_path)
+    cell = (11, 12)
+    tactic._known_resources.add(cell)
+    tactic._resource_hints[cell] = tactic.ResourceHint(
+        last_confirmed_tick=42,
+        source="history",
+        failure_count=2,
+        cooldown_until=50,
+    )
+
+    tactic._save_persistent_state()
+    saved = json.loads(state_path.read_text(encoding="utf-8"))
+    tactic._known_resources.clear()
+    tactic._resource_hints.clear()
+    tactic._load_persistent_state()
+
+    assert saved["resource_hints"] == [
+        {
+            "position": [11, 12],
+            "last_confirmed_tick": 42,
+            "source": "history",
+            "failure_count": 2,
+            "cooldown_until": 50,
+        }
+    ]
+    assert tactic._resource_hints[cell].cooldown_until == 50
+
+
+def test_bad_or_orphan_resource_hint_does_not_corrupt_persistent_map(
+    tmp_path, monkeypatch
+) -> None:
+    state_path = tmp_path / "tactic_state.json"
+    state_path.write_text(
+        json.dumps(
+            {
+                "known_resources": [[7, 8]],
+                "resource_hints": [
+                    {
+                        "position": [7, 8],
+                        "failure_count": [],
+                        "cooldown_until": None,
+                    },
+                    {"position": [99, 99], "failure_count": 1},
+                ],
+                "known_obstacles": [[4, 4]],
+                "known_enemy_cores": [[20, 20]],
+                "explored_cells": [[1, 1]],
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(tactic, "_STATE_PATH", state_path)
+
+    tactic._load_persistent_state()
+
+    assert tactic._known_resources == {(7, 8)}
+    assert tactic._resource_hints[(7, 8)].failure_count == 0
+    assert tactic._resource_hints[(7, 8)].cooldown_until == 0
+    assert tactic._known_obstacles == {(4, 4)}
+    assert tactic._known_enemy_cores == {(20, 20)}
+    assert tactic._explored_cells == {(1, 1)}
+
+
+def test_resource_cooldown_failure_count_is_bounded() -> None:
+    cell = (100, 0)
+    tactic._known_resources.add(cell)
+    tactic._resource_hints[cell] = tactic.ResourceHint(
+        last_confirmed_tick=1,
+        source="history",
+        failure_count=10**6,
+    )
+
+    tactic._cooldown_resource(cell, tick=20)
+
+    hint = tactic._resource_hints[cell]
+    assert hint.failure_count == tactic._RESOURCE_FAILURE_CAP
+    assert hint.cooldown_until == 20 + tactic._RESOURCE_COOLDOWN_CAP
+
+
+def test_multiple_resource_cooldowns_flush_persistent_state_once(monkeypatch) -> None:
+    writes = 0
+
+    def fake_save() -> None:
+        nonlocal writes
+        writes += 1
+        tactic._persistent_state_dirty = False
+
+    monkeypatch.setattr(tactic, "_save_persistent_state", fake_save)
+    for cell in ((100, 0), (101, 0)):
+        tactic._known_resources.add(cell)
+        tactic._cooldown_resource(cell, tick=20)
+
+    assert writes == 0
+    tactic._flush_persistent_state()
+    tactic._flush_persistent_state()
+    assert writes == 1
+
+
+def test_reloaded_cooldown_expires_and_restores_assignment(
+    tmp_path, monkeypatch
+) -> None:
+    state_path = tmp_path / "tactic_state.json"
+    monkeypatch.setattr(tactic, "_STATE_PATH", state_path)
+    cell = (100, 0)
+    tactic._known_resources.add(cell)
+    tactic._resource_hints[cell] = tactic.ResourceHint(
+        last_confirmed_tick=5,
+        source="history",
+        failure_count=2,
+        cooldown_until=30,
+    )
+    tactic._save_persistent_state()
+    tactic._known_resources.clear()
+    tactic._resource_hints.clear()
+    tactic._load_persistent_state()
+
+    assert tactic._worker_resource_assignments(
+        _turn(_workers_state([(0, 0)]), tick=29)
+    ) == {}
+    assert tactic._worker_resource_assignments(
+        _turn(_workers_state([(0, 0)]), tick=30)
+    ) == {str(UUID(int=0x6000)): cell}
+
+
+def test_visible_resource_refreshes_hint_and_clears_cooldown() -> None:
+    cell = (3, 0)
+    tactic._known_resources.add(cell)
+    tactic._resource_hints[cell] = tactic.ResourceHint(
+        last_confirmed_tick=1,
+        source="history",
+        failure_count=3,
+        cooldown_until=50,
+    )
+    turn = _turn(_workers_state([(0, 0)], resources=[cell]), tick=20)
+
+    tactic._observe_resources(turn)
+
+    hint = tactic._resource_hints[cell]
+    assert hint.last_confirmed_tick == 20
+    assert hint.source == "visible"
+    assert hint.failure_count == 0
+    assert hint.cooldown_until == 0
+    assert tactic._worker_resource_assignments(turn) == {
+        str(UUID(int=0x6000)): cell
+    }
+
+
+def test_cooled_history_hint_is_retained_but_not_assigned() -> None:
+    cell = (100, 0)
+    tactic._known_resources.add(cell)
+    tactic._resource_hints[cell] = tactic.ResourceHint(
+        last_confirmed_tick=5,
+        source="history",
+        failure_count=2,
+        cooldown_until=30,
+    )
+    turn = _turn(_workers_state([(0, 0)]), tick=20)
+
+    tactic._observe_resources(turn)
+
+    assert cell in tactic._known_resources
+    assert tactic._worker_resource_assignments(turn) == {}
+
+
+def test_cooled_history_hint_recovers_immediately_when_visible() -> None:
+    cell = (100, 0)
+    tactic._known_resources.add(cell)
+    tactic._resource_hints[cell] = tactic.ResourceHint(
+        last_confirmed_tick=5,
+        source="history",
+        failure_count=2,
+        cooldown_until=30,
+    )
+    turn = _turn(_workers_state([(0, 0)], resources=[cell]), tick=20)
+
+    tactic._observe_resources(turn)
+
+    assert tactic._resource_hints[cell].cooldown_until == 0
+    assert tactic._worker_resource_assignments(turn) == {
+        str(UUID(int=0x6000)): cell
+    }
+
+
+def test_unreachable_history_hint_is_cooled_and_worker_returns_to_frontier() -> None:
+    cell = (10, 0)
+    tactic._known_resources.add(cell)
+    tactic._resource_hints[cell] = tactic.ResourceHint(
+        last_confirmed_tick=5,
+        source="history",
+    )
+    tactic._known_obstacles.update({(9, 0), (11, 0), (10, -1), (10, 1)})
+    turn = _turn(_workers_state([(1, 0)]), tick=20)
+
+    decide(turn)
+
+    hint = tactic._resource_hints[cell]
+    assert cell in tactic._known_resources
+    assert hint.failure_count == 1
+    assert hint.cooldown_until == 24
+    assert tactic._resource_telemetry["unreachable"] == 1
+    assert _action(turn.plan, UUID(int=0x6000)).type == "MOVE"
+
+
+def test_resource_telemetry_log_is_monitorable_and_never_contains_api_key(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    import play
+    from meta import monitor
+
+    fake_key = "arena-secret-that-must-not-be-logged"
+    monkeypatch.setenv(play.API_KEY_ENV, fake_key)
+    turn = _turn(_workers_state([(0, 0)], resources=[(3, 0)]))
+    decide(turn)
+
+    line = play._log_line(turn, accepted=None)
+
+    assert "eco[a1,av1,ah0,blk0,cool0,unr0,harv0,dep0]" in line
+    assert fake_key not in line
+    record = monitor._parse_line(line)
+    assert record is not None
+    assert record["eco"] == {
+        "a": 1,
+        "av": 1,
+        "ah": 0,
+        "blk": 0,
+        "cool": 0,
+        "unr": 0,
+        "harv": 0,
+        "dep": 0,
+    }
+    log_path = tmp_path / "game.log"
+    log_path.write_text(line + "\n", encoding="utf-8")
+    kpi = monitor.analyze(log_path)
+    assert kpi.resource_assignments == 1
+    assert kpi.visible_resource_assignments == 1
+    assert monitor.main(["--json", str(log_path)]) == 1
+    report = json.loads(capsys.readouterr().out)
+    assert report["resource_assignments"] == 1
+    assert report["event_hist"] == {"-": 1}
 
 
 def test_dispersed_exploration_targets_cover_multiple_directions() -> None:
@@ -1591,6 +1951,49 @@ def test_revisited_empty_enemy_core_position_is_forgotten() -> None:
     turn = _turn(_state())
     tactic._observe_enemies(turn)
     assert (2, 0) not in tactic._known_enemy_cores
+
+
+def test_visible_enemy_core_is_kept_in_known_set() -> None:
+    # A CORE visible this Tick stays remembered (the ghost pass must not drop
+    # a live Core just because it also iterates the memory set).
+    state = _state(
+        population=1,
+        objects=[
+            {
+                "kind": "CORE",
+                "id": str(CORE_ID),
+                "controlled": True,
+                "owner_username": "arena_hero",
+                "position": [0, 0],
+                "hp": 5,
+                "shield": 5,
+                "state": "NORMAL",
+            },
+            {
+                "kind": "UNIT",
+                "id": str(WORKER_ID),
+                "controlled": True,
+                "position": [1, 0],
+                "hp": 2,
+                "unit_type": "WORKER",
+                "cargo": 0,
+            },
+            {
+                "kind": "CORE",
+                "id": str(ENEMY_CORE_ID),
+                "controlled": False,
+                "owner_username": "rival",
+                "position": [2, 0],
+                "hp": 5,
+                "shield": 5,
+                "state": "NORMAL",
+            },
+        ],
+    )
+    turn = _turn(state)
+    tactic._observe_enemies(turn)
+    assert (2, 0) in tactic._known_enemy_cores
+    assert tactic._last_enemy_pos.get(str(ENEMY_CORE_ID)) is not None
 
 
 def test_obstacle_shadow_is_not_recorded_as_explored() -> None:

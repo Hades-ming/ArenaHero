@@ -32,6 +32,7 @@ RE_RES = re.compile(r"r(\d+)/(\d+)")
 RE_POP = re.compile(r"pop(\d+)\(W(\d+) V(\d+) R(\d+)\)")
 RE_CORE = re.compile(r"core@([^ ]+) hp(\d+)/sh(\d+)/(\w+)")
 RE_VIS = re.compile(r"vis(\d+)\[([^\]]*)\]")
+RE_ECO = re.compile(r"eco\[([^\]]*)\]")
 RE_EV = re.compile(r"ev\[([^\]]*)\]")
 
 # Bottleneck thresholds (tunable).
@@ -67,6 +68,14 @@ class KPI:
     resource_drops: int = 0         # ticks where resources fell > RESOURCE_DROP_THRESHOLD w/o spawn
     largest_drop: int = 0
     ticks_with_enemy_visible: int = 0
+    resource_assignments: int = 0
+    visible_resource_assignments: int = 0
+    history_resource_assignments: int = 0
+    blocked_resource_candidates: int = 0
+    cooled_resource_candidates: int = 0
+    unreachable_resource_targets: int = 0
+    harvested_resources: int = 0
+    deposited_resources: int = 0
     # snapshots
     pop_last: int = 0
     workers_last: int = 0
@@ -103,6 +112,14 @@ def _parse_line(line: str) -> dict | None:
     if m:
         rec["vis_n"] = int(m.group(1))
         rec["vis_body"] = m.group(2)
+    m = RE_ECO.search(line)
+    if m:
+        rec["eco"] = {
+            name: int(value)
+            for token in m.group(1).split(",")
+            if (match := re.fullmatch(r"([a-z]+)(\d+)", token))
+            for name, value in [match.groups()]
+        }
     m = RE_EV.search(line)
     if m:
         rec["events"] = [e for e in m.group(1).split(";") if e]
@@ -155,6 +172,15 @@ def analyze(path: str | Path) -> KPI:
                 kpi.core_status_last = rec["core_status"]
             if "vis_n" in rec and rec["vis_n"] > 0:
                 kpi.ticks_with_enemy_visible += 1
+            eco = rec.get("eco", {})
+            kpi.resource_assignments += eco.get("a", 0)
+            kpi.visible_resource_assignments += eco.get("av", 0)
+            kpi.history_resource_assignments += eco.get("ah", 0)
+            kpi.blocked_resource_candidates += eco.get("blk", 0)
+            kpi.cooled_resource_candidates += eco.get("cool", 0)
+            kpi.unreachable_resource_targets += eco.get("unr", 0)
+            kpi.harvested_resources += eco.get("harv", 0)
+            kpi.deposited_resources += eco.get("dep", 0)
             for ev in rec.get("events", []):
                 # strip trailing [n] payload
                 base = ev.split("[")[0]
@@ -259,6 +285,18 @@ def report(kpi: KPI, alerts: list[str]) -> str:
         f"{kpi.spawn} spawns"
     )
     lines.append(
+        f"Dispatch       : {kpi.resource_assignments} assignments "
+        f"(visible {kpi.visible_resource_assignments}, history "
+        f"{kpi.history_resource_assignments}), blocked "
+        f"{kpi.blocked_resource_candidates}, cooled "
+        f"{kpi.cooled_resource_candidates}, unreachable "
+        f"{kpi.unreachable_resource_targets}"
+    )
+    lines.append(
+        f"Resource flow  : harvested {kpi.harvested_resources}, "
+        f"deposited {kpi.deposited_resources}"
+    )
+    lines.append(
         f"Combat         : {kpi.unit_died} unit deaths, "
         f"{kpi.core_under_attack} core-under-attack, "
         f"{kpi.enemy_core_destroyed} enemy cores destroyed"
@@ -318,7 +356,7 @@ def main(argv: list[str]) -> int:
     as_json = False
     loop = 0
     args: list[str] = []
-    i = 1
+    i = 0
     while i < len(argv):
         a = argv[i]
         if a == "--json":
@@ -331,7 +369,7 @@ def main(argv: list[str]) -> int:
                 loop = int(argv[i + 1])
                 i += 1
         elif not a.startswith("-"):
-            # Positional log path (argv[0] = script name is skipped above).
+            # main 接收的已经是 sys.argv[1:]，当前位置参数就是日志路径。
             args.append(a)
         i += 1
     path = Path(args[0]) if args else LOG_PATH
@@ -342,6 +380,9 @@ def main(argv: list[str]) -> int:
     alerts = detect_bottlenecks(kpi)
     if as_json:
         out = asdict(kpi)
+        # dataclasses.asdict 会用 Counter 的构造器重建映射，从而把
+        # (事件名, 次数) 对误当成 tuple 键；显式转为普通字典才能 JSON 化。
+        out["event_hist"] = dict(kpi.event_hist)
         out["bottlenecks"] = alerts
         print(json.dumps(out, indent=2, default=str))
     else:

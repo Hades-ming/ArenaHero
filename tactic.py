@@ -55,6 +55,7 @@ from __future__ import annotations
 import heapq
 import json
 from collections import Counter
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -265,6 +266,25 @@ ENEMY_MEMORY_TICKS = 6    # forget a last-seen enemy position after this many ti
 # memory directly raises effective discovery by avoiding re-scan of empty
 # cells already known from earlier sweeps).
 _known_resources: set[tuple[int, int]] = set()
+
+
+@dataclass
+class ResourceHint:
+    """一个历史资源坐标的持久可信度元数据。"""
+
+    last_confirmed_tick: int
+    source: str
+    failure_count: int = 0
+    cooldown_until: int = 0
+
+
+_resource_hints: dict[tuple[int, int], ResourceHint] = {}
+_resource_telemetry: dict[str, int] = {}
+_RESOURCE_COOLDOWN_BASE = 4
+_RESOURCE_COOLDOWN_CAP = 64
+_RESOURCE_FAILURE_CAP = 5
+_PERSISTED_TICK_CAP = 2**63 - 1
+_persistent_state_dirty = False
 # Persistent obstacle-terrain memory. turn.obstacle_cells only exposes obstacles
 # in current vision; a wall seen once and forgotten makes A* pathing collide
 # with it again and again (workers re-route around the same walls every trip).
@@ -299,7 +319,8 @@ _STATE_PATH = Path(__file__).resolve().parent / "tactic_state.json"
 
 def _load_persistent_state() -> None:
     """Restore the persisted resource/obstacle/enemy-core/explored memory."""
-    global _known_resources, _known_obstacles, _known_enemy_cores, _explored_cells
+    global _known_resources, _resource_hints, _persistent_state_dirty
+    global _known_obstacles, _known_enemy_cores, _explored_cells
     try:
         data = json.loads(_STATE_PATH.read_text(encoding="utf-8"))
         raw = data.get("known_resources", [])
@@ -309,6 +330,43 @@ def _load_persistent_state() -> None:
                 for a, b in raw
                 if isinstance(a, int) and isinstance(b, int)
             }
+        _resource_hints = {}
+        raw_hints = data.get("resource_hints", [])
+        if isinstance(raw_hints, list):
+            for item in raw_hints:
+                if not isinstance(item, dict):
+                    continue
+                position = item.get("position")
+                if (
+                    not isinstance(position, list)
+                    or len(position) != 2
+                    or not all(isinstance(value, int) for value in position)
+                ):
+                    continue
+                cell = (position[0], position[1])
+                if cell not in _known_resources:
+                    continue
+
+                def bounded_int(name: str, cap: int) -> int:
+                    value = item.get(name, 0)
+                    if isinstance(value, bool) or not isinstance(value, int):
+                        return 0
+                    return min(max(0, value), cap)
+
+                _resource_hints[cell] = ResourceHint(
+                    last_confirmed_tick=bounded_int(
+                        "last_confirmed_tick", _PERSISTED_TICK_CAP
+                    ),
+                    source=str(item.get("source", "history")),
+                    failure_count=bounded_int(
+                        "failure_count", _RESOURCE_FAILURE_CAP
+                    ),
+                    cooldown_until=bounded_int(
+                        "cooldown_until", _PERSISTED_TICK_CAP
+                    ),
+                )
+        for cell in _known_resources:
+            _resource_hints.setdefault(cell, ResourceHint(0, "legacy"))
         raw_obs = data.get("known_obstacles", [])
         if isinstance(raw_obs, list):
             _known_obstacles = {
@@ -330,25 +388,53 @@ def _load_persistent_state() -> None:
                 for a, b in raw_expl
                 if isinstance(a, int) and isinstance(b, int)
             }
+        _persistent_state_dirty = False
     except (OSError, ValueError, TypeError):
         _known_resources = set()
+        _resource_hints = {}
         _known_obstacles = set()
         _known_enemy_cores = set()
         _explored_cells = set()
+        _persistent_state_dirty = False
 
 
 def _save_persistent_state() -> None:
     """Persist resource/obstacle/enemy-core/explored memory (on change)."""
+    global _persistent_state_dirty
     try:
         payload = {
-            "known_resources": [list(c) for c in _known_resources],
-            "known_obstacles": [list(c) for c in _known_obstacles],
-            "known_enemy_cores": [list(c) for c in _known_enemy_cores],
-            "explored_cells": [list(c) for c in _explored_cells],
+            "known_resources": [list(c) for c in sorted(_known_resources)],
+            "resource_hints": [
+                {
+                    "position": list(cell),
+                    "last_confirmed_tick": hint.last_confirmed_tick,
+                    "source": hint.source,
+                    "failure_count": hint.failure_count,
+                    "cooldown_until": hint.cooldown_until,
+                }
+                for cell in sorted(_known_resources)
+                for hint in [_resource_hints.setdefault(cell, ResourceHint(0, "legacy"))]
+            ],
+            "known_obstacles": [list(c) for c in sorted(_known_obstacles)],
+            "known_enemy_cores": [list(c) for c in sorted(_known_enemy_cores)],
+            "explored_cells": [list(c) for c in sorted(_explored_cells)],
         }
         _STATE_PATH.write_text(json.dumps(payload), encoding="utf-8")
+        _persistent_state_dirty = False
     except OSError:
         pass
+
+
+def _mark_persistent_state_dirty() -> None:
+    """标记状态需要落盘，由当前 Tick 末尾统一写入。"""
+    global _persistent_state_dirty
+    _persistent_state_dirty = True
+
+
+def _flush_persistent_state() -> None:
+    """每个 Tick 最多合并写入一次完整持久状态。"""
+    if _persistent_state_dirty:
+        _save_persistent_state()
 
 
 def _observe_terrain(turn: "Turn") -> None:
@@ -372,13 +458,13 @@ def _observe_terrain(turn: "Turn") -> None:
                 if _any_vision_sees(cell, [(src, radius)], _known_obstacles):
                     _explored_cells.add(cell)
     if len(_known_obstacles) != before:
-        _save_persistent_state()
+        _mark_persistent_state_dirty()
         _last_saved_explored = len(_explored_cells)
     elif len(_explored_cells) - _last_saved_explored >= _EXPLORED_SAVE_STEP:
         # The explored map is the part the user actually wanted persisted; flush
         # it in coarse batches so a play.py restart resumes near where it left off
         # instead of re-scanning from scratch.
-        _save_persistent_state()
+        _mark_persistent_state_dirty()
         _last_saved_explored = len(_explored_cells)
 
 
@@ -505,7 +591,42 @@ def _minimum_assignment(costs: list[list[int]]) -> list[int]:
     return result
 
 
-def _worker_resource_assignments(turn: "Turn") -> dict[str, tuple[int, int]]:
+def _cooldown_resource(cell: tuple[int, int], tick: int) -> None:
+    """暂时停用不可达提示，但不删除持久地图事实。"""
+    hint = _resource_hints.setdefault(cell, ResourceHint(0, "legacy"))
+    hint.failure_count = min(hint.failure_count + 1, _RESOURCE_FAILURE_CAP)
+    delay = (
+        _RESOURCE_COOLDOWN_CAP
+        if hint.failure_count >= _RESOURCE_FAILURE_CAP
+        else _RESOURCE_COOLDOWN_BASE * 2 ** (hint.failure_count - 1)
+    )
+    hint.cooldown_until = tick + delay
+    hint.source = "history"
+    _resource_telemetry["unreachable"] = _resource_telemetry.get("unreachable", 0) + 1
+    _mark_persistent_state_dirty()
+
+
+def _resource_telemetry_summary() -> str:
+    """返回不含凭据的紧凑经济指标，供 Tick 日志使用。"""
+    keys = (
+        ("assignments", "a"),
+        ("visible_assignments", "av"),
+        ("history_assignments", "ah"),
+        ("blocked", "blk"),
+        ("cooled", "cool"),
+        ("unreachable", "unr"),
+        ("harvested", "harv"),
+        ("deposited", "dep"),
+    )
+    return ",".join(
+        f"{short}{_resource_telemetry.get(name, 0)}" for name, short in keys
+    )
+
+
+def _worker_resource_assignments(
+    turn: "Turn",
+    blocked_resources: frozenset[tuple[int, int]] = frozenset(),
+) -> dict[str, tuple[int, int]]:
     """Globally match empty Workers to all trustworthy known resources.
 
     The lexicographic objective is: assign as many resources as possible,
@@ -525,9 +646,46 @@ def _worker_resource_assignments(turn: "Turn") -> dict[str, tuple[int, int]]:
         ),
         key=lambda worker: str(worker.id),
     )
-    resources = sorted(_known_resources | set(turn.resource_cells))
+    visible_resources = set(turn.resource_cells)
+    all_resources = _known_resources | visible_resources
+    cooled_resources = {
+        resource
+        for resource in all_resources - visible_resources
+        if _resource_hints.setdefault(resource, ResourceHint(0, "legacy")).cooldown_until
+        > turn.tick
+    }
+    eligible_resources = all_resources - cooled_resources
+    fixed: dict[str, tuple[int, int]] = {}
+    for resource in sorted(eligible_resources & blocked_resources):
+        occupant = next(
+            (worker for worker in workers if tuple(worker.position) == resource),
+            None,
+        )
+        if occupant is not None:
+            fixed[str(occupant.id)] = resource
+    fixed_worker_ids = set(fixed)
+    workers = [worker for worker in workers if str(worker.id) not in fixed_worker_ids]
+    resources = sorted(eligible_resources - blocked_resources - set(fixed.values()))
+    _resource_telemetry.update(
+        {
+            "blocked": len((all_resources & blocked_resources) - set(fixed.values())),
+            "cooled": len(cooled_resources),
+        }
+    )
     if not workers or not resources:
-        return {}
+        assignments = fixed
+        _resource_telemetry.update(
+            {
+                "assignments": len(assignments),
+                "visible_assignments": sum(
+                    target in visible_resources for target in assignments.values()
+                ),
+                "history_assignments": sum(
+                    target not in visible_resources for target in assignments.values()
+                ),
+            }
+        )
+        return assignments
 
     max_distance = max(
         _manhattan(worker.position, resource)
@@ -543,28 +701,40 @@ def _worker_resource_assignments(turn: "Turn") -> dict[str, tuple[int, int]]:
         costs = [
             [
                 _manhattan(worker.position, resource)
-                + (0 if resource in turn.resource_cells else history_penalty)
+                + (0 if resource in visible_resources else history_penalty)
                 for resource in resources
             ]
             for worker in workers
         ]
         columns = _minimum_assignment(costs)
-        return {
+        assignments = fixed | {
             str(worker.id): resources[column]
             for worker, column in zip(workers, columns, strict=True)
         }
-
-    # Every resource can be assigned when Workers outnumber resources, so all
-    # visible resources are already covered and only total distance remains.
-    costs = [
-        [_manhattan(resource, worker.position) for worker in workers]
-        for resource in resources
-    ]
-    columns = _minimum_assignment(costs)
-    return {
-        str(workers[column].id): resource
-        for resource, column in zip(resources, columns, strict=True)
-    }
+    else:
+        # Worker 多于资源时，每个资源都能分配；可见资源已全部覆盖，
+        # 此时只需继续最小化总路程。
+        costs = [
+            [_manhattan(resource, worker.position) for worker in workers]
+            for resource in resources
+        ]
+        columns = _minimum_assignment(costs)
+        assignments = fixed | {
+            str(workers[column].id): resource
+            for resource, column in zip(resources, columns, strict=True)
+        }
+    _resource_telemetry.update(
+        {
+            "assignments": len(assignments),
+            "visible_assignments": sum(
+                target in visible_resources for target in assignments.values()
+            ),
+            "history_assignments": sum(
+                target not in visible_resources for target in assignments.values()
+            ),
+        }
+    )
+    return assignments
 
 
 def _frontier_gain(
@@ -1148,7 +1318,7 @@ def _select_ranger_target(
         hp = getattr(enemy, "hp", None)
         finishable = 0 if hp == 1 else 1
         last = _last_enemy_pos.get(str(enemy.id))
-        fleeing = 1
+        fleeing = 1  # lowest = best here (0 beats 1)
         if last is not None:
             last_pos, _ = last
             if _manhattan(cell, core_pos) > _manhattan(last_pos, core_pos):
@@ -1219,15 +1389,10 @@ def _control_workers(turn: "Turn", core_pos: tuple[int, int]) -> None:
     friendly_full = frozenset(
         cell for cell, count in friendly_occupancy.items() if count >= 2
     )
-    resource_assignments = _worker_resource_assignments(turn)
-    worker_positions = {str(worker.id): worker.position for worker in turn.workers}
     dynamically_blocked = base_blocked | friendly_full
-    resource_assignments = {
-        worker_id: target
-        for worker_id, target in resource_assignments.items()
-        if target not in dynamically_blocked
-        or target == worker_positions[worker_id]
-    }
+    resource_assignments = _worker_resource_assignments(
+        turn, blocked_resources=dynamically_blocked
+    )
     for worker_id in resource_assignments:
         _explore_targets.pop(worker_id, None)
     idle_workers = [
@@ -1422,13 +1587,23 @@ def _control_workers(turn: "Turn", core_pos: tuple[int, int]) -> None:
         target = resource_assignments.get(wid)
         if target is not None:
             step = _astar_step(pos, target, base_blocked, blocked_empty)
-            if step is None:
+            if step is None and target not in resource_cells:
+                # 历史提示无法通过完整已知地图到达时，暂停追逐并回到前沿。
+                # 当前可见资源是真实目标，仍允许下面的贪心兜底。
+                _cooldown_resource(target, turn.tick)
+                _explore_targets.pop(wid, None)
+                explore_targets.update(
+                    _assign_explore_targets(
+                        [(wid, tuple(pos))], core_pos, dynamically_blocked
+                    )
+                )
+            elif step is None:
                 step = _step_toward(pos, target, blocked_empty, avoid=_avoid_set(wid))
             if step is not None:
                 _prev_pos[wid] = pos
                 _record_pos(wid, pos)
                 worker.move(step)
-            continue
+                continue
 
         # No resource task: move toward this Worker's stable, globally dispersed
         # frontier target. The persistent map now actively drives exploration.
@@ -1541,6 +1716,19 @@ def _control_vanguards(turn: "Turn", core_pos: tuple[int, int]) -> None:
             vanguard.sweep(sweep_dir)
             continue
         target = targets.get(str(vanguard.id))
+        # A Vanguard at full HP (4) can absorb one more hit before dying; a 1-HP
+        # Vanguard is dead after one more sweep. Regroup toward the Core when
+        # critically damaged so a raider cannot one-shot our body-block.
+        hp = getattr(vanguard, "hp", 4)
+        if hp <= 1 and target is None:
+            step = _step_toward(
+                vanguard.position, core_pos,
+                (obstacles | enemy_positions | friendly_full) - {vanguard.position},
+                avoid=None,
+            )
+            if step is not None:
+                vanguard.move(step)
+            continue
         if target is None or target == vanguard.position:
             continue
         blocked = (
@@ -1575,14 +1763,19 @@ def _ring_patrol_step(
         return _step_toward(pos, core_pos, blocked, avoid=None)
     best: Direction | None = None
     best_keep = 10**9
+    # Within the band: prefer a step that KEEPS the distance roughly constant
+    # (tangential ring-walk), scoring |change| only against band-members. This
+    # avoids the perverse preference where a large |change| that jumps across
+    # the band (e.g. dist-16 -> dist-2) beat an exact hold.
     for d in DIRECTIONS:
         nxt = (pos[0] + d.delta[0], pos[1] + d.delta[1])
         if nxt in blocked:
             continue
         nd = _manhattan(nxt, core_pos)
         if inner <= nd <= outer:
-            if abs(nd - dist) < best_keep:
-                best_keep = abs(nd - dist)
+            change = abs(nd - dist)
+            if change < best_keep:
+                best_keep = change
                 best = d
     return best
 
@@ -1775,13 +1968,23 @@ def _control_rangers(turn: "Turn", core_pos: tuple[int, int]) -> None:
         chase = _chase_target(pos, core_pos, enemies, rid, turn.tick, turn.resources)
         if chase is not None:
             enemy_cells = frozenset(e.position for e in enemies)
-            step = _step_toward(
-                pos, chase,
-                obstacles | enemy_cells,
-                avoid=_avoid_set(rid),
-            )
+            # Chase to a cell that can SHOOT the target, not onto it. Moving
+            # onto an enemy cell always fails MOVE_DESTINATION_OCCUPIED; a
+            # Vanguard/Ranger reached cell fights (we want distance), a Worker
+            # reached cell is useless (cannot attack). _step_toward supports
+            # `toward_exact`; passing a "blocked" goal makes it step toward it
+            # while treating the exact goal cell as allowed-only-if-reached.
+            blocked = obstacles | enemy_cells
+            goal_exact = pos == chase  # already there -> just look for a shot
+            if not goal_exact:
+                step = _astar_step(pos, chase, obstacles, blocked)
+                if step is None:
+                    step = _step_toward(pos, chase, obstacles | (enemy_cells - {chase}),
+                                        avoid=_avoid_set(rid))
+            else:
+                step = None
             if step is None:
-                step = _step_toward(pos, chase, obstacles, avoid=None)
+                step = _step_toward(pos, chase, obstacles, avoid=_avoid_set(rid))
             if step is not None:
                 _record_pos(rid, pos)
                 ranger.move(step)
@@ -2104,15 +2307,34 @@ def _observe_resources(turn: "Turn") -> None:
     Add newly-visible resources; remove cells confirmed bare (visible and NOT
     a resource); remove cells harvested successfully this Tick.
     """
-    global _known_resources
+    global _known_resources, _resource_telemetry
+    _resource_telemetry = {
+        "harvested": sum(
+            event.resource_amount or 0
+            for event in turn.events
+            if event.event_type == "HARVEST_SUCCEEDED"
+        ),
+        "deposited": sum(
+            event.resource_amount or 0
+            for event in turn.events
+            if event.event_type == "DEPOSIT_SUCCEEDED"
+        ),
+    }
     # Remove cells harvested this Tick (the event carries the harvest cell).
     for event in turn.events:
         if event.event_type == "HARVEST_SUCCEEDED" and event.position is not None:
-            _known_resources.discard(tuple(event.position))
+            cell = tuple(event.position)
+            _known_resources.discard(cell)
+            _resource_hints.pop(cell, None)
     # The complete current state is authoritative over previous-Tick events.
     # A dropped-cargo pile can remain after a partial harvest, and a natural
     # node can refill at the same coordinate.
     _known_resources.update(turn.resource_cells)
+    for cell in turn.resource_cells:
+        _resource_hints[cell] = ResourceHint(
+            last_confirmed_tick=turn.tick,
+            source="visible",
+        )
     # Remove cells that a friendly vision source can see and are confirmed
     # not to hold a resource (visible but not in turn.resource_cells).
     sources = _vision_sources(turn)
@@ -2122,7 +2344,8 @@ def _observe_resources(turn: "Turn") -> None:
             continue  # still a resource, keep it
         if _any_vision_sees(cell, sources, obstacles):
             _known_resources.discard(cell)
-    _save_persistent_state()
+            _resource_hints.pop(cell, None)
+    _mark_persistent_state_dirty()
 
 
 def _observe_enemies(turn: "Turn") -> None:
@@ -2133,27 +2356,31 @@ def _observe_enemies(turn: "Turn") -> None:
     never driven off. Remembering positions lets Rangers chase briefly.
     """
     tick = turn.tick
+    cores_before = set(_known_enemy_cores)
     visible_core_positions = {
         tuple(e.position) for e in turn.visible_enemies if e.kind == "CORE"
     }
     sources = _vision_sources(turn)
+    for e in turn.visible_enemies:
+        _last_enemy_pos[str(e.id)] = (tuple(e.position), tick)
+        # Persist enemy Cores permanently (a Core is a durable hunt target).
+        if e.kind == "CORE":
+            _known_enemy_cores.add(tuple(e.position))
+    # Full-ghost pass: a CORE cell that a friendly vision source can see but
+    # that does not hold a Core this Tick has moved or been destroyed — drop it
+    # so a remembered coordinate never sends Rangers to a dead cell.
     for position in list(_known_enemy_cores):
         if (
             position not in visible_core_positions
             and _any_vision_sees(position, sources, turn.obstacle_cells)
         ):
             _known_enemy_cores.discard(position)
-    for e in turn.visible_enemies:
-        _last_enemy_pos[str(e.id)] = (tuple(e.position), tick)
-        # Persist enemy Cores permanently (a Core is a durable hunt target).
-        if e.kind == "CORE":
-            _known_enemy_cores.add(tuple(e.position))
     for eid in list(_last_enemy_pos):
         _, seen = _last_enemy_pos[eid]
         if tick - seen > ENEMY_MEMORY_TICKS:
             del _last_enemy_pos[eid]
-    if _known_enemy_cores:
-        _save_persistent_state()
+    if _known_enemy_cores != cores_before:
+        _mark_persistent_state_dirty()
 
 
 def _chase_target(
@@ -2272,6 +2499,7 @@ def decide(turn: "Turn") -> None:
     if core is None:
         # Respawning: submit no invented actions. An empty plan is a valid
         # complete replacement that leaves every object on WAIT.
+        _flush_persistent_state()
         return
 
     core_pos = core.position
@@ -2289,10 +2517,23 @@ def decide(turn: "Turn") -> None:
     enemy_core_visible = any(
         getattr(e, "kind", "") == "CORE" for e in turn.visible_enemies
     )
-
     # Defense first: react to visible nearby enemies and Core damage before
     # pursuing the economy or distant goals.
+    # FINAL GOAL: hold the Beacon (champion-bonus harvest + Core shield cap 10)
+    # when it is in vision — a worker/Ranger passing its cell picks it up on the
+    # way through. The Core itself never travels (a migrating Core cannot act and
+    # the Beacon is far from our cell), so Units are the picker-uppers.
+    if (
+        turn.beacon.status == BeaconStatus.GROUND
+        and turn.beacon.position is not None
+    ):
+        beacon_pos = tuple(turn.beacon.position)
+        for unit in turn.units:
+            if unit.position == beacon_pos and str(unit.id) not in turn.plan:
+                unit.pickup_beacon()
+                break
     _control_rangers(turn, core_pos)
     _control_vanguards(turn, core_pos)
     _control_core(turn, threats, enemy_core_visible=enemy_core_visible)
     _control_workers(turn, core_pos)
+    _flush_persistent_state()
