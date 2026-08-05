@@ -264,6 +264,50 @@ def test_nearest_worker_claims_resource_independent_of_unit_order() -> None:
     assert len(far_state) < 4 or tuple(far_state[2:4]) != resource
 
 
+def test_nearest_worker_takes_over_stale_far_lock() -> None:
+    resource = (6, 0)
+    state = _state(
+        population=2,
+        objects=[
+            {
+                "kind": "CORE",
+                "id": str(CORE_ID),
+                "controlled": True,
+                "owner_username": "arena_hero",
+                "position": [0, 0],
+                "hp": 5,
+                "shield": 5,
+                "state": "NORMAL",
+            },
+            {
+                "kind": "UNIT",
+                "id": str(WORKER_ID),
+                "controlled": True,
+                "position": [-6, 0],
+                "hp": 2,
+                "unit_type": "WORKER",
+                "cargo": 0,
+            },
+            {
+                "kind": "UNIT",
+                "id": str(WORKER2_ID),
+                "controlled": True,
+                "position": [5, 0],
+                "hp": 2,
+                "unit_type": "WORKER",
+                "cargo": 0,
+            },
+            {"kind": "RESOURCE", "positions": [list(resource)]},
+        ],
+    )
+    tactic._explore_state[str(WORKER_ID)] = [0, 0, *resource]
+    turn = _turn(state)
+    decide(turn)
+    assert tuple(tactic._explore_state[str(WORKER2_ID)][2:4]) == resource
+    far_state = tactic._explore_state.get(str(WORKER_ID), [])
+    assert len(far_state) < 4 or tuple(far_state[2:4]) != resource
+
+
 def test_worker_with_cargo_home_deposits() -> None:
     state = _state(
         resources=5,
@@ -500,6 +544,127 @@ def test_ranger_shoots_visible_legal_target() -> None:
     assert action.type == "SHOOT"
     assert action.target_id == ENEMY_UNIT_ID
     assert tuple(action.expected_cell) == (0, 2)
+
+
+def test_ranger_shoots_visible_diagonal_target() -> None:
+    state = _state(
+        population=2,
+        objects=[
+            {
+                "kind": "CORE",
+                "id": str(CORE_ID),
+                "controlled": True,
+                "owner_username": "arena_hero",
+                "position": [0, 0],
+                "hp": 5,
+                "shield": 5,
+                "state": "NORMAL",
+            },
+            {
+                "kind": "UNIT",
+                "id": str(RANGER_ID),
+                "controlled": True,
+                "position": [0, 0],
+                "hp": 2,
+                "unit_type": "RANGER",
+                "cargo": None,
+            },
+            {
+                "kind": "UNIT",
+                "id": str(ENEMY_UNIT_ID),
+                "controlled": False,
+                "position": [2, 2],
+                "hp": 2,
+                "unit_type": "RANGER",
+                "cargo": None,
+            },
+        ],
+    )
+    turn = _turn(state)
+    decide(turn)
+    action = _action(turn.plan, RANGER_ID)
+    assert action.type == "SHOOT"
+    assert tuple(action.expected_cell) == (2, 2)
+
+
+def test_ranger_does_not_shoot_diagonal_through_obstacle() -> None:
+    state = _state(
+        population=2,
+        objects=[
+            {
+                "kind": "CORE",
+                "id": str(CORE_ID),
+                "controlled": True,
+                "owner_username": "arena_hero",
+                "position": [0, 0],
+                "hp": 5,
+                "shield": 5,
+                "state": "NORMAL",
+            },
+            {
+                "kind": "UNIT",
+                "id": str(RANGER_ID),
+                "controlled": True,
+                "position": [0, 0],
+                "hp": 2,
+                "unit_type": "RANGER",
+                "cargo": None,
+            },
+            {"kind": "OBSTACLE", "positions": [[1, 1]]},
+            {
+                "kind": "UNIT",
+                "id": str(ENEMY_UNIT_ID),
+                "controlled": False,
+                "position": [2, 2],
+                "hp": 2,
+                "unit_type": "RANGER",
+                "cargo": None,
+            },
+        ],
+    )
+    turn = _turn(state)
+    decide(turn)
+    assert _action(turn.plan, RANGER_ID).type != "SHOOT"
+
+
+def test_ranger_diagonal_is_not_blocked_by_adjacent_obstacle() -> None:
+    state = _state(
+        population=2,
+        objects=[
+            {
+                "kind": "CORE",
+                "id": str(CORE_ID),
+                "controlled": True,
+                "owner_username": "arena_hero",
+                "position": [0, 0],
+                "hp": 5,
+                "shield": 5,
+                "state": "NORMAL",
+            },
+            {
+                "kind": "UNIT",
+                "id": str(RANGER_ID),
+                "controlled": True,
+                "position": [0, 0],
+                "hp": 2,
+                "unit_type": "RANGER",
+                "cargo": None,
+            },
+            {"kind": "OBSTACLE", "positions": [[1, 0]]},
+            {
+                "kind": "UNIT",
+                "id": str(ENEMY_UNIT_ID),
+                "controlled": False,
+                "position": [2, 2],
+                "hp": 2,
+                "unit_type": "RANGER",
+                "cargo": None,
+            },
+        ],
+    )
+    turn = _turn(state)
+    decide(turn)
+    assert _action(turn.plan, RANGER_ID).type == "SHOOT"
 
 
 def test_ranger_does_not_shoot_obstructed_target() -> None:
@@ -1017,6 +1182,82 @@ def test_holds_beacon_does_not_break_decisions() -> None:
     assert _action(turn.plan, WORKER_ID).type == "HARVEST"
 
 
+def test_enemy_beacon_does_not_raise_our_shield_cap() -> None:
+    state = _state(
+        resources=12,
+        population=2,
+        beacon_pos=(1, 0),
+        beacon_status="CARRIED",
+        beacon_carrier_id=ENEMY_UNIT_ID,
+        objects=[
+            {
+                "kind": "CORE",
+                "id": str(CORE_ID),
+                "controlled": True,
+                "owner_username": "arena_hero",
+                "position": [0, 0],
+                "hp": 5,
+                "shield": 5,
+                "state": "NORMAL",
+            },
+            {
+                "kind": "UNIT",
+                "id": str(WORKER_ID),
+                "controlled": True,
+                "position": [2, 0],
+                "hp": 2,
+                "unit_type": "WORKER",
+                "cargo": 0,
+            },
+            {
+                "kind": "UNIT",
+                "id": str(ENEMY_UNIT_ID),
+                "controlled": False,
+                "position": [1, 0],
+                "hp": 2,
+                "unit_type": "RANGER",
+                "cargo": None,
+            },
+        ],
+    )
+    turn = _turn(state)
+    decide(turn)
+    act = _core_action(turn.plan)
+    assert act is None or act.type != "REPAIR_SHIELD"
+
+
+def test_worker_picks_up_ground_beacon_on_same_cell() -> None:
+    state = _state(
+        beacon_pos=(1, 0),
+        beacon_status="GROUND",
+    )
+    turn = _turn(state)
+    decide(turn)
+    assert _action(turn.plan, WORKER_ID).type == "PICKUP_BEACON"
+
+
+def test_obstacle_shadow_is_not_recorded_as_explored() -> None:
+    state = _state(
+        objects=[
+            {
+                "kind": "CORE",
+                "id": str(CORE_ID),
+                "controlled": True,
+                "owner_username": "arena_hero",
+                "position": [0, 0],
+                "hp": 5,
+                "shield": 5,
+                "state": "NORMAL",
+            },
+            {"kind": "OBSTACLE", "positions": [[1, 0]]},
+        ],
+        population=0,
+    )
+    tactic._observe_terrain(_turn(state))
+    assert (1, 0) in tactic._explored_cells
+    assert (2, 0) not in tactic._explored_cells
+
+
 # ---------------------------------------------------------------------------
 # Standing army: combat Units are maintained even in peacetime
 # ---------------------------------------------------------------------------
@@ -1153,6 +1394,19 @@ def test_standing_army_grows_workers_when_reserve_full() -> None:
     assert act.unit_type.value == "WORKER"
 
 
+def test_remembered_enemy_core_does_not_freeze_economy() -> None:
+    tactic._known_enemy_cores.add((30, 30))
+    state = _state_with_workers(
+        n_workers=4, resources=8, n_vanguards=1, n_rangers=1
+    )
+    turn = _turn(state)
+    decide(turn)
+    act = _core_action(turn.plan)
+    assert act is not None
+    assert act.type == "SPAWN"
+    assert act.unit_type.value == "WORKER"
+
+
 def test_standing_army_banks_worker_spawn_when_below_reserve() -> None:
     # Reserve satisfied, only 5 resources: a Worker costs 5 but the reserve
     # requires 3 left over, so 5 is NOT enough — bank instead of draining to 0.
@@ -1217,10 +1471,9 @@ def test_standing_army_scales_with_worker_fleet() -> None:
             assert v >= 1, f"vanguard floor broken at {w}"
 
 
-def test_pop_over_budget_culls_empty_worker() -> None:
-    # A fleet that grew past the free-upkeep cap (population 21) must
-    # self-destruct a surplus EMPTY Worker each Tick to drop back under 20,
-    # stopping the upkeep tier-1 drain. Combat Units are never culled.
+def test_pop_over_budget_does_not_destroy_units_or_capacity() -> None:
+    # A manual expansion above 19 pays upkeep, but the Agent must not destroy
+    # units and shrink capacity before upkeep merely to save 1 resource/tick.
     objects = [
         {
             "kind": "CORE",
@@ -1265,7 +1518,7 @@ def test_pop_over_budget_culls_empty_worker() -> None:
             "unit_type": "RANGER",
         }
     )
-    state = _state(resources=50, population=21, objects=objects)
+    state = _state(resources=105, population=21, objects=objects)
     turn = _turn(state)
     decide(turn)
     culled = [
@@ -1273,12 +1526,7 @@ def test_pop_over_budget_culls_empty_worker() -> None:
         for uid, a in turn.plan.unit_actions.items()
         if getattr(a, "type", "") == "SELF_DESTRUCT"
     ]
-    # pop21 - budget19 = 2 surplus Workers culled in ONE Tick (SELF_DESTRUCT
-    # resolves before upkeep, so the drain stops immediately).
-    assert len(culled) == 2
-    for uid in culled:
-        culled_unit = next(u for u in turn.units if str(u.id) == str(uid))
-        assert culled_unit.unit_type == "WORKER"
+    assert culled == []
 
 
 def test_resource_memory_pool_remembers_and_confirms() -> None:
@@ -1334,6 +1582,46 @@ def test_resource_memory_pool_remembers_and_confirms() -> None:
     t3 = _turn(s3)
     tactic._observe_resources(t3)
     assert (8, 0) in tactic._known_resources
+
+
+def test_current_resource_state_overrides_previous_harvest_event() -> None:
+    state = _state(
+        objects=[
+            {
+                "kind": "CORE",
+                "id": str(CORE_ID),
+                "controlled": True,
+                "owner_username": "arena_hero",
+                "position": [0, 0],
+                "hp": 5,
+                "shield": 5,
+                "state": "NORMAL",
+            },
+            {
+                "kind": "UNIT",
+                "id": str(WORKER_ID),
+                "controlled": True,
+                "position": [1, 0],
+                "hp": 2,
+                "unit_type": "WORKER",
+                "cargo": 0,
+            },
+            {"kind": "RESOURCE", "positions": [[3, 0]]},
+        ],
+        events=[
+            {
+                "event_id": "00000000-0000-4000-8000-0000000000cc",
+                "tick": 9,
+                "event_type": "HARVEST_SUCCEEDED",
+                "actor_id": str(WORKER2_ID),
+                "position": [3, 0],
+                "values": {"amount": 1, "source": "DROPPED_CARGO"},
+            }
+        ],
+    )
+    turn = _turn(state)
+    tactic._observe_resources(turn)
+    assert (3, 0) in tactic._known_resources
 
 
 def test_worker_sweep_directions_alternate_by_index() -> None:

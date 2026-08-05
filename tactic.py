@@ -399,14 +399,16 @@ def _observe_terrain(turn: "Turn") -> None:
     global _known_obstacles, _explored_cells, _last_saved_explored
     before = len(_known_obstacles)
     _known_obstacles.update(turn.obstacle_cells)
-    # Record every cell within a friendly vision source's radius as explored
-    # (Manhattan approximation of vision coverage). Large, so persist only when
-    # new obstacles appear (which also snapshots the explored set).
-    for src, radius in _vision_sources(turn):
+    # Record only cells actually visible through the obstacle layout. A plain
+    # Manhattan diamond incorrectly marks cells behind walls as explored.
+    sources = _vision_sources(turn)
+    for src, radius in sources:
         sx, sy = src
         for dx in range(-radius, radius + 1):
             for dy in range(-(radius - abs(dx)), radius - abs(dx) + 1):
-                _explored_cells.add((sx + dx, sy + dy))
+                cell = (sx + dx, sy + dy)
+                if _any_vision_sees(cell, [(src, radius)], _known_obstacles):
+                    _explored_cells.add(cell)
     if len(_known_obstacles) != before:
         _save_persistent_state()
         _last_saved_explored = len(_explored_cells)
@@ -474,39 +476,34 @@ def _manhattan(a: tuple[int, int], b: tuple[int, int]) -> int:
     return abs(a[0] - b[0]) + abs(a[1] - b[1])
 
 
-def _same_line(a: tuple[int, int], b: tuple[int, int]) -> bool:
-    return a[0] == b[0] or a[1] == b[1]
+def _same_fire_line(a: tuple[int, int], b: tuple[int, int]) -> bool:
+    """Return whether two cells share a cardinal or exact-diagonal fire line."""
+    dx = abs(a[0] - b[0])
+    dy = abs(a[1] - b[1])
+    return (dx == 0 and dy > 0) or (dy == 0 and dx > 0) or dx == dy
 
 
 def _obstacles_between(
     a: tuple[int, int], b: tuple[int, int], obstacles: frozenset[tuple[int, int]]
 ) -> bool:
-    """True if any obstacle cell lies strictly between a and b on a cardinal line.
+    """True if an obstacle lies between cells on a legal Ranger fire line.
 
-    Only obstacles block a Ranger shot (Units and Cores never do). The
-    supercover line is checked against every intermediate cell.
+    Only obstacles in the cardinal or exact-diagonal shot cells block Ranger
+    fire. Obstacles beside an exact diagonal do not block it.
     """
-    if not _same_line(a, b):
+    if not _same_fire_line(a, b):
         return True
     if a == b:
         return False
     ax, ay = a
     bx, by = b
-    if ax == bx:
-        step = 1 if by > ay else -1
-        y = ay + step
-        while y != by:
-            if (ax, y) in obstacles:
-                return True
-            y += step
-    else:
-        step = 1 if bx > ax else -1
-        x = ax + step
-        while x != bx:
-            if (x, ay) in obstacles:
-                return True
-            x += step
-    return False
+    dx = 0 if ax == bx else (1 if bx > ax else -1)
+    dy = 0 if ay == by else (1 if by > ay else -1)
+    distance = max(abs(bx - ax), abs(by - ay))
+    return any(
+        (ax + dx * step, ay + dy * step) in obstacles
+        for step in range(1, distance)
+    )
 
 
 def _step_toward(
@@ -937,7 +934,7 @@ def _select_ranger_target(
 ) -> UnitView | CoreView | None:
     """Choose a visible enemy the Ranger can legally shoot this Tick.
 
-    Rules: shared cardinal line, Manhattan distance 1-3, no obstacle strictly
+    Rules: shared cardinal or exact-diagonal line, range 1-3, no obstacle strictly
     between. Enemy Cores are prioritized: destroying one removes the enemy fleet
     and can capture its stockpiled resources (variable loot, not a flat +6; see
     ``CORE_RESOURCES_CAPTURED``). Among Units, prefer a one-shot-killable (hp==1)
@@ -949,9 +946,9 @@ def _select_ranger_target(
     best_key: tuple[int, int, int, int, str] | None = None
     for enemy in enemies:
         cell = enemy.position
-        if not _same_line(ranger_pos, cell):
+        if not _same_fire_line(ranger_pos, cell):
             continue
-        dist = _manhattan(ranger_pos, cell)
+        dist = max(abs(ranger_pos[0] - cell[0]), abs(ranger_pos[1] - cell[1]))
         if dist < 1 or dist > RANGER_MAX_RANGE:
             continue
         if _obstacles_between(ranger_pos, cell, obstacles):
@@ -1055,9 +1052,11 @@ def _control_workers(turn: "Turn", core_pos: tuple[int, int]) -> None:
     _sorted_workers: list[tuple[int, object]] = sorted(
         enumerate(turn.workers),
         key=lambda x: (
+            x[1].cargo > 0,
             min(_manhattan(x[1].position, r) for r in _known_snap)
-            if _known_snap
-            else float('inf')
+            if _known_snap and x[1].cargo == 0
+            else 10**18,
+            x[0],
         ),
     )
     for _srt_pos, (orig_index, worker) in enumerate(_sorted_workers):
@@ -1074,6 +1073,13 @@ def _control_workers(turn: "Turn", core_pos: tuple[int, int]) -> None:
         # at d=37 and spent 53+ ticks hauling cargo 1 home (a net loss). A
         # worker standing on a node beyond the economic radius skips it and
         # stays in the sweep fleet; a closer worker finds it or it refills.
+        if (
+            worker.cargo == 0
+            and turn.beacon.status == BeaconStatus.GROUND
+            and turn.beacon.position == pos
+        ):
+            worker.pickup_beacon()
+            continue
         if (
             worker.cargo == 0
             and pos in resource_cells
@@ -1254,9 +1260,19 @@ def _control_workers(turn: "Turn", core_pos: tuple[int, int]) -> None:
         # resource (and it's still economically reachable), keep it — another
         # worker must not yank a mid-walk target (community Player C's pacing
         # anti-pattern: "a far worker steals the node at a near worker's feet").
-        if lock is not None and lock in known and _manhattan(core_pos, lock) <= _harvest_radius(turn):
+        if (
+            lock is not None
+            and lock in known
+            and lock not in claims
+            and _manhattan(core_pos, lock) <= _harvest_radius(turn)
+        ):
             claims[lock] = orig_index + 1
         else:
+            if lock in claims:
+                lock = None
+                if st is not None and len(st) >= 4:
+                    st[2] = None
+                    st[3] = None
             # Sort KNOWN resources by distance to this worker. Pick the nearest
             # one that has NOT already been claimed by another empty worker —
             # this fans the fleet across the pool instead of converging on the
@@ -1485,27 +1501,15 @@ def _can_shoot(
 ) -> bool:
     """True if a Ranger at ``shooter`` can legally shoot ``target``.
 
-    Rules (v0.7): shared cardinal line, Manhattan 1-3, no obstacle strictly
-    between. The reference agent and SDK 0.2.8 suggest the live server may
-    also accept 45-degree diagonal fire (|dx|==|dy|, range 1-3); we include
-    both and let the server decide (worst case: SHOT_MISSED, no penalty).
+    Rules (v0.13): shared cardinal or exact-diagonal line, range 1-3, with no
+    obstacle in an intermediate shot cell.
     """
-    dist = _manhattan(shooter, target)
+    if not _same_fire_line(shooter, target):
+        return False
+    dist = max(abs(shooter[0] - target[0]), abs(shooter[1] - target[1]))
     if dist < 1 or dist > 3:
         return False
-    sx, sy = shooter
-    tx, ty = target
-    if sx == tx or sy == ty:
-        return not _obstacles_between(shooter, target, obstacles)
-    # Diagonal: |dx| == |dy| <= 3. The server may or may not support this
-    # (v0.7: no; likely v0.8: yes). Include it as a free probe — if the
-    # server rejects it the result is SHOT_MISSED, no penalty. Include the
-    # obstacle check for when/if it lands.
-    dx = abs(tx - sx)
-    dy = abs(ty - sy)
-    if dx == dy:
-        return not _obstacles_between(shooter, target, obstacles)
-    return False
+    return not _obstacles_between(shooter, target, obstacles)
 
 
 def _guard_reposition_step(
@@ -1746,36 +1750,6 @@ def _standing_army_targets(n_workers: int) -> tuple[int, int]:
     return vanguards, rangers
 
 
-def _control_pop_demotion(turn: "Turn") -> None:
-    """Shrink the fleet back under the free-upkeep cap when growth overshoots.
-
-    Can happen when the Core spawns faster than the population gate expected
-    (e.g. after a full-capacity deadlock unblocks and multiple spawns land in
-    quick succession): population passes FREE_UPKEEP_CAP-1, upkeep enters tier
-    1 and drains resources every Tick, and the live server destroys Units with
-    UPKEEP_DEFICIT when resources cannot cover the charge — an over-budget
-    fleet bleeds out by random attrition, possibly taking the standing army.
-    Self-destruct ALL surplus EMPTY Workers this Tick (empty so no cargo drops;
-    SELF_DESTRUCT resolves before upkeep, so the drain stops the same Tick).
-    Choose the surplus Workers NEAREST the Core so the most distant sweep
-    coverage survives. Combat Units are never culled: the standing army stays
-    intact (user requirement).
-    """
-    surplus = turn.state.population - (FREE_UPKEEP_CAP - 1)
-    if surplus <= 0:
-        return
-    core = turn.core
-    if core is None:
-        return
-    core_pos = core.position
-    candidates = sorted(
-        (w for w in turn.workers if w.cargo == 0),
-        key=lambda w: _manhattan(w.position, core_pos),
-    )
-    for worker in candidates[:surplus]:
-        worker.self_destruct()
-
-
 def _control_core(
     turn: "Turn",
     threats: list[UnitView | CoreView],
@@ -1790,10 +1764,22 @@ def _control_core(
         return
 
     resources = turn.resources
+    if (
+        turn.beacon.status == BeaconStatus.GROUND
+        and turn.beacon.position == core.position
+    ):
+        core.pickup_beacon()
+        return
     # Repair shield first when under threat and there is space and a spare
     # resource. Holding the Beacon raises the cap to 10, so use the live cap.
     if threats and resources >= 1:
-        cap = 10 if turn.beacon.status == BeaconStatus.CARRIED else 5
+        friendly_ids = {u.id for u in turn.units}
+        friendly_ids.add(core.id)
+        owns_beacon = (
+            turn.beacon.status == BeaconStatus.CARRIED
+            and turn.beacon.carrier_id in friendly_ids
+        )
+        cap = 10 if owns_beacon else 5
         if core.shield < cap:
             core.repair_shield()
             return
@@ -2026,12 +2012,14 @@ def _observe_resources(turn: "Turn") -> None:
     a resource); remove cells harvested successfully this Tick.
     """
     global _known_resources
-    # Add all currently visible resources.
-    _known_resources.update(turn.resource_cells)
     # Remove cells harvested this Tick (the event carries the harvest cell).
     for event in turn.events:
         if event.event_type == "HARVEST_SUCCEEDED" and event.position is not None:
             _known_resources.discard(tuple(event.position))
+    # The complete current state is authoritative over previous-Tick events.
+    # A dropped-cargo pile can remain after a partial harvest, and a natural
+    # node can refill at the same coordinate.
+    _known_resources.update(turn.resource_cells)
     # Remove cells that a friendly vision source can see and are confirmed
     # not to hold a resource (visible but not in turn.resource_cells).
     sources = _vision_sources(turn)
@@ -2266,12 +2254,12 @@ def decide(turn: "Turn") -> None:
     # production (req: build attack units in time vs. other enemies).
     #
     # Enemy Cores expose `kind == "CORE"` (not `unit_type`); `_observe_enemies`
-    # already latches any seen Core into `_known_enemy_cores` (a set), so a
-    # fleeting sighting still drives a raid over the many ticks it takes to build
-    # and march the strike force.
+    # already latches seen Cores into `_known_enemy_cores` for bounded Ranger
+    # tracking. Extra production is intentionally limited to a currently visible
+    # Core: a stale permanent coordinate must not freeze Worker investment.
     enemy_core_visible = any(
         getattr(e, "kind", "") == "CORE" for e in turn.visible_enemies
-    ) or bool(_known_enemy_cores)
+    )
 
     # Defense first: react to visible nearby enemies and Core damage before
     # pursuing the economy or distant goals.
@@ -2279,9 +2267,3 @@ def decide(turn: "Turn") -> None:
     _control_vanguards(turn, core_pos)
     _control_core(turn, threats, enemy_core_visible=enemy_core_visible)
     _control_workers(turn, core_pos)
-    # Cull LAST: the SDK unit action slot is last-set-wins, so if the demotion
-    # ran first, _control_workers would overwrite the queued SELF_DESTRUCT with
-    # a MOVE and the over-budget fleet would never actually cull (6th review,
-    # skeptic F1). Running after every other unit command guarantees the cull
-    # survives into the submitted plan.
-    _control_pop_demotion(turn)

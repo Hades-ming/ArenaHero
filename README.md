@@ -1,6 +1,6 @@
 # Arena Hero — balanced tactic
 
-A conservative starter tactic for [Arena Hero](https://doc.arenahero.io/) v0.7,
+A resource-first balanced tactic for [Arena Hero](https://doc.arenahero.io/) v0.13,
 built with the official [`arena-hero`](https://pypi.org/project/arena-hero/)
 Python SDK. Tactics decisions are separated from the connection loop so they
 can be tested without a live credential.
@@ -10,12 +10,12 @@ can be tested without a live credential.
 - `tactic.py` — `decide(turn)` queues one complete plan per Turn.
 - `play.py` — connects to the live server, calls `decide`, and submits.
 - `tests/test_tactic.py` — decision tests using `PlayerState` fixtures.
-- `pyproject.toml` — pins `arena-hero>=0.2.4,<0.3`.
+- `pyproject.toml` — pins `arena-hero>=0.2.8,<0.3`.
 
 ## Install
 
 ```bash
-python -m pip install 'arena-hero>=0.2.4,<0.3'
+python -m pip install 'arena-hero>=0.2.8,<0.3'
 python -m pip install pytest
 ```
 
@@ -46,17 +46,17 @@ python -m pytest -q
 
 ## Policy
 
-The default is deliberately conservative and not optimal:
+The tactic is continuously measured and is not claimed to be globally optimal:
 
 - deposit carried Worker cargo when sharing the Core cell;
 - harvest when an empty Worker stands on a currently visible resource cell;
-- move empty Workers toward the nearest visible resource, or home to deposit;
-- Rangers shoot visible legal targets (Core prioritized), else kite home;
+- assign known resources to nearby empty Workers, while unassigned Workers explore;
+- Rangers shoot visible legal cardinal or diagonal targets (Core prioritized);
 - Vanguards sweep the adjacent cell with the most enemies, else hold near Core;
 - repair Core shield only when under visible threat;
-- spawn Workers to a soft target, then one Vanguard if threatened, staying
-  below the free-upkeep population band (population < 20);
+- maintain a Worker economy and standing combat reserve while keeping population
+  below the free-upkeep boundary (population < 20);
 - leave an object on WAIT when no legal useful action is known.
 
-Every numeric rule comes from the bundled Arena Hero v0.7 references; none is
+Every numeric rule comes from the bundled Arena Hero v0.13 references; none is
 inferred from memory.
