@@ -172,17 +172,21 @@ HARVEST_LOCK_RANGE = 6
 # node used to just keep exploring (observed: workers idled while user-visible
 # resources sat uncollected). Commit to a known node within reach instead.
 MAX_HARVEST_REACH = 30
-# Max Core-to-resource distance worth harvesting. A node 55 cells out means a
-# ~110-tick round trip — a NET LOSS at ~0.1/tick income (observed: d48045
-# harvested (30,274) at dist 55 and the economy stalled on its long delivery).
-# Only actively harvest nodes the Core can reach economically; beyond this a
-# Worker picks one up if it happens to pass through, not by lock.
-MAX_HARVEST_FROM_CORE = 30
+# Max Core-to-resource distance worth harvesting. The alternative to locking a
+# known node is IDLE EXPLORATION, which yields ~0 resources (workers only hit a
+# node by chance). So committing to a known node within this radius is strictly
+# better than milling around. Workers pick the NEAREST known node first, so
+# close nodes are always taken before any distant one; a distant node is only
+# approached by a worker that happens to be near it. Raised from 30 (user
+# complaint: workers loitered near the Core while known resources sat
+# uncollected — the old 30 radius + a 30-cell worker lock gate meant most
+# workers were too far to ever commit and just swept aimlessly).
+MAX_HARVEST_FROM_CORE = 40
 # Wider band used when the economy is STARVED: nearby-but-distant nodes that are
 # a net loss in a healthy economy become worth taking when nothing closer exists
 # (expert review L2: late-game the Core sat at r0/95 because the only visible
 # nodes were d=41-46 and were hard-filtered). Keeps income alive instead of idling.
-MAX_HARVEST_FROM_CORE_STARVED = 55
+MAX_HARVEST_FROM_CORE_STARVED = 65
 # If no harvest succeeds for this many ticks, treat the economy as starved and
 # permit harvesting out to MAX_HARVEST_FROM_CORE_STARVED.
 STARVE_TICKS = 50
@@ -1180,11 +1184,23 @@ def _control_workers(turn: "Turn", core_pos: tuple[int, int]) -> None:
                     if candidate in claims:
                         continue
                     nearest = candidate
-                    lock_dist = MAX_HARVEST_REACH if nearest in known else HARVEST_LOCK_RANGE
+                    # For a KNOWN resource, commit from anywhere within the
+                    # economic harvest radius (the worker may be far; A* walks it
+                    # there). For a merely VISIBLE resource, keep the tight
+                    # HARVEST_LOCK_RANGE so a Worker does not detour for an
+                    # edge-of-vision node it may lose next tick. The old code used
+                    # MAX_HARVEST_REACH (30) as the worker-distance cap, which left
+                    # most of the fleet too far to ever commit — they just swept
+                    # near the Core while known resources sat uncollected.
+                    lock_dist = (
+                        max(MAX_HARVEST_REACH, _harvest_radius(turn))
+                        if nearest in known
+                        else HARVEST_LOCK_RANGE
+                    )
                     # Skip nodes too far from the Core — the round trip is a net
-                    # loss and stalls the economy in a healthy state (observed:
-                    # (30,274) at dist 55). When starved, the radius widens so a
-                    # distant node is still taken rather than idling.
+                    # loss and stalls the economy in a healthy state. When starved,
+                    # the radius widens so a distant node is still taken rather
+                    # than idling.
                     if _manhattan(core_pos, nearest) > _harvest_radius(turn):
                         continue
                     if _manhattan(pos, nearest) <= lock_dist:
@@ -1952,11 +1968,13 @@ def _observe_resources(turn: "Turn") -> None:
         # Economy-pool hygiene (9th review, rank 5): drop nodes so far from the
         # Core they are never collectable (the round trip is a net loss). They
         # are re-added if a vision source re-lights them later. Prevents a
-        # sparse pool from pulling an edge Worker into a wasted approach.
+        # sparse pool from pulling an edge Worker into a wasted approach. Bound
+        # matches the widest harvest radius (starved) so a node the tactic WILL
+        # target is never pruned from memory before a Worker can reach it.
         _known_resources = {
             cell
             for cell in _known_resources
-            if _manhattan((cx, cy), cell) <= MAX_HARVEST_FROM_CORE + HARVEST_REACH
+            if _manhattan((cx, cy), cell) <= MAX_HARVEST_FROM_CORE_STARVED
         }
     _save_persistent_state()
 
