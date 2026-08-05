@@ -123,8 +123,8 @@
   验证：`game.log` 的 tick 继续推进、且 `play.out` 无 error。
 - **当前运行方式**：`launchctl` 用户服务 `io.arenahero.tactic` 托管 `play.py`；改动后用
   `launchctl kickstart -k gui/$(id -u)/io.arenahero.tactic` 重启，并验证唯一 PID 与连续新 Tick。
-- **自动化边界**：当前 Codex 定时复审自动化尚未成功创建，不能把文档中的历史名称当作现状；
-  SDK/规则核验由每轮审查显式执行，直到自动化有可验证 ID/配置为止。
+- **自动化边界**：Codex heartbeat `arena-hero` 已创建，每 6 小时复核 SDK、规则文档、live KPI，
+  瓶颈时调用经济/战斗/路径/运行专家；仅失败运行通知。人工审查仍需实时核验，不能只信历史配置。
 
 ## L12 — 全量复审：规则真相必须压过历史启发式
 - **对角火力漏判**：v0.13 Ranger 支持横、竖和 45 度对角线 1-3 格射击。旧实现先按
