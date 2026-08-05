@@ -107,11 +107,11 @@ Run: `launchctl kickstart -k gui/$(id -u)/io.arenahero.tactic`
 
 Expected: 常驻进程恢复运行；新发现资源由对应 Worker 领取；无资源阶段的 Worker 坐标开始向多个方向扩散；无认证、协议或提交错误。
 
-- [ ] **Step 4: 精准提交并推送**
+- [x] **Step 4: 精准提交并推送**
 
 只暂存 `tactic.py`、`tests/test_tactic.py`、`GOAL.md`、`LESSONS.md` 和本轮 `docs/superpowers/` 文档，创建提交并推送 `main`。
 
-- [ ] **Step 5: 核对远端一致性**
+- [x] **Step 5: 核对远端一致性**
 
 Run: `git status --short --branch && git rev-parse HEAD && git rev-parse origin/main && git ls-remote origin refs/heads/main && git rev-list --left-right --count origin/main...HEAD`
 
