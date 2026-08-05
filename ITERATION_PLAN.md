@@ -40,9 +40,9 @@
 
 ### 合同
 
-- **负责人**：隔离执行 Agent；主代理验收与上线。
+- **负责人**：待用户安排外部执行 Agent；主代理只负责审查、验收与上线决定。
 - **base SHA**：`4ed9c8d393e0b03e6fa0c147d5d926912deba28e`。
-- **分支 / worktree**：`codex/obs-001-timing` / 仓库外独立目录。
+- **建议分支 / worktree**：`codex/obs-001-timing` / 仓库外独立目录；是否开始由用户决定。
 - **允许文件**：`play.py`、`meta/monitor.py`、`tests/test_tactic.py`。
 - **禁止文件**：`.env`、`tactic.py`、`tactic_state.json`、所有运行日志和 LaunchAgent。
 - **问题**：当前只有动作/事件计数，没有 `decide`、`submit`、总本地耗时和唯一 Tick 口径，
@@ -102,7 +102,8 @@
 
 ## 本轮完成定义
 
-1. 所有批准任务由隔离执行 Agent 交付、主代理验收；执行 Agent 不直接 push/live。
+1. 所有批准任务由用户安排的外部执行 Agent 交付、主代理验收；主代理不派发或代写实现，
+   执行 Agent 不直接 push/live。
 2. 规则与 SDK 版本一致，唯一 live 进程，日志按唯一 Tick 统计。
 3. 每项行为变化都有基线、样本量、主指标、安全护栏和回滚条件。
 4. 验收结果更新本文件和 `LESSONS.md`，由主代理精准 commit、push 并核验 GitHub SHA。

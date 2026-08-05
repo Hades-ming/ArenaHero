@@ -27,7 +27,8 @@
 - 完整阅读基础规则、SDK、`GOAL.md`、本文件和当前计划。
 - 核验 Git、规则/SDK 版本、唯一 live 进程、日志连续性和当前战况。
 - 从代码与日志提出可证伪假设，召集专家，决定是否批准实验。
-- 编写任务合同、建立隔离 worktree、审查执行 Agent 的 diff 和证据。
+- 编写任务合同，审查由用户安排的执行 Agent 所交付的 diff 和证据。
+- 不派发执行 Agent，不代替执行 Agent 编写任务代码；是否开始执行由用户决定。
 - 独占 live 重启、静态验收、canary、commit、merge 和 push 权限。
 - 验收失败时拒绝或回滚，不以“测试通过”代替真实战况验证。
 
@@ -43,8 +44,9 @@
 专家模型固定使用用户指定的 **Luna**。若当前协作接口没有暴露 Luna，主代理必须在
 `ITERATION_PLAN.md` 记录实际降级模型；降级输出只能作为临时会诊，禁止标记成 Luna 结果。
 
-### 执行 Agent（隔离实现者）
+### 外部执行 Agent（由用户安排）
 
+- 主代理只提供任务合同；由用户决定何时、交给哪个 Agent 执行。
 - 每个任务使用独立 `codex/<task-id>` 分支和仓库外 worktree。
 - 只能修改任务合同 `允许文件` 中的路径，只运行离线测试。
 - 不得读取或复制 `.env`，不得运行 `play.py`、操作 `launchctl`、提交、推送或合并。
@@ -77,7 +79,7 @@ DISCOVERED -> PROPOSED -> APPROVED -> IN_PROGRESS -> STATIC_VERIFIED
 - `DISCOVERED`：日志、用户观察或审查发现问题。
 - `PROPOSED`：有假设、基线、指标、样本量和回滚条件。
 - `APPROVED`：主代理确认收益与风险，锁定 `base_sha` 和文件范围。
-- `IN_PROGRESS`：执行 Agent 在隔离 worktree 实现。
+- `IN_PROGRESS`：用户已安排外部执行 Agent 在隔离 worktree 实现。
 - `STATIC_VERIFIED`：主代理完成 diff、测试、编译和凭据检查。
 - `LIVE_CANARY`：主代理重启唯一服务，先跑小窗口。
 - `OBSERVING`：样本不足，禁止提前宣布优化成功。
@@ -130,8 +132,9 @@ DISCOVERED -> PROPOSED -> APPROVED -> IN_PROGRESS -> STATIC_VERIFIED
 
 ## 7. Git、live 与回滚
 
-1. 开始前：确认干净 `main`、`HEAD == origin/main == ls-remote main`。
-2. 执行时：Agent 只在隔离 worktree 产生 diff，主代理不并发修改同一文件。
+1. 开始前：主代理确认干净 `main`、`HEAD == origin/main == ls-remote main`，并提供基线 SHA。
+2. 执行时：由用户安排的 Agent 只在隔离 worktree 产生 diff，主代理不派发实现，也不并发修改
+   同一文件。
 3. 静态验收：定向测试、全量测试、`compileall`、`uv sync --locked --dry-run`、
    `uv pip check`、`git diff --check` 和敏感信息扫描。
 4. live 验收：主代理执行
