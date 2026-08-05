@@ -40,6 +40,7 @@ ENEMY_UNIT_ID = UUID("00000000-0000-4000-8000-000000000098")
 def _reset_explore_state() -> None:
     """Each test sees a clean per-Worker exploration memory."""
     tactic._explore_state.clear()
+    tactic._explore_targets.clear()
     tactic._known_resources.clear()
     tactic._known_obstacles.clear()
     tactic._known_enemy_cores.clear()
@@ -48,9 +49,9 @@ def _reset_explore_state() -> None:
     tactic._prev_pos.clear()
     tactic._last_pos.clear()
     tactic._stuck_ticks.clear()
-    tactic._lock_meta.clear()
     yield
     tactic._explore_state.clear()
+    tactic._explore_targets.clear()
     tactic._known_resources.clear()
     tactic._known_obstacles.clear()
     tactic._known_enemy_cores.clear()
@@ -59,7 +60,6 @@ def _reset_explore_state() -> None:
     tactic._prev_pos.clear()
     tactic._last_pos.clear()
     tactic._stuck_ticks.clear()
-    tactic._lock_meta.clear()
 
 
 def _state(
@@ -182,6 +182,214 @@ def test_exploration_assigns_different_bands_to_workers() -> None:
     assert chunk_x0 <= col1 <= chunk_x0 + 31
 
 
+def _workers_state(
+    positions: list[tuple[int, int]],
+    *,
+    cargo: list[int] | None = None,
+    resources: list[tuple[int, int]] | None = None,
+) -> PlayerState:
+    """Build a deterministic Core plus Worker fleet for dispatcher tests."""
+    cargo = cargo or [0] * len(positions)
+    objects: list[dict[str, Any]] = [
+        {
+            "kind": "CORE",
+            "id": str(CORE_ID),
+            "controlled": True,
+            "owner_username": "arena_hero",
+            "position": [0, 0],
+            "hp": 5,
+            "shield": 5,
+            "state": "NORMAL",
+        }
+    ]
+    for index, (position, worker_cargo) in enumerate(zip(positions, cargo, strict=True)):
+        objects.append(
+            {
+                "kind": "UNIT",
+                "id": str(UUID(int=0x6000 + index)),
+                "controlled": True,
+                "position": list(position),
+                "hp": 2,
+                "unit_type": "WORKER",
+                "cargo": worker_cargo,
+            }
+        )
+    if resources:
+        objects.append(
+            {"kind": "RESOURCE", "positions": [list(cell) for cell in resources]}
+        )
+    return _state(population=len(positions), objects=objects)
+
+
+def test_distant_known_resource_is_retained_and_assigned() -> None:
+    distant = (100, 0)
+    tactic._known_resources.add(distant)
+    turn = _turn(_workers_state([(1, 0)]))
+
+    tactic._observe_resources(turn)
+
+    assert distant in tactic._known_resources
+    assert tactic._worker_resource_assignments(turn) == {
+        str(UUID(int=0x6000)): distant
+    }
+
+
+def test_visible_resource_priority_over_nearer_history_hint() -> None:
+    remembered = (1, 0)
+    visible = (10, 0)
+    tactic._known_resources.add(remembered)
+    turn = _turn(_workers_state([(0, 1)], resources=[visible]))
+    tactic._observe_resources(turn)
+
+    assignments = tactic._worker_resource_assignments(turn)
+
+    assert assignments[str(UUID(int=0x6000))] == visible
+
+
+def test_global_resource_matching_beats_worker_order_greedy() -> None:
+    # Greedy gives A->(1,0), B->(0,100), total 103. The global optimum is
+    # A->(0,100), B->(1,0), total 101.
+    resources = {(1, 0), (0, 100)}
+    tactic._known_resources.update(resources)
+    turn = _turn(_workers_state([(0, 0), (2, 0)]))
+
+    assignments = tactic._worker_resource_assignments(turn)
+
+    assert assignments == {
+        str(UUID(int=0x6000)): (0, 100),
+        str(UUID(int=0x6001)): (1, 0),
+    }
+
+
+def test_global_resource_matching_ignores_unit_input_order() -> None:
+    tactic._known_resources.update({(1, 0), (0, 100)})
+    state = _workers_state([(0, 0), (2, 0)])
+    turn = _turn(state)
+    expected = tactic._worker_resource_assignments(turn)
+
+    reversed_objects = [state.objects[0], *reversed(state.objects[1:])]
+    reordered = state.model_copy(update={"objects": tuple(reversed_objects)})
+
+    assert tactic._worker_resource_assignments(_turn(reordered)) == expected
+
+
+def test_global_resource_matching_excludes_laden_workers_and_is_unique() -> None:
+    tactic._known_resources.update({(1, 0), (2, 0)})
+    turn = _turn(_workers_state([(0, 0), (0, 1), (0, 2)], cargo=[1, 0, 0]))
+
+    assignments = tactic._worker_resource_assignments(turn)
+
+    assert str(UUID(int=0x6000)) not in assignments
+    assert len(assignments) == 2
+    assert len(set(assignments.values())) == 2
+
+
+def test_dispersed_exploration_targets_cover_multiple_directions() -> None:
+    # Simulate a fully explored inner diamond. New targets should lie around
+    # different parts of its frontier rather than all inheriting southeast.
+    tactic._explored_cells.update(
+        (x, y)
+        for x in range(-10, 11)
+        for y in range(-10, 11)
+        if abs(x) + abs(y) <= 10
+    )
+    workers = [
+        (str(UUID(int=0x6000 + index)), (2 + index, 2))
+        for index in range(4)
+    ]
+
+    targets = tactic._assign_explore_targets(workers, (0, 0), frozenset())
+
+    quadrants = {
+        (1 if x >= 0 else -1, 1 if y >= 0 else -1)
+        for x, y in targets.values()
+    }
+    assert len(targets) == 4
+    assert len(quadrants) >= 3
+    assert min(
+        tactic._manhattan(a, b)
+        for index, a in enumerate(targets.values())
+        for b in list(targets.values())[index + 1 :]
+    ) >= 6
+
+
+def test_exploration_target_stays_stable_until_frontier_is_lit() -> None:
+    tactic._explored_cells.update(
+        (x, y)
+        for x in range(-6, 7)
+        for y in range(-6, 7)
+        if abs(x) + abs(y) <= 6
+    )
+    workers = [(str(UUID(int=0x6000)), (1, 1))]
+    first = tactic._assign_explore_targets(workers, (0, 0), frozenset())
+    second = tactic._assign_explore_targets(workers, (0, 0), frozenset())
+
+    assert second == first
+
+
+def test_unknown_cells_behind_obstacle_remain_exploration_frontier() -> None:
+    tactic._explored_cells.update({(0, 0), (1, 0), (0, 1), (0, -1), (-1, 0)})
+    workers = [(str(UUID(int=0x6000)), (0, 0))]
+
+    targets = tactic._assign_explore_targets(workers, (0, 0), frozenset({(1, 0)}))
+
+    assert targets[str(UUID(int=0x6000))] != (1, 0)
+    assert targets[str(UUID(int=0x6000))] not in tactic._explored_cells
+
+
+def test_frontier_targets_stay_near_current_core_after_migration() -> None:
+    # Historical explored terrain near an old Core must not pull idle Workers
+    # back across the map after a manual migration.
+    tactic._explored_cells.update(
+        (100 + x, 100 + y)
+        for x in range(-5, 6)
+        for y in range(-5, 6)
+    )
+    worker_id = str(UUID(int=0x6000))
+
+    targets = tactic._assign_explore_targets(
+        [(worker_id, (1, 0))], (0, 0), frozenset()
+    )
+
+    assert tactic._manhattan(targets[worker_id], (0, 0)) <= tactic.MAX_SWEEP_RADIUS
+
+
+def test_astar_rejects_blocked_goal_unless_explicitly_allowed() -> None:
+    start = (0, 0)
+    goal = (1, 0)
+    blocked = frozenset({goal})
+
+    assert tactic._astar_step(start, goal, frozenset(), blocked) is None
+    assert (
+        tactic._astar_step(
+            start, goal, frozenset(), blocked, allow_blocked_goal=True
+        )
+        == Direction.RIGHT
+    )
+
+
+def test_complete_worker_plan_is_independent_of_object_order() -> None:
+    state = _workers_state([(2, 2), (3, 2), (4, 2), (5, 2)])
+    first = _turn(state)
+    decide(first)
+    expected = first.plan.unit_actions
+
+    tactic._explore_state.clear()
+    tactic._explore_targets.clear()
+    tactic._explored_cells.clear()
+    tactic._pos_history.clear()
+    tactic._prev_pos.clear()
+    tactic._last_pos.clear()
+    tactic._stuck_ticks.clear()
+    reordered = state.model_copy(
+        update={"objects": tuple([state.objects[0], *reversed(state.objects[1:])])}
+    )
+    second = _turn(reordered)
+    decide(second)
+
+    assert second.plan.unit_actions == expected
+
+
 # ---------------------------------------------------------------------------
 # Economy: harvest and deposit
 # ---------------------------------------------------------------------------
@@ -258,10 +466,8 @@ def test_nearest_worker_claims_resource_independent_of_unit_order() -> None:
     turn = _turn(state)
     decide(turn)
 
-    near_state = tactic._explore_state[str(WORKER2_ID)]
-    assert tuple(near_state[2:4]) == resource
-    far_state = tactic._explore_state.get(str(WORKER_ID), [])
-    assert len(far_state) < 4 or tuple(far_state[2:4]) != resource
+    assert tactic._worker_resource_assignments(turn) == {str(WORKER2_ID): resource}
+    assert _action(turn.plan, WORKER2_ID).direction == Direction.RIGHT
 
 
 def test_nearest_worker_takes_over_stale_far_lock() -> None:
@@ -303,9 +509,8 @@ def test_nearest_worker_takes_over_stale_far_lock() -> None:
     tactic._explore_state[str(WORKER_ID)] = [0, 0, *resource]
     turn = _turn(state)
     decide(turn)
-    assert tuple(tactic._explore_state[str(WORKER2_ID)][2:4]) == resource
-    far_state = tactic._explore_state.get(str(WORKER_ID), [])
-    assert len(far_state) < 4 or tuple(far_state[2:4]) != resource
+    assert tactic._worker_resource_assignments(turn) == {str(WORKER2_ID): resource}
+    assert _action(turn.plan, WORKER2_ID).direction == Direction.RIGHT
 
 
 def test_worker_with_cargo_home_deposits() -> None:
@@ -840,6 +1045,109 @@ def test_vanguard_steps_off_core_cell_to_unblock_deposit() -> None:
     ddx, ddy = vaction.direction.delta
     # Its destination must not be the laden Worker's cell (would re-block it).
     assert (ddx, ddy) != (0, 1)
+
+
+def test_vanguard_guard_targets_keep_delivery_lanes_open() -> None:
+    second_vanguard = UUID(int=0x7001)
+    state = _state(
+        population=2,
+        objects=[
+            {
+                "kind": "CORE",
+                "id": str(CORE_ID),
+                "controlled": True,
+                "owner_username": "arena_hero",
+                "position": [0, 0],
+                "hp": 5,
+                "shield": 5,
+                "state": "NORMAL",
+            },
+            {
+                "kind": "UNIT",
+                "id": str(VANGUARD_ID),
+                "controlled": True,
+                "position": [0, 1],
+                "hp": 4,
+                "unit_type": "VANGUARD",
+            },
+            {
+                "kind": "UNIT",
+                "id": str(second_vanguard),
+                "controlled": True,
+                "position": [0, 1],
+                "hp": 4,
+                "unit_type": "VANGUARD",
+            },
+        ],
+    )
+    turn = _turn(state)
+
+    targets = tactic._vanguard_guard_targets(turn, (0, 0))
+
+    assert len(set(targets.values())) == 2
+    assert sum(tactic._manhattan(target, (0, 0)) == 1 for target in targets.values()) == 1
+    assert sum(tactic._manhattan(target, (0, 0)) == 2 for target in targets.values()) == 1
+
+
+def test_stacked_vanguards_split_instead_of_blocking_one_entrance() -> None:
+    second_vanguard = UUID(int=0x7001)
+    state = _state(
+        population=2,
+        objects=[
+            {
+                "kind": "CORE",
+                "id": str(CORE_ID),
+                "controlled": True,
+                "owner_username": "arena_hero",
+                "position": [0, 0],
+                "hp": 5,
+                "shield": 5,
+                "state": "NORMAL",
+            },
+            {
+                "kind": "UNIT",
+                "id": str(VANGUARD_ID),
+                "controlled": True,
+                "position": [0, 1],
+                "hp": 4,
+                "unit_type": "VANGUARD",
+            },
+            {
+                "kind": "UNIT",
+                "id": str(second_vanguard),
+                "controlled": True,
+                "position": [0, 1],
+                "hp": 4,
+                "unit_type": "VANGUARD",
+            },
+        ],
+    )
+    turn = _turn(state)
+    decide(turn)
+
+    actions = [
+        _action(turn.plan, VANGUARD_ID),
+        _action(turn.plan, second_vanguard),
+    ]
+    moves = [action for action in actions if action is not None and action.type == "MOVE"]
+    assert len(moves) == 1
+    destination = (
+        moves[0].direction.delta[0],
+        1 + moves[0].direction.delta[1],
+    )
+    assert tactic._manhattan(destination, (0, 0)) == 2
+
+
+def test_friendly_full_invalidates_stable_frontier_target() -> None:
+    worker_id = str(UUID(int=0x6000))
+    tactic._explored_cells.update({(0, 0), (1, 0), (0, 1), (0, -1), (-1, 0)})
+    tactic._explore_targets[worker_id] = (2, 0)
+
+    targets = tactic._assign_explore_targets(
+        [(worker_id, (0, 0))], (0, 0), frozenset({(2, 0)})
+    )
+
+    assert targets[worker_id] != (2, 0)
 
 
 # ---------------------------------------------------------------------------
