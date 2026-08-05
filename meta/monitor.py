@@ -217,7 +217,9 @@ def detect_bottlenecks(kpi: KPI) -> list[str]:
     if kpi.enemy_core_destroyed == 0 and kpi.ticks_with_enemy_visible > 0:
         alerts.append(
             f"NO_RAID: enemies were visible for {kpi.ticks_with_enemy_visible} ticks "
-            f"but 0 enemy Cores destroyed — missed +6 resource opportunity"
+            f"but 0 enemy Cores destroyed — a raid was available but not taken "
+            f"(note: enemy-core loot is variable via CORE_RESOURCES_CAPTURED, not a "
+            f"flat +6; see LESSONS L10)"
         )
     if kpi.resource_drops > 0:
         alerts.append(
@@ -280,13 +282,62 @@ def report(kpi: KPI, alerts: list[str]) -> str:
     return "\n".join(lines)
 
 
+def _watch_loop(path: str | Path, interval: int, as_json: bool) -> None:
+    """Continuously re-analyze ``path`` every ``interval`` seconds (real-time monitor).
+
+    Prints a compact live status line every cycle and only re-prints the bottleneck
+    block when the set of active bottlenecks CHANGES, so a long-running session stays
+    readable instead of spamming the same alerts. This is the standing real-time
+    watch (user requirement #5) — run it as a nohup background daemon.
+    """
+    import time
+
+    prev: tuple[str, ...] = ()
+    print(f"[monitor] watching {path} every {interval}s (ctrl-c to stop)", flush=True)
+    while True:
+        kpi = analyze(path)
+        alerts = tuple(detect_bottlenecks(kpi))
+        status = (
+            f"t{kpi.end_tick} r{kpi.resources_last}/{kpi.capacity_last} "
+            f"pop{kpi.pop_last}(W{kpi.workers_last} V{kpi.vanguards_last} "
+            f"R{kpi.rangers_last}) hp{kpi.core_hp_last}/"
+            f"sh{kpi.core_shield_last} harv{kpi.harvest} dep{kpi.deposit} "
+            f"evis{kpi.ticks_with_enemy_visible} "
+            f"{'ALERTS(' + str(len(alerts)) + ')' if alerts else 'ok'}"
+        )
+        print(status, flush=True)
+        if alerts != prev:
+            print("--- BOTTLENECKS (changed) ---", flush=True)
+            for a in alerts:
+                print(f"  ! {a}", flush=True)
+            prev = alerts
+        time.sleep(interval)
+
+
 def main(argv: list[str]) -> int:
-    as_json = "--json" in argv
-    path = LOG_PATH
-    for a in argv:
-        if a != "--json" and not a.startswith("-"):
-            path = Path(a)
-            break
+    as_json = False
+    loop = 0
+    args: list[str] = []
+    i = 1
+    while i < len(argv):
+        a = argv[i]
+        if a == "--json":
+            as_json = True
+        elif a == "--loop" or a.startswith("--loop"):
+            # Accept both "--loop 30" and "--loop=30".
+            if "=" in a:
+                loop = int(a.split("=", 1)[1])
+            elif i + 1 < len(argv):
+                loop = int(argv[i + 1])
+                i += 1
+        elif not a.startswith("-"):
+            # Positional log path (argv[0] = script name is skipped above).
+            args.append(a)
+        i += 1
+    path = Path(args[0]) if args else LOG_PATH
+    if loop > 0:
+        _watch_loop(path, loop, as_json)
+        return 0
     kpi = analyze(path)
     alerts = detect_bottlenecks(kpi)
     if as_json:

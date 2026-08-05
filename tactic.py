@@ -1045,7 +1045,22 @@ def _control_workers(turn: "Turn", core_pos: tuple[int, int]) -> None:
     # all converging on the single nearest node (observed: workers clustered on
     # the south resource while north nodes (13,214)/(16,211) went uncollected).
     claims: dict[tuple[int, int], int] = {}
-    for index, worker in enumerate(turn.workers):
+    # L12: sort Workers by distance to their nearest KNOWN resource so that
+    # closer Workers are processed first and claim nearby nodes ahead of far
+    # competitors — prevents first-come-first-served where an early, distant
+    # Worker (idx 0 at -6,0) locks a node at a near Worker's feet (idx 1 at 5,0
+    # for resource at 6,0).  orig_index is preserved for column/direction parity
+    # (_explore_step / _begin_outbound) so a Worker's sweep band stays stable.
+    _known_snap = frozenset(_known_resources)
+    _sorted_workers: list[tuple[int, object]] = sorted(
+        enumerate(turn.workers),
+        key=lambda x: (
+            min(_manhattan(x[1].position, r) for r in _known_snap)
+            if _known_snap
+            else float('inf')
+        ),
+    )
+    for _srt_pos, (orig_index, worker) in enumerate(_sorted_workers):
         pos = worker.position
         wid = str(worker.id)
         # An EMPTY Worker standing on a visible resource cell harvests
@@ -1080,7 +1095,7 @@ def _control_workers(turn: "Turn", core_pos: tuple[int, int]) -> None:
             col_off = st[0] if st is not None and len(st) >= 1 else 0
             # Keep the half-zone direction on escape (even -> north, odd ->
             # south), otherwise a boxed escape re-sends even workers south.
-            _explore_state[wid] = [col_off + _SWEEP_COL_STEP, 1 if index % 2 == 1 else 0, None, None]
+            _explore_state[wid] = [col_off + _SWEEP_COL_STEP, 1 if orig_index % 2 == 1 else 0, None, None]
             _pos_history.pop(wid, None)
             _prev_pos.pop(wid, None)
             _last_pos.pop(wid, None)
@@ -1135,7 +1150,7 @@ def _control_workers(turn: "Turn", core_pos: tuple[int, int]) -> None:
                         continue
                 worker.deposit()
                 # Deposited: resume the assigned scan row, clearing any lock.
-                _begin_outbound(wid, index, pos, core_pos)
+                _begin_outbound(wid, orig_index, pos, core_pos)
                 _prev_pos[wid] = pos
                 _pos_history.pop(wid, None)  # fresh start after deposit
             else:
@@ -1147,7 +1162,7 @@ def _control_workers(turn: "Turn", core_pos: tuple[int, int]) -> None:
                     # review rank 1). This preserves discovery during the
                     # saturation window.
                     step = _explore_step(
-                        index, wid, pos, core_pos, blocked,
+                        orig_index, wid, pos, core_pos, blocked,
                         target_col=chemotaxis_col, avoid=_avoid_set(wid),
                         fleet_size=len(turn.workers),
                     )
@@ -1239,8 +1254,8 @@ def _control_workers(turn: "Turn", core_pos: tuple[int, int]) -> None:
         # resource (and it's still economically reachable), keep it — another
         # worker must not yank a mid-walk target (community Player C's pacing
         # anti-pattern: "a far worker steals the node at a near worker's feet").
-        if lock is not None and lock in known and _manhattan(core_pos, lock) <= MAX_HARVEST_FROM_CORE:
-            claims[lock] = index + 1
+        if lock is not None and lock in known and _manhattan(core_pos, lock) <= _harvest_radius(turn):
+            claims[lock] = orig_index + 1
         else:
             # Sort KNOWN resources by distance to this worker. Pick the nearest
             # one that has NOT already been claimed by another empty worker —
@@ -1276,7 +1291,7 @@ def _control_workers(turn: "Turn", core_pos: tuple[int, int]) -> None:
                         continue
                     if _manhattan(pos, nearest) <= lock_dist:
                         lock = nearest
-                        claims[lock] = index + 1
+                        claims[lock] = orig_index + 1
                         break
         # If we have a lock, keep moving toward it; abandon it only once the
         # Worker is on the cell but it is not a resource (harvested or gone).
@@ -1341,7 +1356,7 @@ def _control_workers(turn: "Turn", core_pos: tuple[int, int]) -> None:
         # boustrophedon. Pass the fleet size and Worker index so columns are
         # distributed evenly across the full chunk width.
         step = _explore_step(
-            index, wid, pos, core_pos, blocked_empty,
+            orig_index, wid, pos, core_pos, blocked_empty,
             target_col=chemotaxis_col, avoid=_avoid_set(wid),
             fleet_size=len(turn.workers),
         )
@@ -2189,15 +2204,31 @@ def _clear_exploration_state() -> None:
 def _harvest_radius(turn: "Turn") -> int:
     """Effective Core-to-resource harvest radius for this Turn.
 
-    Healthy economy: ``MAX_HARVEST_FROM_CORE`` (30) — distant nodes are a net
-    loss. Starved economy (no harvest for ``STARVE_TICKS`` ticks, or no known
-    resources at all): widen to ``MAX_HARVEST_FROM_CORE_STARVED`` (55) so the
-    Core keeps earning instead of idling at r0 (expert review L2).
+    Healthy economy: ``MAX_HARVEST_FROM_CORE`` (40) — distant nodes are a net
+    loss. Starved economy (no harvest for ``STARVE_TICKS`` ticks, no known
+    resources at all, OR every known resource already beyond the non-starved
+    radius): widen to ``MAX_HARVEST_FROM_CORE_STARVED`` (65) so the fleet
+    keeps earning instead of idling at r0 while visible resources sit at
+    40 < d <= 65 (L12 — occasional harvests from sweep collisions kept
+    _last_harvest_tick fresh, preventing starved mode, but all lockable
+    resources were beyond the non-starved gate).
     """
     if not _known_resources:
         return MAX_HARVEST_FROM_CORE_STARVED
     if turn.tick - _last_harvest_tick > STARVE_TICKS:
         return MAX_HARVEST_FROM_CORE_STARVED
+    # L12: if every known resource is beyond the non-starved radius, treat
+    # the economy as effectively starved — workers idly sweep while the only
+    # nodes they could lock sit at 43-48 cells and get filtered by the
+    # core-distance gate below. The starved radius lets the lock-claim loop
+    # (L1253-1280) actually commit to them instead of skipping.
+    core = turn.core
+    if core is not None:
+        if not any(
+            _manhattan(core.position, r) <= MAX_HARVEST_FROM_CORE
+            for r in _known_resources
+        ):
+            return MAX_HARVEST_FROM_CORE_STARVED
     return MAX_HARVEST_FROM_CORE
 
 

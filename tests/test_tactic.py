@@ -217,6 +217,53 @@ def test_worker_on_resource_harvests() -> None:
     assert _action(turn.plan, WORKER_ID).type == "HARVEST"
 
 
+def test_nearest_worker_claims_resource_independent_of_unit_order() -> None:
+    """A far, earlier Worker must not steal a node from a nearby Worker."""
+    resource = (6, 0)
+    state = _state(
+        population=2,
+        objects=[
+            {
+                "kind": "CORE",
+                "id": str(CORE_ID),
+                "controlled": True,
+                "owner_username": "arena_hero",
+                "position": [0, 0],
+                "hp": 5,
+                "shield": 5,
+                "state": "NORMAL",
+            },
+            {
+                "kind": "UNIT",
+                "id": str(WORKER_ID),
+                "controlled": True,
+                "position": [-6, 0],
+                "hp": 2,
+                "unit_type": "WORKER",
+                "cargo": 0,
+            },
+            {
+                "kind": "UNIT",
+                "id": str(WORKER2_ID),
+                "controlled": True,
+                "position": [5, 0],
+                "hp": 2,
+                "unit_type": "WORKER",
+                "cargo": 0,
+            },
+            {"kind": "RESOURCE", "positions": [list(resource)]},
+        ],
+    )
+
+    turn = _turn(state)
+    decide(turn)
+
+    near_state = tactic._explore_state[str(WORKER2_ID)]
+    assert tuple(near_state[2:4]) == resource
+    far_state = tactic._explore_state.get(str(WORKER_ID), [])
+    assert len(far_state) < 4 or tuple(far_state[2:4]) != resource
+
+
 def test_worker_with_cargo_home_deposits() -> None:
     state = _state(
         resources=5,
