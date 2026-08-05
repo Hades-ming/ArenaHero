@@ -1236,6 +1236,55 @@ def test_worker_picks_up_ground_beacon_on_same_cell() -> None:
     assert _action(turn.plan, WORKER_ID).type == "PICKUP_BEACON"
 
 
+def test_core_repairs_before_picking_up_ground_beacon_under_threat() -> None:
+    state = _state(
+        resources=5,
+        population=1,
+        beacon_pos=(0, 0),
+        beacon_status="GROUND",
+        objects=[
+            {
+                "kind": "CORE",
+                "id": str(CORE_ID),
+                "controlled": True,
+                "owner_username": "arena_hero",
+                "position": [0, 0],
+                "hp": 5,
+                "shield": 4,
+                "state": "NORMAL",
+            },
+            {
+                "kind": "UNIT",
+                "id": str(WORKER_ID),
+                "controlled": True,
+                "position": [2, 0],
+                "hp": 2,
+                "unit_type": "WORKER",
+                "cargo": 0,
+            },
+            {
+                "kind": "UNIT",
+                "id": str(ENEMY_UNIT_ID),
+                "controlled": False,
+                "position": [0, 3],
+                "hp": 2,
+                "unit_type": "RANGER",
+                "cargo": None,
+            },
+        ],
+    )
+    turn = _turn(state)
+    decide(turn)
+    assert _core_action(turn.plan).type == "REPAIR_SHIELD"
+
+
+def test_revisited_empty_enemy_core_position_is_forgotten() -> None:
+    tactic._known_enemy_cores.add((2, 0))
+    turn = _turn(_state())
+    tactic._observe_enemies(turn)
+    assert (2, 0) not in tactic._known_enemy_cores
+
+
 def test_obstacle_shadow_is_not_recorded_as_explored() -> None:
     state = _state(
         objects=[

@@ -121,9 +121,10 @@
 - **安全重启命令**（括号技巧 `[p]lay\.py` 避免 pkill 误杀自身；`nohup ... & disown` 完全脱离）：
   `cd /Users/hx/myself/ArenaHero && pkill -f "[p]lay\.py"; sleep 2; nohup .venv/bin/python3 play.py > play.out 2>&1 < /dev/null & disown`
   验证：`game.log` 的 tick 继续推进、且 `play.out` 无 error。
-- **已自动化**：`arena-hero-sdk-check`（每日 09:00）与 `arena-hero-iterate`（每 6h）的 prompt 均加入
-  "改完 tactic.py 后自动重启 play.py"步骤；并暂停了旧的重复项 `arena-hero-sdk-check-2`。
-- **状态**：✅ 当前 play.py 已按此命令重启（PID 72026）并重新接管对局。
+- **当前运行方式**：`launchctl` 用户服务 `io.arenahero.tactic` 托管 `play.py`；改动后用
+  `launchctl kickstart -k gui/$(id -u)/io.arenahero.tactic` 重启，并验证唯一 PID 与连续新 Tick。
+- **自动化边界**：当前 Codex 定时复审自动化尚未成功创建，不能把文档中的历史名称当作现状；
+  SDK/规则核验由每轮审查显式执行，直到自动化有可验证 ID/配置为止。
 
 ## L12 — 全量复审：规则真相必须压过历史启发式
 - **对角火力漏判**：v0.13 Ranger 支持横、竖和 45 度对角线 1-3 格射击。旧实现先按

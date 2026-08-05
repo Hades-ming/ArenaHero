@@ -1764,12 +1764,6 @@ def _control_core(
         return
 
     resources = turn.resources
-    if (
-        turn.beacon.status == BeaconStatus.GROUND
-        and turn.beacon.position == core.position
-    ):
-        core.pickup_beacon()
-        return
     # Repair shield first when under threat and there is space and a spare
     # resource. Holding the Beacon raises the cap to 10, so use the live cap.
     if threats and resources >= 1:
@@ -1783,6 +1777,12 @@ def _control_core(
         if core.shield < cap:
             core.repair_shield()
             return
+    if (
+        turn.beacon.status == BeaconStatus.GROUND
+        and turn.beacon.position == core.position
+    ):
+        core.pickup_beacon()
+        return
 
     # Spawn Workers toward the target fleet so the economy grows and explores
     # faster, staying in the free-upkeep band (population < 20). Only spawn
@@ -2064,6 +2064,16 @@ def _observe_enemies(turn: "Turn") -> None:
     never driven off. Remembering positions lets Rangers chase briefly.
     """
     tick = turn.tick
+    visible_core_positions = {
+        tuple(e.position) for e in turn.visible_enemies if e.kind == "CORE"
+    }
+    sources = _vision_sources(turn)
+    for position in list(_known_enemy_cores):
+        if (
+            position not in visible_core_positions
+            and _any_vision_sees(position, sources, turn.obstacle_cells)
+        ):
+            _known_enemy_cores.discard(position)
     for e in turn.visible_enemies:
         _last_enemy_pos[str(e.id)] = (tuple(e.position), tick)
         # Persist enemy Cores permanently (a Core is a durable hunt target).
