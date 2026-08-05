@@ -22,9 +22,14 @@ resource throughput and net stockpile, not idle hoarding):
 * **Build attack units in time (vs. other enemies)** — when enemies are visible,
   the army is raised immediately (even below the economy floor) so a raid meets
   return fire and the economy is not raided.
-* **Raid enemy Cores for +6** — a visible enemy Core is a resource jackpot
-  (+6 on destroy, shipped home). When one is in vision the tactic forms a strike
-  force to capture it instead of passively defending.
+* **Raid enemy Cores for loot + elimination** — destroying a visible enemy
+  Core removes their whole fleet and captures part of their stockpiled
+  resources. The bounty is NOT a flat +6: per the ``CORE_RESOURCES_CAPTURED``
+  event you gain ``amount`` of the enemy Core's stored ``available`` resources
+  while ``destroyed`` (``available - amount``) is lost, and your own capacity can
+  destroy the overflow. So a raided Core may yield zero if it spent everything.
+  When one is in vision the tactic forms a strike force to capture it instead
+  of passively defending.
 * **Avoid idle gold** — resources on hand earn nothing; the reserve/wall logic
   spends surplus into economy, defense, or army so capital is always working.
 
@@ -933,8 +938,10 @@ def _select_ranger_target(
     """Choose a visible enemy the Ranger can legally shoot this Tick.
 
     Rules: shared cardinal line, Manhattan distance 1-3, no obstacle strictly
-    between. Enemy Cores are prioritized (Core destruction removes a fleet and
-    pays +6). Among Units, prefer a one-shot-killable (hp==1) and a FLEEING
+    between. Enemy Cores are prioritized: destroying one removes the enemy fleet
+    and can capture its stockpiled resources (variable loot, not a flat +6; see
+    ``CORE_RESOURCES_CAPTURED``). Among Units, prefer a one-shot-killable (hp==1)
+    and a FLEEING
     target (farther from the Core than its last-known position) so driven-off
     raiders are finished, not let to escape (8th review, rank 3).
     """
@@ -1829,9 +1836,12 @@ def _control_core(
         target_vanguards, target_rangers = _standing_army_targets(
             len(turn.workers)
         )
-    # FINAL GOAL: a visible enemy Core is a +6 resource jackpot — form a strike
-    # force (extra Vanguards to tank + Rangers to snipe the Core) to capture it
-    # rather than only defending. This directly grows the resource economy.
+    # FINAL GOAL: a visible enemy Core is a strike target — destroying it
+    # removes the enemy fleet and may capture its stockpiled resources. The loot
+    # is variable (per CORE_RESOURCES_CAPTURED, not a flat +6), so the raid's real
+    # value is elimination + uncertain loot, not a guaranteed resource windfall.
+    # Form a strike force (extra Vanguards to tank + Rangers to snipe the Core)
+    # to raid it instead of only defending.
     if enemy_core_visible:
         target_vanguards = max(target_vanguards, DEFENSE_VANGUARDS + 2)
         target_rangers = max(target_rangers, DEFENSE_RANGERS + 2)
@@ -2075,7 +2085,8 @@ def _chase_target(
     """Pick an enemy cell for a non-guard Ranger to drive off or hunt, or None.
 
     Priority: (1) a VISIBLE enemy Core within HUNT range (when resources allow
-    rebuilding) — destroying it pays +6 and removes a fleet; (2) any enemy
+    rebuilding) — destroying it removes the enemy fleet and may capture its
+    stockpiled resources (variable loot, not a flat +6); (2) any enemy
     within CHASE_RADIUS of the Core (drive off inbound raiders); (3) a
     recently-seen enemy within the radius. Bounded: gives up after
     CHASE_MAX_TICKS, then cools down before chasing again.
@@ -2217,8 +2228,9 @@ def decide(turn: "Turn") -> None:
 
     core_pos = core.position
     threats = _threats_to_core(core_pos, turn.visible_enemies)
-    # FINAL GOAL signal: a visible enemy Core is a +6 resource jackpot. Mark it so
-    # the Core controller forms a strike force (extra Vanguards/Rangers) to raid
+    # FINAL GOAL signal: a visible enemy Core is a strike target (elimination +
+    # uncertain loot via CORE_RESOURCES_CAPTURED, not a flat +6). Mark it so the
+    # Core controller forms a strike force (extra Vanguards/Rangers) to raid
     # it instead of only defending. Any visible enemy triggers prompt attacker
     # production (req: build attack units in time vs. other enemies).
     #

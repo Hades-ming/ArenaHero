@@ -107,6 +107,7 @@ def _summarize_events(events) -> str:
             "DEPOSIT_SUCCEEDED",
             "WORKER_CARGO_DROPPED",
             "CORE_RESOURCE_OVERFLOW_DESTROYED",
+            "CORE_RESOURCES_CAPTURED",
         } and e.resource_amount is not None:
             tag += f"[{e.resource_amount}]"
         if e.event_type == "HARVEST_SUCCEEDED" and e.harvest_source is HarvestSource.DROPPED_CARGO:

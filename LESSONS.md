@@ -93,3 +93,35 @@
 - **遗留**：SDK 的 `Turn` 无 `game_id`，无法区分"同局崩溃恢复"与"开新局"——目前持久化对崩溃恢复
   有利、但开新局可能带入上局地图。需 SDK 暴露局标识才能根治（已记入待查清单）。
 - **状态**：✅ 探索已真正消费持久化地图；40 测试通过。
+
+## L10 — 击毁敌核 ≠ 固定 +6（CORE_RESOURCES_CAPTURED 真实机制）
+- **现象（用户纠正）**："击毁敌方 core 不一定获取 +6 资源"。
+- **真相（查 SDK `arena_hero/models.py` 的 `CoreResourceCapture` 类型）**：
+  击毁敌核触发 `CORE_RESOURCES_CAPTURED` 事件，携带 4 个字段且约束 `amount + destroyed == available`：
+  - `available`：敌核被摧毁时的库存资源（**变量**，取决于对方攒了多少、是否花光）
+  - `amount`：**你实际获得**的资源（= available 中未被销毁的部分）
+  - `destroyed`：被销毁/溢出的资源（available - amount）
+  - `capacity`：敌核容量上限
+  即回报 = 敌核当时**库存中未被销毁的那部分**，**不是固定 +6**；且受我方核容量约束
+  （超出我方容量的溢出会被销毁）。若敌方把资源全花在生产上（库存≈0），击毁它**几乎得不到资源**。
+  （实时游戏规则已到 v0.13，含 "combat Core-loot winner selection / capacity overflow destruction"；
+  本项目打包文档是 v0.7，且 v0.7 旧规则写的是"库存资源全部丢失"——旧文档已过时，以 SDK 模型为准。）
+- **已改（tactic.py）**：删除 5 处"+6 resource jackpot / pays +6 / shipped home"的错误假设，
+  改为准确描述 `CORE_RESOURCES_CAPTURED`（变量回报 + 战略价值=清场+不确定战利品）。
+  突袭敌核的**战略价值仍在**（消灭对方舰队、削弱竞争者），但不再被当成"稳赚 +6 的资源经济"来过度加权。
+  `play.py` 日志现在也会打印真实 `CORE_RESOURCES_CAPTURED[amount]`，便于验证真实数额。
+- **后续可优化（未做，避免范围蔓延）**：`_known_enemy_cores` 一旦见过就永久保留，
+  会导致"记得的敌核"持续触发额外突击编队——在回报不确定的情况下可能浪费产能。
+  可改为仅在**当前可见**敌核时才超编。留待后续评审。
+- **状态**：✅ 错误假设已修正并记入；40 测试通过。
+
+## L11 — 更新 tactic.py 后必须重启 play.py（无热加载）
+- **纪律（用户要求）**：程序（tactic.py）更新后**及时重启 play.py 进程**，否则改动不生效。
+- **原因**：`play.py` 是长驻进程、不热加载（L8）。本地持久化地图 `tactic_state.json` 会在
+  重启后自动重载，故重启安全、状态连续；服务器侧也保留对局状态，重连即可续上。
+- **安全重启命令**（括号技巧 `[p]lay\.py` 避免 pkill 误杀自身；`nohup ... & disown` 完全脱离）：
+  `cd /Users/hx/myself/ArenaHero && pkill -f "[p]lay\.py"; sleep 2; nohup .venv/bin/python3 play.py > play.out 2>&1 < /dev/null & disown`
+  验证：`game.log` 的 tick 继续推进、且 `play.out` 无 error。
+- **已自动化**：`arena-hero-sdk-check`（每日 09:00）与 `arena-hero-iterate`（每 6h）的 prompt 均加入
+  "改完 tactic.py 后自动重启 play.py"步骤；并暂停了旧的重复项 `arena-hero-sdk-check-2`。
+- **状态**：✅ 当前 play.py 已按此命令重启（PID 72026）并重新接管对局。
