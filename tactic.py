@@ -743,15 +743,17 @@ def _worker_resource_assignments(
     ):
         core_pos = turn.core.position if turn.core is not None else (0, 0)
         visible_targets = visible_resources & set(resources)
+        priority_targets = visible_targets or set(resources)
 
         def explorer_score(worker: "Worker") -> tuple[int, int, str]:
-            # 先保留离当前可见资源最远的 Worker，避免把最近采集者误留在探索线。
-            visible_distance = min(
-                (_manhattan(worker.position, resource) for resource in visible_targets),
+            # 有可见资源时保护其最近采集者；只有历史提示时，则保护离历史
+            # 资源最近的 Worker，避免把已经走到节点旁的采集者派去探索。
+            resource_distance = min(
+                (_manhattan(worker.position, resource) for resource in priority_targets),
                 default=0,
             )
             return (
-                visible_distance,
+                resource_distance,
                 _manhattan(worker.position, core_pos),
                 str(worker.id),
             )

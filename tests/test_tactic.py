@@ -261,6 +261,21 @@ def test_history_dispatch_reserves_a_worker_for_exploration() -> None:
     assert tactic._resource_telemetry["explore_reserved"] == 1
 
 
+def test_history_dispatch_keeps_nearest_worker_on_known_resource() -> None:
+    # With no visible node, the far-away Worker should explore while the Worker
+    # already beside the historical hint continues the resource attempt.  The
+    # old Core-distance tie-breaker reserved the near Worker instead.
+    cell = (30, 0)
+    near_id = str(UUID(int=0x6000))
+    tactic._known_resources.add(cell)
+    tactic._resource_hints[cell] = tactic.ResourceHint(19, "history")
+    turn = _turn(_workers_state([(29, 0), (0, 1)]), tick=20)
+
+    assignments = tactic._worker_resource_assignments(turn)
+
+    assert assignments == {near_id: cell}
+
+
 def test_history_dispatch_keeps_exploration_slot_when_visible_resource_exists() -> None:
     """历史提示不能占满 Worker，当前可见资源仍必须优先。"""
     visible = (10, 0)
