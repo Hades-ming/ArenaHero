@@ -269,6 +269,15 @@ def test_very_old_history_hint_is_not_an_active_resource_target() -> None:
     assert tactic._resource_telemetry["stale"] == 1
 
 
+def test_control_workers_reports_exploration_reservation_without_resources() -> None:
+    turn = _turn(_workers_state([(0, 1), (0, 2), (0, 3)]), tick=20)
+
+    tactic._control_workers(turn, turn.core.position)
+
+    assert tactic._resource_telemetry["explore_reserved"] == 1
+    assert len(turn.plan.unit_actions) == 3
+
+
 def test_visible_resource_priority_over_nearer_history_hint() -> None:
     remembered = (1, 0)
     visible = (10, 0)

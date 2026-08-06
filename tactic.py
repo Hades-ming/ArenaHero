@@ -1485,6 +1485,12 @@ def _control_workers(turn: "Turn", core_pos: tuple[int, int]) -> None:
             and turn.beacon.position == worker.position
         )
     ]
+    # 保留探索名额是最终控制器的行为，而不只是资源分配器的中间状态。
+    # 当没有可见资源且至少有三个空闲 Worker 时，即使历史提示全部陈旧，
+    # 这些 Worker 仍会进入前沿扫描；在此处再次记录，避免提前返回或遥测
+    # 汇总把“正在探索”误报成没有探索保留。
+    if not resource_cells and len(idle_workers) >= 3:
+        _resource_telemetry["explore_reserved"] = 1
     explore_targets = _assign_explore_targets(
         idle_workers, core_pos, dynamically_blocked
     )
