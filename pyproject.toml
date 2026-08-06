@@ -1,10 +1,10 @@
 [project]
 name = "arena-hero-tactic"
 version = "0.1.0"
-description = "Balanced tactic for Arena Hero v0.13"
+description = "Balanced tactic for Arena Hero v0.14"
 requires-python = ">=3.11"
 dependencies = [
-    "arena-hero>=0.2.8,<0.3",
+    "arena-hero>=0.2.9,<0.3",
 ]
 
 [dependency-groups]

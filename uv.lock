@@ -26,16 +26,16 @@ wheels = [
 
 [[package]]
 name = "arena-hero"
-version = "0.2.8"
+version = "0.2.9"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "httpx" },
     { name = "pydantic" },
     { name = "websockets" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/f2/3c/f646b326155d1f7a23de7054ee8804de72d915f8702bf2329fa1b06af37a/arena_hero-0.2.8.tar.gz", hash = "sha256:f3c08411c2b5554492dc1b4d91e69a63014a9a0d900e2758a498f9e8b3fc547e", size = 86813, upload-time = "2026-08-03T13:34:45.204Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/32/dc/d6a83d22e6df55eb09bd205af0aa3fd0508bd92eb0df619f8f75779818eb/arena_hero-0.2.9.tar.gz", hash = "sha256:620c5fbd5a7dd1d5c32c145ee8f3f184538d0a7c08ee69e7eda34459916db8d1", size = 87076, upload-time = "2026-08-06T09:54:55.964Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/58/23/3210d58c14197ce7f74802e9ac25d3f4bc2ee74660569e08395f925fa51d/arena_hero-0.2.8-py3-none-any.whl", hash = "sha256:abfff2090886b9ad8bd8c37b04150a7d21559f4a792434948250de76162ee008", size = 28864, upload-time = "2026-08-03T13:34:43.981Z" },
+    { url = "https://files.pythonhosted.org/packages/68/20/8e7a20b23be76526c840d0aea4ac62e4402a48dbd707f38106635789cb99/arena_hero-0.2.9-py3-none-any.whl", hash = "sha256:822e4de0999e8f26e8c8beb910c786513fcc5be6e426175d9b5e2e3e32b899d9", size = 29177, upload-time = "2026-08-06T09:54:54.596Z" },
 ]
 
 [[package]]
@@ -52,7 +52,7 @@ dev = [
 ]
 
 [package.metadata]
-requires-dist = [{ name = "arena-hero", specifier = ">=0.2.8,<0.3" }]
+requires-dist = [{ name = "arena-hero", specifier = ">=0.2.9,<0.3" }]
 
 [package.metadata.requires-dev]
 dev = [{ name = "pytest", specifier = ">=8.4.2" }]

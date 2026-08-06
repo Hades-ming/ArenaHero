@@ -7,8 +7,8 @@
 | 字段 | 当前值 |
 |---|---|
 | 轮次 | `2026-08-06-R1` |
-| 基线提交 | `df14f9ac85cb0dfcdd12df3833410e1f7909cbc2` |
-| 规则 / SDK | gameplay `v0.13` / Python SDK `0.2.8` |
+| 基线提交 | `fd8506fa6ae26b4dc9ce7873985e152756abb21b` |
+| 规则 / SDK | gameplay `v0.14` / Python SDK `0.2.9` |
 | 官方版本复核 | 2026-08-06，官方 source/version 与本地 bundle 一致 |
 | 最终目标 | 长期得到最多资源 |
 | 主代理 | 当前 Codex 主任务 |
@@ -163,8 +163,8 @@
 
 - `PERF-001`：只对 Worker 的前 K 个 Manhattan 候选计算/缓存 A*，再用
   `confidence * yield / (outbound + harvest + return + deposit_wait)` 排序。
-- 人口 20+：除非边际 Worker 的实测增量入核率覆盖 upkeep=1/Tick、生产成本和防御风险，
-  否则保持人口 19 以下。
+- 人口 20+：没有自动 upkeep；生产价格按人口阶梯上涨。仍以人口 19 作为保守软上限，直到
+  边际 Worker 的实测增量入核率覆盖动态生产成本和防御风险。
 - Core 满仓缓冲队列：先取得“距 Core 两格到入核”的 P50/P95，再决定是否实现。
 
 ## `RESOURCE-DISPATCH-002` 可见资源机会成本修复
@@ -182,12 +182,12 @@
 - **回滚**：连续两个 100-Tick 窗口入核率下降 10%、采集到入核 P95 上升 25%、资源失败率
   上升 5 个百分点，或出现 Core/窗口/协议故障，恢复上一提交。
 
-### 当前验收阻断（2026-08-06）
+### 当前验收阻断（2026-08-06，协议阻断已解除）
 
-- 单连接原始 WebSocket 的 `state` 消息缺少 SDK 0.2.8 必填字段
-  `population_tier`、`upkeep_next_tick`，官方客户端因此抛出 `ProtocolError`。
-- 已停止 LaunchAgent，未将协议错误 Tick 纳入 canary；等待服务端/公开 schema/SDK 对齐后，
-  从新窗口重新执行 20 Tick canary。当前提交只完成静态调度修复，不宣称 live 收益已验证。
+- 原阻断是服务端已切换 v0.14 状态，而本地仍使用 SDK 0.2.8；`population_tier`、`upkeep_next_tick`
+  已从新契约删除，旧客户端因此抛出 `ProtocolError`。
+- 已同步官方 skill `a63222e` 与 SDK 0.2.9，严格模型字段和动态价格 helper 对齐。LaunchAgent
+  仍保持停止，待新 SDK 下完成原始握手和 20 Tick canary；静态对齐不等于 live 收益已验证。
 
 ## 本轮完成定义
 

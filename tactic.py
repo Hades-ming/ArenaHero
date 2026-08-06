@@ -15,7 +15,7 @@ resource throughput and net stockpile, not idle hoarding):
   exploration when none are visible) and haul them home. Discovery is the #1
   lever on income; standing still earns nothing.
 * **Deposit & reinvest** — carried cargo is deposited on the Core cell; the Core
-  spends into more Workers (free-upkeep fleet) so income compounds.
+  spends into more Workers so income compounds, while respecting v0.14 pricing.
 * **Protect the economy** — losing the Core forfeits ALL stored resources, and
   losing Units forfeits their cargo. Defense (shield repair, a standing army,
   a Wall) is therefore an *investment in the goal*, never waste.
@@ -44,7 +44,7 @@ Policy:
 * Rangers shoot visible legal targets (enemy Core prioritized), else explore/kite;
 * Vanguards sweep the adjacent cell with the most enemies, else hold near Core;
 * repair Core shield only when under visible threat;
-* spawn Workers toward a soft target while upkeep stays free (population < 20)
+* spawn Workers toward a soft target while the first dynamic-price tier is active
   and the Core cell has room;
 * when enemies or an enemy Core are visible, prioritize attack-unit production;
 * leave an object on WAIT when no legal useful action is known.
@@ -64,14 +64,15 @@ from arena_hero import (
     Direction,
     HarvestSource,
     UnitType,
+    unit_cost,
 )
 
 if TYPE_CHECKING:
     from arena_hero import Core, CoreView, Turn, Unit, UnitView
 
-# Population at and above which upkeep becomes a real cost. Upkeep is
-# ``tier * (tier + 1) / 2`` where ``tier = floor(population / 20)``; the first
-# tier (0) is free, so staying below 20 Units costs nothing.
+# v0.14 has no per-Tick upkeep. Keep a conservative soft population cap at the
+# first dynamic-price step until live ROI data proves that higher production
+# prices pay back the extra scouting and defense capacity.
 FREE_UPKEEP_CAP = 20
 # Comfortable Worker count the tactic tries to maintain. The fourth review
 # found TARGET_WORKERS=16 was unreachable at the observed harvest rate AND
@@ -81,10 +82,10 @@ FREE_UPKEEP_CAP = 20
 # skeptic personas) re-measured and found the binding constraint is node
 # DISCOVERY rate (~0.033 res/tick) not the chunk-quota ceiling (2.0/tick,
 # 34-64x headroom): more Workers find nodes faster, directly raising
-# throughput, and upkeep is still 0 below pop 20. Raised 8 -> 12, then
+# throughput, and the first dynamic-price tier remains below pop 20. Raised 8 -> 12, then
 # 12 -> 15 after r hit the pop-14 capacity ceiling (70): more Workers both
 # raise discovery AND raise Core capacity (each Unit +5), letting r bank
-# past 70. Still free-upkeep (pop 17 < 20). The bank reserve +
+# past 70. Still below the first price step (pop 17 < 20). The bank reserve +
 # army-short gate still prevent draining deposits to r0.
 TARGET_WORKERS = 19
 MAX_WORKERS = 21
@@ -101,14 +102,14 @@ WORKER_SPAWN_RESERVE = 3
 # the 10-resource Vanguard cost in time and the Core burned with zero return
 # fire. We now maintain a combat reserve even in peacetime.
 #
-# A Vanguard costs 10 and a Ranger 12 (rules). The fleet builds the standing
-# reserve as soon as a minimal Worker economy (MIN_WORKERS_BEFORE_ARMY) exists,
+# Base Vanguard/Ranger prices are 10/12; v0.14 raises them with population. The
+# fleet builds the standing reserve as soon as a minimal Worker economy exists,
 # and BEFORE growing Workers past that floor — combat readiness outranks a
 # larger Worker fleet once the economy can sustain the smallest army.
 MIN_WORKERS_BEFORE_ARMY = 4
 # Peacetime standing reserve now SCALES with the Worker fleet via
 # _standing_army_targets (a floor of V1/R1, growing ~one combat pair per 8
-# Workers up to the free-upkeep pop budget). These legacy constants document
+# Workers up to the first-price-step population budget). These legacy constants document
 # the floor that scaling starts from. A Vanguard is the cheapest return-fire
 # Unit (1 damage to an adjacent cell, 4 HP body-block) and is built first.
 STANDING_VANGUARDS = 1
@@ -2010,7 +2011,7 @@ def _can_shoot(
 ) -> bool:
     """True if a Ranger at ``shooter`` can legally shoot ``target``.
 
-    Rules (v0.13): shared cardinal or exact-diagonal line, range 1-3, with no
+    Rules (v0.14): shared cardinal or exact-diagonal line, range 1-3, with no
     obstacle in an intermediate shot cell.
     """
     if not _same_fire_line(shooter, target):
@@ -2267,9 +2268,8 @@ def _standing_army_targets(n_workers: int) -> tuple[int, int]:
     with it, so a raid meets more return fire the more valuable the Core is
     (the 2026-08-02 Core loss was a raid against an economy with no army).
     Roughly one combat pair (Vanguard + Ranger) per 8 Workers, a floor of 1,
-    then shrunk to fit the free-upkeep population budget (W + V + R <= 19,
-    i.e. budget = FREE_UPKEEP_CAP - 1) so growth never overflows into upkeep
-    tier 1.
+    then shrunk to fit the conservative first-price-step budget (W + V + R <=
+    19, i.e. budget = FREE_UPKEEP_CAP - 1).
 
     Ratchet-proof (10th review, rank 1): a raid that kills a Vanguard/Ranger
     does NOT lower the Worker count, so the old formula returned the same
@@ -2331,7 +2331,7 @@ def _control_core(
         return
 
     # Spawn Workers toward the target fleet so the economy grows and explores
-    # faster, staying in the free-upkeep band (population < 20). Only spawn
+    # faster, staying below the first dynamic-price step (population < 20). Only spawn
     # when the Core cell has room (Core + at most one colocated Unit) so it
     # does not fail with CELL_UNIT_LIMIT.
     #
@@ -2377,7 +2377,7 @@ def _control_core(
         # Peacetime standing reserve scales with the Worker economy (user
         # requirement): a bigger fleet must field a bigger army so a raid
         # meets more return fire the more valuable the Core is. Growth is
-        # capped by the free-upkeep population budget below 20.
+        # capped by the conservative first-price-step population budget below 20.
         target_vanguards, target_rangers = _standing_army_targets(
             len(turn.workers)
         )
@@ -2401,22 +2401,24 @@ def _control_core(
 
     if economy_floor_met or army_floor_met:
         # Rangers are the strongest defender (range-3 return fire from a
-        # 5-vision scout) but cost 12, so build the cheap Vanguard body-block
-        # first, then the Ranger.
+        # 5-vision scout) but have a higher dynamic price, so build the cheap
+        # Vanguard body-block first, then the Ranger.
         wants_vanguard = len(turn.vanguards) < target_vanguards
         wants_ranger = len(turn.rangers) < target_rangers
-        if wants_vanguard and effective_resources >= 10:
+        vanguard_price = unit_cost(UnitType.VANGUARD, population)
+        ranger_price = unit_cost(UnitType.RANGER, population)
+        if wants_vanguard and effective_resources >= vanguard_price:
             core.spawn(UnitType.VANGUARD)
             return
-        if wants_ranger and effective_resources >= 12:
+        if wants_ranger and effective_resources >= ranger_price:
             core.spawn(UnitType.RANGER)
             return
 
     # Budget-aware Worker target (6th review, strategy STRAT-5): the effective
-    # ceiling is the free-upkeep population budget minus the standing army's pop
+    # ceiling is the conservative first-price-step population budget minus the standing army's pop
     # cost. A fixed TARGET_WORKERS=19 ignored the army (e.g. V1R3 leaves room
-    # for only 15 Workers) and pushed the fleet into tier-1 upkeep. TARGET_WORKERS
-    # remains as a legacy constant for the never-reached pre-army ceiling.
+    # for only 15 Workers) and pushed the fleet into the next price step.
+    # TARGET_WORKERS remains as a legacy constant for the pre-army ceiling.
     worker_target = FREE_UPKEEP_CAP - 1 - (
         len(turn.vanguards) + len(turn.rangers)
     )
@@ -2427,7 +2429,7 @@ def _control_core(
     )
     # Above the economy floor (and whenever an enemy is present), if the combat
     # reserve is STILL short, do NOT spend 5 on another Worker — bank the
-    # resource toward the 10/12 combat Unit instead, or the economy stalls at
+    # resource toward the dynamically priced combat Unit instead, or the economy stalls at
     # ~5 and never affords return fire (the exact trap that lost the Core on
     # 2026-08-02).
     if (economy_floor_met or enemy_present) and army_short:
@@ -2435,7 +2437,8 @@ def _control_core(
     # Bank reserve: only spawn a Worker if the Core keeps at least
     # WORKER_SPAWN_RESERVE resources afterward, so the economy never drains to
     # zero and the standing-army bank is not reset each spawn.
-    if wants_worker and effective_resources >= 5 + WORKER_SPAWN_RESERVE:
+    worker_price = unit_cost(UnitType.WORKER, population)
+    if wants_worker and effective_resources >= worker_price + WORKER_SPAWN_RESERVE:
         core.spawn(UnitType.WORKER)
         return
 
