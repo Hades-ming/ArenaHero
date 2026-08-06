@@ -702,7 +702,7 @@ def _worker_resource_assignments(
     # 扫描。这样大量旧地图提示不会把所有 Worker 都停在陈旧路线，同时仍让
     # 前两个 Worker 立即处理已知历史资源。
     dispatch_workers = workers
-    if not visible_resources and len(workers) >= 3 and resources:
+    if not visible_resources and len(workers) >= 3:
         core_pos = turn.core.position if turn.core is not None else (0, 0)
         explorer = max(
             workers,
