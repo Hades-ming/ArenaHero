@@ -21,12 +21,23 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import sys
+import time
 from datetime import datetime
 from getpass import getpass
 from pathlib import Path
 
-from arena_hero import ArenaHeroClient, APIError, HarvestSource, TurnClosedError, TransportError
+from arena_hero import (
+    APIError,
+    ArenaHeroClient,
+    AuthenticationError,
+    HarvestSource,
+    PolicyViolationError,
+    ProtocolError,
+    TransportError,
+    TurnClosedError,
+)
 
 from tactic import decide
 import tactic
@@ -116,7 +127,72 @@ def _summarize_events(events) -> str:
     return ";".join(out)
 
 
-def _log_line(turn, accepted) -> str:
+_SAFE_ERROR_CODE = re.compile(r"[A-Z0-9_.-]{1,64}")
+_SAFE_STATUS = re.compile(r"[A-Z_]{1,32}")
+
+
+def _safe_log_token(value: object, pattern: re.Pattern[str], fallback: str) -> str:
+    if isinstance(value, str):
+        candidate = value.strip().upper()
+        if pattern.fullmatch(candidate):
+            return candidate
+    return fallback
+
+
+def _safe_error_code(exc: BaseException, fallback: str = "UNKNOWN_ERROR") -> str:
+    """Return a bounded code without copying server messages into logs."""
+    known = (
+        (TurnClosedError, "TURN_CLOSED"),
+        (APIError, "API_ERROR"),
+        (TransportError, "TRANSPORT_ERROR"),
+        (ProtocolError, "PROTOCOL_ERROR"),
+        (AuthenticationError, "AUTHENTICATION_ERROR"),
+        (PolicyViolationError, "POLICY_VIOLATION"),
+    )
+    for error_type, code in known:
+        if isinstance(exc, error_type):
+            raw = getattr(exc, "error", None)
+            candidate = _safe_log_token(raw, _SAFE_ERROR_CODE, "")
+            if candidate:
+                return candidate
+            return code
+    return fallback
+
+
+def _append_log_line(line: str) -> None:
+    try:
+        with LOG_PATH.open("a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
+    except OSError:
+        pass
+
+
+def _failure_log_line(
+    tick: int,
+    status: str,
+    error_code: str,
+    decide_ms: int,
+    submit_ms: int,
+    total_local_ms: int,
+) -> str:
+    status = _safe_log_token(status, _SAFE_STATUS, "SUBMIT_FAILED")
+    error_code = _safe_log_token(error_code, _SAFE_ERROR_CODE, "UNKNOWN_ERROR")
+    return (
+        f"t{tick} ST[{status}] ER[{error_code}] "
+        f"TM[{decide_ms},{submit_ms},{total_local_ms}]"
+    )
+
+
+def _log_line(
+    turn,
+    accepted=None,
+    decide_ms: int = 0,
+    submit_ms: int = 0,
+    total_local_ms: int = 0,
+    dup: int = 0,
+    status: str = "ACCEPTED",
+    error_code: str | None = None,
+) -> str:
     s = turn.state
     core = turn.core
     core_desc = "respawn" if core is None else f"{core.position[0]},{core.position[1]} hp{core.hp}/sh{core.shield}/{core.view.state}"
@@ -131,6 +207,9 @@ def _log_line(turn, accepted) -> str:
     enemies_desc = ",".join(
         f"{e.position[0]},{e.position[1]}{'C' if e.kind == 'CORE' else getattr(e,'unit_type',None)}" for e in turn.visible_enemies
     ) or "-"
+    status = _safe_log_token(status, _SAFE_STATUS, "ACCEPTED")
+    safe_error_code = _safe_log_token(error_code, _SAFE_ERROR_CODE, "UNKNOWN_ERROR")
+    dup_flag = f" dup" if dup else ""
     return (
         f"t{turn.tick} "
         f"r{turn.resources}/{turn.resource_capacity} "
@@ -142,41 +221,85 @@ def _log_line(turn, accepted) -> str:
         f"obs{len(turn.obstacle_cells)} "
         f"beacon{turn.beacon.position[0]},{turn.beacon.position[1]} "
         f"eco[{tactic._resource_telemetry_summary()}] "
+        f"TM[{decide_ms},{submit_ms},{total_local_ms}] ST[{status}]"
+        f"{f' ER[{safe_error_code}]' if error_code else ''}{dup_flag} "
         f"ev[{_summarize_events(turn.events)}] "
         f"plan[{_summarize_plan(turn.plan)}]"
     )
 
 
 def play(api_key: str, base_url: str, websocket_url: str | None) -> int:
-    submitted = 0
-    with ArenaHeroClient(api_key=api_key, base_url=base_url, websocket_url=websocket_url) as game:
-        for turn in game.turns():
-            decide(turn)
-            try:
-                accepted = turn.submit()
-            except (TurnClosedError, APIError, TransportError) as exc:
-                # A stale tick, a closed window, a rate-limit, or a transient
-                # transport failure (network/server) is recoverable: the next
-                # Turn carries fresh state. Log and keep going rather than
-                # killing the run. COMMAND_WINDOW_CLOSED and TICK_MISMATCH
-                # arrive as APIError here; TransportError covers submission
-                # failures that exhausted safe retries.
-                err = getattr(exc, "error", None) or type(exc).__name__
-                print(f"t{turn.tick} submit_skipped ({err})", file=sys.stderr)
+    try:
+        with ArenaHeroClient(api_key=api_key, base_url=base_url, websocket_url=websocket_url) as game:
+            for turn in game.turns():
+                t0 = time.monotonic()
                 try:
-                    with LOG_PATH.open("a", encoding="utf-8") as fh:
-                        fh.write(f"t{turn.tick} submit_skipped ({err})\n")
-                except OSError:
-                    pass
-                continue
-            submitted += 1
-            line = _log_line(turn, accepted)
-            print(line, file=sys.stderr)
-            try:
-                with LOG_PATH.open("a", encoding="utf-8") as fh:
-                    fh.write(line + "\n")
-            except OSError:
-                pass
+                    decide(turn)
+                except Exception as exc:
+                    t1 = time.monotonic()
+                    decide_ms = int((t1 - t0) * 1000)
+                    error_code = _safe_error_code(exc, "DECISION_ERROR")
+                    line = _failure_log_line(
+                        turn.tick, "DECISION_FAILED", error_code, decide_ms, 0, decide_ms
+                    )
+                    print(line, file=sys.stderr)
+                    _append_log_line(line)
+                    continue
+
+                t1 = time.monotonic()
+                try:
+                    accepted = turn.submit()
+                except (
+                    TurnClosedError,
+                    APIError,
+                    ProtocolError,
+                    TransportError,
+                    AuthenticationError,
+                    PolicyViolationError,
+                ) as exc:
+                    t2 = time.monotonic()
+                    decide_ms = int((t1 - t0) * 1000)
+                    submit_ms = int((t2 - t1) * 1000)
+                    total_local_ms = int((t2 - t0) * 1000)
+                    error_code = _safe_error_code(exc)
+                    line = _failure_log_line(
+                        turn.tick,
+                        "SUBMIT_FAILED",
+                        error_code,
+                        decide_ms,
+                        submit_ms,
+                        total_local_ms,
+                    )
+                    print(line, file=sys.stderr)
+                    _append_log_line(line)
+                    if isinstance(exc, (AuthenticationError, PolicyViolationError)):
+                        raise
+                    continue
+
+                t2 = time.monotonic()
+                decide_ms = int((t1 - t0) * 1000)
+                submit_ms = int((t2 - t1) * 1000)
+                total_local_ms = int((t2 - t0) * 1000)
+                line = _log_line(
+                    turn,
+                    accepted,
+                    decide_ms,
+                    submit_ms,
+                    total_local_ms,
+                    status="ACCEPTED",
+                )
+                print(line, file=sys.stderr)
+                _append_log_line(line)
+    except (
+        AuthenticationError,
+        PolicyViolationError,
+        ProtocolError,
+        APIError,
+        TransportError,
+        TurnClosedError,
+    ) as exc:
+        print(f"game_stopped ({_safe_error_code(exc)})", file=sys.stderr)
+        return 1
     return 0
 
 

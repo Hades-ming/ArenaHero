@@ -34,6 +34,10 @@ RE_CORE = re.compile(r"core@([^ ]+) hp(\d+)/sh(\d+)/(\w+)")
 RE_VIS = re.compile(r"vis(\d+)\[([^\]]*)\]")
 RE_ECO = re.compile(r"eco\[([^\]]*)\]")
 RE_EV = re.compile(r"ev\[([^\]]*)\]")
+RE_TM = re.compile(r"TM\[(\d+),(\d+),(\d+)\]")
+RE_STATUS = re.compile(r"ST\[([A-Z_]+)\]")
+RE_ERROR = re.compile(r"ER\[([A-Z0-9_.-]{1,64})\]")
+RE_LEGACY_SKIP = re.compile(r"^t(\d+)\s+submit_skipped\s+\(([^)\r\n]+)\)")
 
 # Bottleneck thresholds (tunable).
 IDLE_GOLD_TICKS = 15        # resources == capacity for this many CONSECUTIVE ticks => under-investing
@@ -41,11 +45,32 @@ STUCK_MOVE_THRESHOLD = 0.10  # fraction of MOVE events that fail CELL_UNIT_LIMIT
 CORE_HP_WARN = 4             # core hp at/below this (or shield < cap under threat) => defense failing
 LOW_HARVEST_PER_TICK = 0.05  # harvests per tick below this => exploration stalled
 RESOURCE_DROP_THRESHOLD = 10  # single-tick resource drop > this with no spawn => unexplained loss
+# OBS-001 timing thresholds (ms). The contract uses strict upper bounds.
+PLAN_P50_MAX = 250
+PLAN_P95_MAX = 1000
+PLAN_P99_MAX = 2000
+
+
+def _percentile(values: list[int], pct: float) -> float:
+    """Return the interpolated ``pct``-th percentile without truncation."""
+    if not values:
+        return 0.0
+    if not 0 <= pct <= 100:
+        raise ValueError("pct must be between 0 and 100")
+    sorted_vals = sorted(values)
+    k = (len(sorted_vals) - 1) * pct / 100.0
+    f = int(k)
+    c = f + 1 if f + 1 < len(sorted_vals) else f
+    dk = k - f
+    return sorted_vals[f] + dk * (sorted_vals[c] - sorted_vals[f])
 
 
 @dataclass
 class KPI:
+    # ``ticks`` counts successful, unique accepted ticks. ``records`` includes
+    # accepted duplicates and failed submissions for data-quality accounting.
     ticks: int = 0
+    records: int = 0
     start_tick: int = 0
     end_tick: int = 0
     resources_min: int = 10**9
@@ -86,6 +111,36 @@ class KPI:
     core_shield_last: int = 0
     core_status_last: str = ""
     event_hist: Counter = field(default_factory=Counter)
+    error_hist: Counter = field(default_factory=Counter)
+    # Timing (OBS-001): decide_ms, submit_ms, total_local_ms per tick
+    decide_ms_list: list[int] = field(default_factory=list)
+    submit_ms_list: list[int] = field(default_factory=list)
+    total_ms_list: list[int] = field(default_factory=list)
+    # Unique-tick tracking (OBS-001)
+    unique_ticks: int = 0
+    duplicate_ticks: int = 0
+    failed_ticks: int = 0
+    window_errors: int = 0
+    submit_errors: int = 0
+    decision_errors: int = 0
+
+
+_ERROR_CODE_ALIASES = {
+    "APIERROR": "API_ERROR",
+    "TRANSPORTERROR": "TRANSPORT_ERROR",
+    "PROTOCOLERROR": "PROTOCOL_ERROR",
+    "AUTHENTICATIONERROR": "AUTHENTICATION_ERROR",
+    "POLICYVIOLATIONERROR": "POLICY_VIOLATION",
+    "TURN_CLOSEDERROR": "TURN_CLOSED",
+}
+
+
+def _normalize_error_code(value: object) -> str:
+    if isinstance(value, str):
+        candidate = value.strip().upper()
+        if RE_ERROR.fullmatch(f"ER[{candidate}]"):
+            return _ERROR_CODE_ALIASES.get(candidate, candidate)
+    return "UNKNOWN_ERROR"
 
 
 def _parse_line(line: str) -> dict | None:
@@ -94,7 +149,19 @@ def _parse_line(line: str) -> dict | None:
     m = RE_TICK.search(line)
     if not m:
         return None
-    rec: dict = {"tick": int(m.group(1))}
+    legacy_skip = RE_LEGACY_SKIP.match(line.rstrip("\n"))
+    rec: dict = {
+        "tick": int(m.group(1)),
+        "status": "SUBMIT_FAILED" if legacy_skip else "ACCEPTED",
+    }
+    if legacy_skip:
+        rec["error_code"] = _normalize_error_code(legacy_skip.group(2))
+    status_match = RE_STATUS.search(line)
+    if status_match:
+        rec["status"] = status_match.group(1)
+    error_match = RE_ERROR.search(line)
+    if error_match:
+        rec["error_code"] = _normalize_error_code(error_match.group(1))
     m = RE_RES.search(line)
     if m:
         rec["res"], rec["cap"] = int(m.group(1)), int(m.group(2))
@@ -123,6 +190,11 @@ def _parse_line(line: str) -> dict | None:
     m = RE_EV.search(line)
     if m:
         rec["events"] = [e for e in m.group(1).split(";") if e]
+    m = RE_TM.search(line)
+    if m:
+        rec["decide_ms"], rec["submit_ms"], rec["total_ms"] = (
+            int(m.group(1)), int(m.group(2)), int(m.group(3))
+        )
     return rec
 
 
@@ -133,15 +205,44 @@ def analyze(path: str | Path) -> KPI:
     if not p.exists():
         return kpi
     prev_res = None
+    last_success_tick: int | None = None
     with p.open("r", encoding="utf-8", errors="replace") as fh:
         for raw in fh:
             rec = _parse_line(raw)
             if not rec:
                 continue
+            kpi.records += 1
+            tick = rec["tick"]
+            if rec.get("status") != "ACCEPTED":
+                kpi.failed_ticks += 1
+                error_code = rec.get("error_code", "UNKNOWN_ERROR")
+                kpi.error_hist[error_code] += 1
+                if error_code == "COMMAND_WINDOW_CLOSED":
+                    kpi.window_errors += 1
+                if rec["status"] == "SUBMIT_FAILED":
+                    kpi.submit_errors += 1
+                elif rec["status"] == "DECISION_FAILED":
+                    kpi.decision_errors += 1
+                continue
+
+            # Logs are append-only and ticks are monotonic. This bounded-state
+            # check avoids retaining every tick ID while rejecting repeats and
+            # out-of-order accepted records from business KPI aggregation.
+            if last_success_tick is not None and tick <= last_success_tick:
+                kpi.duplicate_ticks += 1
+                continue
+            last_success_tick = tick
             kpi.ticks += 1
-            kpi.end_tick = rec["tick"]
-            if kpi.start_tick == 0:
-                kpi.start_tick = rec["tick"]
+            kpi.unique_ticks += 1
+            kpi.end_tick = tick
+            if kpi.unique_ticks == 1:
+                kpi.start_tick = tick
+            if "decide_ms" in rec:
+                kpi.decide_ms_list.append(rec["decide_ms"])
+            if "submit_ms" in rec:
+                kpi.submit_ms_list.append(rec["submit_ms"])
+            if "total_ms" in rec:
+                kpi.total_ms_list.append(rec["total_ms"])
             if "res" in rec:
                 res, cap = rec["res"], rec["cap"]
                 kpi.resources_min = min(kpi.resources_min, res)
@@ -214,7 +315,18 @@ def detect_bottlenecks(kpi: KPI) -> list[str]:
     """Return a list of human-readable bottleneck alerts."""
     alerts: list[str] = []
     if kpi.ticks == 0:
-        return ["no game data parsed (empty or missing log)"]
+        if kpi.records == 0:
+            return ["no game data parsed (empty or missing log)"]
+        alerts = ["no successful unique ticks parsed"]
+        if kpi.window_errors:
+            alerts.append(
+                f"COMMAND_WINDOW_CLOSED: {kpi.window_errors} failed submissions"
+            )
+        if kpi.submit_errors:
+            alerts.append(f"SUBMIT_ERRORS: {kpi.submit_errors} submissions failed")
+        if kpi.decision_errors:
+            alerts.append(f"DECISION_ERRORS: {kpi.decision_errors} decisions failed")
+        return alerts
 
     harvest_per_tick = kpi.harvest / kpi.ticks
     if harvest_per_tick < LOW_HARVEST_PER_TICK:
@@ -257,17 +369,57 @@ def detect_bottlenecks(kpi: KPI) -> list[str]:
         alerts.append(
             "UNIT_LOSS_NO_DEPOSIT: units died without deposits — cargo wasted"
         )
+    if kpi.window_errors:
+        alerts.append(
+            f"COMMAND_WINDOW_CLOSED: {kpi.window_errors} failed submissions"
+        )
+    if kpi.submit_errors:
+        alerts.append(f"SUBMIT_ERRORS: {kpi.submit_errors} submissions failed")
+    if kpi.decision_errors:
+        alerts.append(f"DECISION_ERRORS: {kpi.decision_errors} decisions failed")
+    # OBS-001 gates algorithmic plan time. Submit and total timings remain in
+    # the report because they include server/network latency outside decide().
+    if kpi.decide_ms_list:
+        p50 = _percentile(kpi.decide_ms_list, 50)
+        p95 = _percentile(kpi.decide_ms_list, 95)
+        p99 = _percentile(kpi.decide_ms_list, 99)
+        limits = (
+            (p50, PLAN_P50_MAX, "P50"),
+            (p95, PLAN_P95_MAX, "P95"),
+            (p99, PLAN_P99_MAX, "P99"),
+        )
+        exceeded = ", ".join(
+            f"{name} {value:g}ms >= {limit}ms"
+            for value, limit, name in limits
+            if value >= limit
+        )
+        if exceeded:
+            alerts.append(
+                f"PLAN_TIMING: {exceeded} — local plan may risk the 15s command window"
+            )
+    if kpi.duplicate_ticks > 0:
+        alerts.append(
+            f"DUP_TICK: {kpi.duplicate_ticks} duplicate ticks detected "
+            f"({kpi.unique_ticks} unique) — verify single process"
+        )
     return alerts
 
 
 def report(kpi: KPI, alerts: list[str]) -> str:
-    if kpi.ticks == 0:
+    if kpi.records == 0:
         return "No game data to report."
     lines = []
     lines.append("=" * 60)
     lines.append("ARENA HERO — BATTLE TELEMETRY")
     lines.append("=" * 60)
-    lines.append(f"Ticks analyzed : {kpi.ticks} (t{kpi.start_tick}..t{kpi.end_tick})")
+    lines.append(
+        f"Ticks analyzed : {kpi.ticks} successful unique / {kpi.records} records "
+        f"(t{kpi.start_tick}..t{kpi.end_tick})"
+    )
+    lines.append(
+        f"Failures       : {kpi.failed_ticks} (window {kpi.window_errors}, "
+        f"submit {kpi.submit_errors}, decision {kpi.decision_errors})"
+    )
     lines.append(
         f"Resources      : last {kpi.resources_last}/{kpi.capacity_last} "
         f"(min {kpi.resources_min}, max {kpi.resources_max})"
@@ -309,6 +461,25 @@ def report(kpi: KPI, alerts: list[str]) -> str:
     lines.append(
         f"Enemy visible  : {kpi.ticks_with_enemy_visible} ticks"
     )
+    if kpi.decide_ms_list:
+        n = len(kpi.total_ms_list)
+        p50_d = _percentile(kpi.decide_ms_list, 50)
+        p95_d = _percentile(kpi.decide_ms_list, 95)
+        p99_d = _percentile(kpi.decide_ms_list, 99)
+        p50_s = _percentile(kpi.submit_ms_list, 50)
+        p95_s = _percentile(kpi.submit_ms_list, 95)
+        p99_s = _percentile(kpi.submit_ms_list, 99)
+        p50_t = _percentile(kpi.total_ms_list, 50)
+        p95_t = _percentile(kpi.total_ms_list, 95)
+        p99_t = _percentile(kpi.total_ms_list, 99)
+        lines.append(
+            f"Timing ({n} samples) : decide {p50_d:g}/{p95_d:g}/{p99_d:g}ms "
+            f"(P50/P95/P99)  submit {p50_s:g}/{p95_s:g}/{p99_s:g}ms  "
+            f"total {p50_t:g}/{p95_t:g}/{p99_t:g}ms"
+        )
+    lines.append(
+        f"Tick quality   : {kpi.unique_ticks} unique + {kpi.duplicate_ticks} duplicate"
+    )
     lines.append("-" * 60)
     if alerts:
         lines.append("BOTTLENECKS / ACTION NEEDED:")
@@ -341,6 +512,7 @@ def _watch_loop(path: str | Path, interval: int, as_json: bool) -> None:
             f"R{kpi.rangers_last}) hp{kpi.core_hp_last}/"
             f"sh{kpi.core_shield_last} harv{kpi.harvest} dep{kpi.deposit} "
             f"evis{kpi.ticks_with_enemy_visible} "
+            f"u{kpi.unique_ticks}d{kpi.duplicate_ticks} "
             f"{'ALERTS(' + str(len(alerts)) + ')' if alerts else 'ok'}"
         )
         print(status, flush=True)
@@ -380,9 +552,11 @@ def main(argv: list[str]) -> int:
     alerts = detect_bottlenecks(kpi)
     if as_json:
         out = asdict(kpi)
-        # dataclasses.asdict 会用 Counter 的构造器重建映射，从而把
-        # (事件名, 次数) 对误当成 tuple 键；显式转为普通字典才能 JSON 化。
+        # dataclasses.asdict dumps sets as-is (not JSON-serializable);
+        # convert to list.
+        # Counter -> plain dict; timing lists are already lists.
         out["event_hist"] = dict(kpi.event_hist)
+        out["error_hist"] = dict(kpi.error_hist)
         out["bottlenecks"] = alerts
         print(json.dumps(out, indent=2, default=str))
     else:

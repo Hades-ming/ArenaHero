@@ -664,6 +664,7 @@ def test_resource_telemetry_log_is_monitorable_and_never_contains_api_key(
     turn = _turn(_workers_state([(0, 0)], resources=[(3, 0)]))
     decide(turn)
 
+    # Legacy callers may still omit the optional timing/status arguments.
     line = play._log_line(turn, accepted=None)
 
     assert "eco[a1,av1,ah0,blk0,cool0,unr0,harv0,dep0]" in line
@@ -2731,3 +2732,333 @@ def test_worker_harvests_resource_before_boxed_escape() -> None:
     action = _action(turn.plan, WORKER_ID)
     assert action is not None
     assert action.type == "HARVEST"
+
+
+# ---------------------------------------------------------------------------
+# OBS-001: decision timing and unique-tick observation
+# ---------------------------------------------------------------------------
+
+
+def test_percentile_sorted_values() -> None:
+    from meta.monitor import _percentile
+
+    assert _percentile([], 50) == 0
+    assert _percentile([100], 50) == 100
+    assert _percentile([100], 0) == 100
+    assert _percentile([100], 100) == 100
+    vals = [10, 20, 30, 40, 50, 60, 70, 80, 90, 100]
+    p50 = _percentile(vals, 50)
+    assert 45 <= p50 <= 55, f"P50 {p50} out of expected range"
+    p99 = _percentile(vals, 99)
+    assert p99 >= 90, f"P99 {p99} out of expected range"
+    p0 = _percentile(vals, 0)
+    assert p0 == 10
+
+
+def test_monitor_parses_timing_field() -> None:
+    from meta.monitor import _parse_line
+
+    rec = _parse_line(
+        "t100 r50/95 pop19(W16 V2 R1) core@15,234 hp5/sh5/NORMAL "
+        "W[-] O[-] vis0[-] res0[] obs0 beacon0,0 "
+        "eco[a0,av0,ah0,blk0,cool0,unr0,harv0,dep0] "
+        "TM[80,12,92] "
+        "ev[] plan[-]"
+    )
+    assert rec is not None
+    assert rec["tick"] == 100
+    assert rec["decide_ms"] == 80
+    assert rec["submit_ms"] == 12
+    assert rec["total_ms"] == 92
+
+
+def test_monitor_backward_compat_no_timing() -> None:
+    from meta.monitor import _parse_line
+
+    rec = _parse_line(
+        "t99 r50/95 pop19(W16 V2 R1) core@15,234 hp5/sh5/NORMAL "
+        "W[-] O[-] vis0[-] res0[] obs0 beacon0,0 "
+        "eco[a0,av0,ah0,blk0,cool0,unr0,harv0,dep0] "
+        "ev[] plan[-]"
+    )
+    assert rec is not None
+    assert rec["tick"] == 99
+    assert "decide_ms" not in rec
+    assert "submit_ms" not in rec
+    assert "total_ms" not in rec
+
+
+def test_unique_tick_dedup() -> None:
+    from meta.monitor import analyze, KPI
+    import tempfile
+
+    # Two unique ticks, t100 appears twice (duplicate).
+    log = (
+        "t100 r50/95 pop19(W16 V2 R1) core@15,234 hp5/sh5/NORMAL "
+        "W[-] O[-] vis0[-] res0[] obs0 beacon0,0 "
+        "eco[a0,av0,ah0,blk0,cool0,unr0,harv0,dep0] "
+        "TM[80,12,92] ev[] plan[-]\n"
+        "t100 r50/95 pop19(W16 V2 R1) core@15,234 hp5/sh5/NORMAL "
+        "W[-] O[-] vis0[-] res0[] obs0 beacon0,0 "
+        "eco[a0,av0,ah0,blk0,cool0,unr0,harv0,dep0] "
+        "TM[85,15,100] ev[] plan[-]\n"
+        "t101 r51/95 pop19(W16 V2 R1) core@15,234 hp5/sh5/NORMAL "
+        "W[-] O[-] vis0[-] res0[] obs0 beacon0,0 "
+        "eco[a0,av0,ah0,blk0,cool0,unr0,harv0,dep0] "
+        "TM[90,10,100] ev[] plan[-]\n"
+    )
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".log", delete=False) as f:
+        f.write(log)
+        f.flush()
+        kpi = analyze(f.name)
+    assert kpi.unique_ticks == 2
+    assert kpi.duplicate_ticks == 1
+    assert kpi.records == 3
+    assert kpi.ticks == 2
+    # Only unique ticks' timing is collected (t100 first occurrence, t101).
+    assert len(kpi.decide_ms_list) == 2
+    assert kpi.decide_ms_list == [80, 90]
+
+
+def test_timing_format_is_compact_integers() -> None:
+    """TM field must be three comma-separated non-negative integers, no keys."""
+    import re
+
+    tm_re = re.compile(r"TM\[(\d+),(\d+),(\d+)\]")
+    # Confirm regex only captures positive integer groups.
+    m = tm_re.search("TM[0,1,9999]")
+    assert m is not None
+    assert m.group(1) == "0"
+    assert m.group(3) == "9999"
+    # Reject non-integer.
+    assert tm_re.search("TM[1.5,2,3]") is None
+    # Reject trailing content (no path/headers).
+    line = "t100 TM[80,12,92] ev[]"
+    m = tm_re.search(line)
+    assert m is not None
+    # The field sits between eco and ev; no sensitive content.
+    sensitive = {"key", "secret", "token", "auth", "bearer"}
+    assert not any(w in line.lower() for w in sensitive)
+
+
+def test_duplicate_accepted_tick_does_not_double_count_business_kpis(tmp_path) -> None:
+    from meta.monitor import analyze
+
+    accepted = (
+        "r50/95 pop19(W16 V2 R1) core@15,234 hp5/sh5/NORMAL "
+        "W[-] O[-] vis0[-] res0[] obs0 beacon0,0 "
+        "eco[a1,av1,ah0,blk0,cool0,unr0,harv1,dep1] "
+        "TM[80,12,92] ST[ACCEPTED] "
+        "ev[HARVEST_SUCCEEDED;DEPOSIT_SUCCEEDED] plan[-]"
+    )
+    duplicate = accepted.replace("a1,av1", "a9,av9").replace(
+        "harv1,dep1", "harv9,dep9"
+    ).replace("TM[80,12,92]", "TM[85,15,100]")
+    next_tick = accepted.replace("r50/95", "r51/95").replace(
+        "a1,av1", "a2,av2"
+    ).replace("TM[80,12,92]", "TM[90,10,100]")
+    log_path = tmp_path / "game.log"
+    log_path.write_text(
+        f"t100 {accepted}\n"
+        f"t100 {duplicate}\n"
+        f"t101 {next_tick}\n",
+        encoding="utf-8",
+    )
+
+    kpi = analyze(log_path)
+
+    assert kpi.records == 3
+    assert kpi.ticks == 2
+    assert kpi.unique_ticks == 2
+    assert kpi.duplicate_ticks == 1
+    assert kpi.resource_assignments == 3
+    assert kpi.visible_resource_assignments == 3
+    assert kpi.harvest == 2
+    assert kpi.deposit == 2
+    assert kpi.event_hist["HARVEST_SUCCEEDED"] == 2
+    assert kpi.event_hist["DEPOSIT_SUCCEEDED"] == 2
+    assert kpi.decide_ms_list == [80, 90]
+
+
+def test_failed_ticks_are_separate_from_successful_kpis(tmp_path) -> None:
+    from meta.monitor import analyze, detect_bottlenecks
+
+    accepted = (
+        "t102 r50/95 pop19(W16 V2 R1) core@15,234 hp5/sh5/NORMAL "
+        "W[-] O[-] vis0[-] res0[] obs0 beacon0,0 "
+        "eco[a0,av0,ah0,blk0,cool0,unr0,harv0,dep0] "
+        "TM[80,12,92] ST[ACCEPTED] ev[] plan[-]\n"
+    )
+    log_path = tmp_path / "game.log"
+    log_path.write_text(
+        "t99 submit_skipped (COMMAND_WINDOW_CLOSED)\n"
+        "t100 ST[SUBMIT_FAILED] ER[COMMAND_WINDOW_CLOSED] TM[80,1,81]\n"
+        "t101 ST[DECISION_FAILED] ER[DECISION_ERROR] TM[300,0,300]\n"
+        + accepted,
+        encoding="utf-8",
+    )
+
+    kpi = analyze(log_path)
+    alerts = detect_bottlenecks(kpi)
+
+    assert kpi.records == 4
+    assert kpi.ticks == 1
+    assert kpi.failed_ticks == 3
+    assert kpi.window_errors == 2
+    assert kpi.submit_errors == 2
+    assert kpi.decision_errors == 1
+    assert kpi.error_hist == {
+        "COMMAND_WINDOW_CLOSED": 2,
+        "DECISION_ERROR": 1,
+    }
+    assert kpi.resource_assignments == 0
+    assert kpi.decide_ms_list == [80]
+    assert any("COMMAND_WINDOW_CLOSED" in alert for alert in alerts)
+    assert any("SUBMIT_ERRORS" in alert for alert in alerts)
+    assert any("DECISION_ERRORS" in alert for alert in alerts)
+
+
+@pytest.mark.parametrize(
+    ("limit", "label"),
+    [(250, "P50"), (1000, "P95"), (2000, "P99")],
+)
+def test_plan_timing_thresholds_are_strict(limit: int, label: str) -> None:
+    from meta.monitor import KPI, detect_bottlenecks
+
+    if label == "P50":
+        at_values = [limit]
+        below_values = [limit - 1]
+    elif label == "P95":
+        at_values = [0] * 18 + [limit, limit]
+        below_values = [0] * 18 + [limit - 1, limit - 1]
+    else:
+        at_values = [0] * 98 + [limit, limit]
+        below_values = [0] * 98 + [limit - 1, limit - 1]
+    at_limit = KPI(ticks=1, records=1, unique_ticks=1, decide_ms_list=at_values)
+    below_limit = KPI(
+        ticks=1, records=1, unique_ticks=1, decide_ms_list=below_values
+    )
+
+    at_alerts = detect_bottlenecks(at_limit)
+    below_alerts = detect_bottlenecks(below_limit)
+
+    assert any(label in alert for alert in at_alerts if alert.startswith("PLAN_TIMING"))
+    assert not any("PLAN_TIMING" in alert for alert in below_alerts)
+
+
+def test_percentile_keeps_fractional_boundary() -> None:
+    from meta.monitor import KPI, _percentile, detect_bottlenecks
+
+    assert _percentile([0, 501], 50) == 250.5
+    kpi = KPI(ticks=1, records=1, unique_ticks=1, decide_ms_list=[0, 501])
+    assert any("P50 250.5ms" in alert for alert in detect_bottlenecks(kpi))
+
+
+def test_plan_gate_excludes_submit_network_latency() -> None:
+    from meta.monitor import KPI, detect_bottlenecks
+
+    kpi = KPI(
+        ticks=1,
+        records=1,
+        unique_ticks=1,
+        decide_ms_list=[100],
+        submit_ms_list=[5000],
+        total_ms_list=[5100],
+    )
+
+    assert not any("PLAN_TIMING" in alert for alert in detect_bottlenecks(kpi))
+
+
+def test_monitor_json_excludes_unbounded_tick_id_state(tmp_path, capsys) -> None:
+    from meta import monitor
+
+    log_path = tmp_path / "game.log"
+    log_path.write_text(
+        "t1 r1/10 pop1(W1 V0 R0) core@0,0 hp5/sh5/NORMAL "
+        "W[-] O[-] vis0[-] res0[] obs0 beacon0,0 "
+        "eco[a0,av0,ah0,blk0,cool0,unr0,harv0,dep0] "
+        "TM[1,2,3] ST[ACCEPTED] ev[] plan[-]\n",
+        encoding="utf-8",
+    )
+
+    monitor.main(["--json", str(log_path)])
+    output = json.loads(capsys.readouterr().out)
+
+    assert "seen_ticks" not in output
+    assert output["unique_ticks"] == 1
+    assert output["records"] == 1
+
+
+def test_error_codes_are_bounded_and_do_not_echo_messages(tmp_path) -> None:
+    import play
+    from arena_hero import APIError, TransportError
+
+    unsafe = APIError(
+        status_code=400,
+        error="COMMAND_WINDOW_CLOSED\nAuthorization: bearer secret-token",
+    )
+    assert play._safe_error_code(unsafe) == "API_ERROR"
+    assert play._safe_error_code(TransportError()) == "TRANSPORT_ERROR"
+    line = play._failure_log_line(
+        7, "SUBMIT_FAILED\nLEAK", "bad code\nsecret", 1, 2, 3
+    )
+    assert "\n" not in line
+    assert "secret" not in line.lower()
+    assert "ST[SUBMIT_FAILED]" in line
+    assert "ER[UNKNOWN_ERROR]" in line
+
+
+def test_play_logs_decision_and_submit_failures_without_exception_text(
+    tmp_path, monkeypatch
+) -> None:
+    import play
+    from arena_hero import APIError
+
+    class FakeTurn:
+        def __init__(self, tick: int, submit_error: Exception | None = None) -> None:
+            self.tick = tick
+            self.submit_error = submit_error
+
+        def submit(self):
+            if self.submit_error is not None:
+                raise self.submit_error
+            return None
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs) -> None:
+            self._turns = [
+                FakeTurn(1),
+                FakeTurn(
+                    2,
+                    APIError(
+                        status_code=409,
+                        error="TICK_MISMATCH\nsecret-response",
+                    ),
+                ),
+            ]
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def turns(self):
+            return iter(self._turns)
+
+    log_path = tmp_path / "game.log"
+    monkeypatch.setattr(play, "ArenaHeroClient", FakeClient)
+    monkeypatch.setattr(play, "LOG_PATH", log_path)
+
+    def fake_decide(turn) -> None:
+        if turn.tick == 1:
+            raise RuntimeError("decision secret\nresponse body")
+
+    monkeypatch.setattr(play, "decide", fake_decide)
+
+    assert play.play("not-a-real-key", "https://example.invalid", None) == 0
+    lines = log_path.read_text(encoding="utf-8").splitlines()
+
+    assert lines[0].startswith("t1 ST[DECISION_FAILED] ER[DECISION_ERROR]")
+    assert lines[1].startswith("t2 ST[SUBMIT_FAILED] ER[API_ERROR]")
+    assert all("secret" not in line.lower() for line in lines)
