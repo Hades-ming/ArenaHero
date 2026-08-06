@@ -2626,6 +2626,33 @@ def test_standing_army_banks_resources_when_short_not_worker() -> None:
     assert act is None, "should bank resources for the combat Unit, not spawn"
 
 
+def test_partial_army_allows_one_economy_bridge_worker() -> None:
+    # Once a Vanguard already protects the Core, a temporary Ranger shortfall
+    # must not freeze the economy at the four-Worker floor.  At 8 resources a
+    # Worker can be paid while preserving the three-resource bank reserve.
+    state = _state_with_workers(
+        n_workers=4, resources=8, n_vanguards=1, n_rangers=0
+    )
+    turn = _turn(state)
+    decide(turn)
+    act = _core_action(turn.plan)
+    assert act is not None
+    assert act.type == "SPAWN"
+    assert act.unit_type.value == "WORKER"
+
+
+def test_partial_army_bridge_is_disabled_under_threat() -> None:
+    # A nearby enemy keeps the combat-first gate: the bridge Worker must not
+    # consume the bank that should fund the next defender.
+    state = _state_with_workers(
+        n_workers=4, resources=8, n_vanguards=1, n_rangers=0, threat=True
+    )
+    turn = _turn(state)
+    decide(turn)
+    act = _core_action(turn.plan)
+    assert act is None
+
+
 def test_standing_army_grows_workers_when_reserve_full() -> None:
     # Standing reserve satisfied (1 Vanguard + 1 Ranger), resources above the
     # spawn+reserve threshold: now grow the Worker fleet toward TARGET_WORKERS.

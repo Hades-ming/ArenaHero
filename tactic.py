@@ -107,6 +107,11 @@ WORKER_SPAWN_RESERVE = 3
 # and BEFORE growing Workers past that floor — combat readiness outranks a
 # larger Worker fleet once the economy can sustain the smallest army.
 MIN_WORKERS_BEFORE_ARMY = 4
+# If a combat Unit already exists, permit one extra Worker to bridge a
+# temporary Ranger/Vanguard shortfall while the Core is not under immediate
+# threat.  This keeps the economy from freezing at the four-Worker floor while
+# still reserving the bank for combat as soon as a nearby enemy is present.
+ECONOMY_BRIDGE_MAX_WORKERS = MIN_WORKERS_BEFORE_ARMY + 1
 # Peacetime standing reserve now SCALES with the Worker fleet via
 # _standing_army_targets (a floor of V1/R1, growing ~one combat pair per 8
 # Workers up to the first-price-step population budget). These legacy constants document
@@ -2568,11 +2573,17 @@ def _control_core(
         or len(turn.rangers) < target_rangers
     )
     # Above the economy floor (and whenever an enemy is present), if the combat
-    # reserve is STILL short, do NOT spend 5 on another Worker — bank the
-    # resource toward the dynamically priced combat Unit instead, or the economy stalls at
-    # ~5 and never affords return fire (the exact trap that lost the Core on
-    # 2026-08-02).
-    if (economy_floor_met or enemy_present) and army_short:
+    # reserve is still short, bank toward the next combat Unit.  One guarded
+    # exception prevents a temporary Ranger gap from freezing a mature enough
+    # economy: with at least one combat Unit already alive, no nearby threat,
+    # and only four Workers, a single Worker may bridge the gap.  The following
+    # Tick is gated again, so this cannot turn into unbounded Worker spending.
+    bridge_worker_allowed = (
+        not threatened
+        and len(turn.workers) < ECONOMY_BRIDGE_MAX_WORKERS
+        and (len(turn.vanguards) + len(turn.rangers)) > 0
+    )
+    if (economy_floor_met or enemy_present) and army_short and not bridge_worker_allowed:
         return
     # Bank reserve: only spawn a Worker if the Core keeps at least
     # WORKER_SPAWN_RESERVE resources afterward, so the economy never drains to
