@@ -320,6 +320,10 @@ ENEMY_MEMORY_TICKS = 6    # forget a last-seen enemy position after this many ti
 # memory directly raises effective discovery by avoiding re-scan of empty
 # cells already known from earlier sweeps).
 _known_resources: set[tuple[int, int]] = set()
+# 短期资源认领只保存“哪个活着的空载 Worker 正在追哪个坐标”。它不是地图
+# 事实，也不落盘；当前可见资源一旦被认领，在到达前不因距离变化而换主，避免
+# 每 Tick 的全局匹配让 Worker 在两个候选之间来回改派。
+_resource_claims: dict[str, tuple[int, int]] = {}
 
 
 @dataclass
@@ -716,6 +720,7 @@ def _worker_resource_assignments(
         ),
         key=lambda worker: str(worker.id),
     )
+    worker_by_id = {str(worker.id): worker for worker in workers}
     visible_resources = set(turn.resource_cells)
     all_resources = _known_resources | visible_resources
     cooled_resources = {
@@ -749,9 +754,45 @@ def _worker_resource_assignments(
         )
         if occupant is not None:
             fixed[str(occupant.id)] = resource
+
+    # 保留仍然有效的短期认领。当前可见资源优先于历史认领：一旦本 Tick
+    # 看见真实节点，旧历史认领释放回匹配池，但已经认领的可见节点继续由
+    # 原 Worker 负责，直到采集成功、失败或资源从可见视野中被确认消失。
+    for worker_id, target in list(_resource_claims.items()):
+        worker = worker_by_id.get(worker_id)
+        if (
+            worker is None
+            or worker.cargo != 0
+            or target not in eligible_resources
+            or target in blocked_resources
+            or (visible_resources and target not in visible_resources)
+        ):
+            del _resource_claims[worker_id]
+
+    # 防御性去重：重启/旧版本状态不应让两个 Worker 同时追同一坐标。
+    claimants: dict[tuple[int, int], list[str]] = {}
+    for worker_id, target in _resource_claims.items():
+        claimants.setdefault(target, []).append(worker_id)
+    for target, worker_ids in claimants.items():
+        for worker_id in sorted(worker_ids)[1:]:
+            del _resource_claims[worker_id]
+
+    for worker_id, target in list(_resource_claims.items()):
+        if worker_id in fixed or target in fixed.values():
+            del _resource_claims[worker_id]
+
     fixed_worker_ids = set(fixed)
     workers = [worker for worker in workers if str(worker.id) not in fixed_worker_ids]
-    resources = sorted(eligible_resources - blocked_resources - set(fixed.values()))
+    retained = {
+        worker_id: target
+        for worker_id, target in _resource_claims.items()
+        if worker_id in {str(worker.id) for worker in workers}
+    }
+    retained_worker_ids = set(retained)
+    retained_targets = set(retained.values())
+    resources = sorted(
+        eligible_resources - blocked_resources - set(fixed.values()) - retained_targets
+    )
     _resource_telemetry.update(
         {
             "blocked": len((all_resources & blocked_resources) - set(fixed.values())),
@@ -761,8 +802,15 @@ def _worker_resource_assignments(
     # 只要候选里混有历史提示，就保留一个没有站在可见资源上的 Worker 做前沿
     # 扫描。这样历史点不能在可见资源出现时把全队锁死，同时站在可见资源格的
     # Worker 仍会优先采集。
-    dispatch_workers = workers
-    history_resources = set(resources) - visible_resources
+    dispatch_workers = [
+        worker for worker in workers if str(worker.id) not in retained_worker_ids
+    ]
+    assignments = fixed | retained
+    history_resources = {
+        resource
+        for resource in eligible_resources - visible_resources - blocked_resources
+        if resource not in fixed.values()
+    }
     explorer_candidates = [
         worker for worker in workers if tuple(worker.position) not in visible_resources
     ]
@@ -774,7 +822,7 @@ def _worker_resource_assignments(
     ):
         core_pos = turn.core.position if turn.core is not None else (0, 0)
         visible_targets = visible_resources & set(resources)
-        priority_targets = visible_targets or set(resources)
+        priority_targets = visible_targets or (history_resources | retained_targets)
 
         def explorer_score(worker: "Worker") -> tuple[int, int, str]:
             # 有可见资源时保护其最近采集者；只有历史提示时，则保护离历史
@@ -793,11 +841,28 @@ def _worker_resource_assignments(
             explorer_candidates,
             key=explorer_score,
         )
-        dispatch_workers = [worker for worker in workers if worker is not explorer]
+        explorer_id = str(explorer.id)
+        # 历史目标可以让位给前沿探索；当前可见目标不能被这个保留名额抢走。
+        if explorer_id in retained and retained[explorer_id] not in visible_resources:
+            retained_targets.discard(retained.pop(explorer_id))
+            retained_worker_ids.discard(explorer_id)
+            assignments.pop(explorer_id, None)
+            resources = sorted(
+                eligible_resources
+                - blocked_resources
+                - set(fixed.values())
+                - retained_targets
+            )
+        dispatch_workers = [
+            worker
+            for worker in workers
+            if str(worker.id) not in retained_worker_ids and worker is not explorer
+        ]
         _resource_telemetry["explore_reserved"] = 1
 
     if not dispatch_workers or not resources:
-        assignments = fixed
+        _resource_claims.clear()
+        _resource_claims.update(assignments)
         _resource_telemetry.update(
             {
                 "assignments": len(assignments),
@@ -836,7 +901,7 @@ def _worker_resource_assignments(
             for worker in dispatch_workers
         ]
         columns = _minimum_assignment(costs)
-        assignments = fixed | {
+        assignments = assignments | {
             str(worker.id): resources[column]
             for worker, column in zip(dispatch_workers, columns, strict=True)
         }
@@ -857,10 +922,12 @@ def _worker_resource_assignments(
             for resource in resources
         ]
         columns = _minimum_assignment(costs)
-        assignments = fixed | {
+        assignments = assignments | {
             str(dispatch_workers[column].id): resource
             for resource, column in zip(resources, columns, strict=True)
         }
+    _resource_claims.clear()
+    _resource_claims.update(assignments)
     _resource_telemetry.update(
         {
             "assignments": len(assignments),
@@ -2831,6 +2898,9 @@ def _observe_resources(turn: "Turn") -> None:
             changed = changed or cell in _known_resources or cell in _resource_hints
             _known_resources.discard(cell)
             _resource_hints.pop(cell, None)
+            for worker_id, target in list(_resource_claims.items()):
+                if target == cell:
+                    del _resource_claims[worker_id]
     # The complete current state is authoritative over previous-Tick events.
     # A dropped-cargo pile can remain after a partial harvest, and a natural
     # node can refill at the same coordinate.
@@ -2865,6 +2935,9 @@ def _observe_resources(turn: "Turn") -> None:
         if _any_vision_sees(cell, sources, obstacles):
             _known_resources.discard(cell)
             _resource_hints.pop(cell, None)
+            for worker_id, target in list(_resource_claims.items()):
+                if target == cell:
+                    del _resource_claims[worker_id]
             changed = True
     # Drought is about *current visibility*, not the existence of a remembered
     # hint.  A historical node is only a stale coordinate promise: it may have
@@ -3005,6 +3078,9 @@ def _process_events(turn: "Turn") -> None:
             if cell in _known_resources or cell in _resource_hints:
                 _known_resources.discard(cell)
                 _resource_hints.pop(cell, None)
+                for worker_id, target in list(_resource_claims.items()):
+                    if target == cell:
+                        del _resource_claims[worker_id]
                 resource_invalidated = True
         if event.event_type == "WORKER_CARGO_DROPPED":
             continue

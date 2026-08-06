@@ -49,6 +49,7 @@ def _reset_explore_state(tmp_path, monkeypatch) -> None:
     tactic._explore_target_failures.clear()
     tactic._explore_progress.clear()
     tactic._known_resources.clear()
+    tactic._resource_claims.clear()
     tactic._resource_hints.clear()
     tactic._resource_telemetry.clear()
     tactic._resource_absence_streak = 0
@@ -67,6 +68,7 @@ def _reset_explore_state(tmp_path, monkeypatch) -> None:
     tactic._explore_target_failures.clear()
     tactic._explore_progress.clear()
     tactic._known_resources.clear()
+    tactic._resource_claims.clear()
     tactic._resource_hints.clear()
     tactic._resource_telemetry.clear()
     tactic._resource_absence_streak = 0
@@ -348,6 +350,32 @@ def test_visible_resource_keeps_nearest_worker_out_of_exploration_slot() -> None
     assert assignments[nearest_worker] == visible
     assert distant_worker not in assignments
     assert tactic._resource_telemetry["explore_reserved"] == 1
+
+
+def test_visible_resource_claim_stays_with_worker_until_resolution() -> None:
+    """移动中的 Worker 不应因另一名 Worker 变近而丢失当前资源认领。"""
+    cell = (10, 0)
+    first_id = str(UUID(int=0x6000))
+    second_id = str(UUID(int=0x6001))
+
+    first_turn = _turn(
+        _workers_state([(8, 0), (4, 0)], resources=[cell]),
+        tick=20,
+    )
+    tactic._observe_resources(first_turn)
+    first_assignments = tactic._worker_resource_assignments(first_turn)
+    assert first_assignments == {first_id: cell}
+
+    # 第二名 Worker 现在更接近资源。每 Tick 重新匹配会换主并制造绕点运动；
+    # 短期认领应一直保留到采集成功或明确失败。
+    second_turn = _turn(
+        _workers_state([(7, 0), (9, 0)], resources=[cell]),
+        tick=21,
+    )
+    tactic._observe_resources(second_turn)
+    second_assignments = tactic._worker_resource_assignments(second_turn)
+    assert second_assignments == {first_id: cell}
+    assert second_id not in second_assignments
 
 
 def test_very_old_history_hint_is_not_an_active_resource_target() -> None:
