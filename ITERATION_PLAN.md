@@ -31,7 +31,7 @@
 
 | 优先级 | 任务 | 状态 | 目的 | 执行顺序 |
 |---:|---|---|---|---:|
-| P0 | `OBS-001` 决策耗时与唯一 Tick 观测 | `APPROVED` | 建立可信性能/链路基线，行为零变化 | 1 |
+| P0 | `OBS-001` 决策耗时与唯一 Tick 观测 | `OBSERVING` | 建立可信性能/链路基线，行为零变化 | 1 |
 | P1 | `RULE-001` 修复 `4ed9c8d` 规则与策略缺陷 | `PROPOSED` | 防止错误目标优先、资源争用和不可达军备目标 | 2 |
 | P1 | `EXP-001` 历史资源与探索名额竞争 | `DISCOVERED` | 避免所有 Worker 被陈旧历史点占满 | 3 |
 | P2 | `PERF-001` 前 K 候选 A* / EV | `DISCOVERED` | 降低全量搜索，升级往返收益估计 | 4 |
@@ -65,6 +65,19 @@
 - 基线：累计 500 个唯一成功 Tick，覆盖至少一次资源刷新；
   `plan_ms P50 < 250ms`、`P95 < 1000ms`、`P99 < 2000ms`。
 - 停止：任一 `COMMAND_WINDOW_CLOSED`，或计时日志改变原计划内容，立即拒绝。
+
+### 主代理验收记录（2026-08-06）
+
+- **静态结果**：`100 passed`；`compileall`、`uv sync --locked --dry-run`、`uv pip check`、
+  `git diff --check` 全部通过。日志新增固定错误码，失败 Tick、重复 Tick 与成功唯一 Tick
+  分开统计；JSON 不再输出无界 Tick ID 集合。
+- **canary 结果**：LaunchAgent `io.arenahero.tactic` 仅 PID `76462`；窗口 `t60286..t60305`
+  共 20 个成功且唯一 Tick，重复 `0`，失败 `0`，`COMMAND_WINDOW_CLOSED` `0`，认证/协议/提交
+  错误 `0`。`decide_ms` P50/P95/P99 为 `141/177.55/231.51ms`，满足计划门槛。
+- **观察限制**：同窗只有 `1` 次交付、`0` 次采集，监控触发 `LOW_HARVEST`；当前战场仅有 1 个
+  Worker，且另有未提交的 `tactic.py` 外部改动，本轮不将资源行为归因于 telemetry。500 个唯一
+  成功 Tick、资源刷新覆盖和收益主指标尚未完成，因此状态保持 `OBSERVING`，禁止宣称优化完成。
+- **代码交付**：`8cd6f20` 已推送到 `origin/codex/obs-001-timing`；治理文档基线合并提交待推送。
 
 ## 待批准修复：`RULE-001`
 
