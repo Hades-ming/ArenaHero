@@ -32,6 +32,7 @@ RE_RES = re.compile(r"r(\d+)/(\d+)")
 RE_POP = re.compile(r"pop(\d+)\(W(\d+) V(\d+) R(\d+)\)")
 RE_CORE = re.compile(r"core@([^ ]+) hp(\d+)/sh(\d+)/(\w+)")
 RE_VIS = re.compile(r"vis(\d+)\[([^\]]*)\]")
+RE_VIS_CORE = re.compile(r"(?:^|,)-?\d+,-?\d+C(?:,|$)")
 RE_ECO = re.compile(r"eco\[([^\]]*)\]")
 RE_EV = re.compile(r"ev\[([^\]]*)\]")
 RE_TM = re.compile(r"TM\[(\d+),(\d+),(\d+)\]")
@@ -41,7 +42,7 @@ RE_LEGACY_SKIP = re.compile(r"^t(\d+)\s+submit_skipped\s+\(([^)\r\n]+)\)")
 
 # Bottleneck thresholds (tunable).
 IDLE_GOLD_TICKS = 15        # resources == capacity for this many CONSECUTIVE ticks => under-investing
-STUCK_MOVE_THRESHOLD = 0.10  # fraction of MOVE events that fail CELL_UNIT_LIMIT => clumping
+STUCK_MOVE_THRESHOLD = 0.10  # fraction of MOVE events that fail => clumping
 CORE_HP_WARN = 4             # core hp at/below this (or shield < cap under threat) => defense failing
 LOW_HARVEST_PER_TICK = 0.05  # harvests per tick below this => exploration stalled
 RESOURCE_DROP_THRESHOLD = 10  # single-tick resource drop > this with no spawn => unexplained loss
@@ -81,7 +82,9 @@ class KPI:
     harvest: int = 0
     deposit: int = 0
     spawn: int = 0
+    move_failed: int = 0
     move_failed_cell: int = 0
+    move_failed_contested: int = 0
     move_succeeded: int = 0
     unit_died: int = 0
     core_under_attack: int = 0
@@ -93,6 +96,7 @@ class KPI:
     resource_drops: int = 0         # ticks where resources fell > RESOURCE_DROP_THRESHOLD w/o spawn
     largest_drop: int = 0
     ticks_with_enemy_visible: int = 0
+    ticks_with_enemy_core_visible: int = 0
     resource_assignments: int = 0
     visible_resource_assignments: int = 0
     history_resource_assignments: int = 0
@@ -179,6 +183,7 @@ def _parse_line(line: str) -> dict | None:
     if m:
         rec["vis_n"] = int(m.group(1))
         rec["vis_body"] = m.group(2)
+        rec["vis_core"] = bool(RE_VIS_CORE.search(m.group(2)))
     m = RE_ECO.search(line)
     if m:
         rec["eco"] = {
@@ -273,6 +278,8 @@ def analyze(path: str | Path) -> KPI:
                 kpi.core_status_last = rec["core_status"]
             if "vis_n" in rec and rec["vis_n"] > 0:
                 kpi.ticks_with_enemy_visible += 1
+                if rec.get("vis_core"):
+                    kpi.ticks_with_enemy_core_visible += 1
             eco = rec.get("eco", {})
             kpi.resource_assignments += eco.get("a", 0)
             kpi.visible_resource_assignments += eco.get("av", 0)
@@ -292,8 +299,13 @@ def analyze(path: str | Path) -> KPI:
                     kpi.deposit += 1
                 elif base == "SPAWN_SUCCEEDED":
                     kpi.spawn += 1
-                elif base == "UNIT_MOVE_FAILED.CELL_UNIT_LIMIT":
-                    kpi.move_failed_cell += 1
+                elif base.startswith("UNIT_MOVE_FAILED."):
+                    kpi.move_failed += 1
+                    reason = base.partition(".")[2]
+                    if reason == "CELL_UNIT_LIMIT":
+                        kpi.move_failed_cell += 1
+                    elif reason == "MOVE_CONTESTED":
+                        kpi.move_failed_contested += 1
                 elif base == "UNIT_MOVE_SUCCEEDED":
                     kpi.move_succeeded += 1
                 elif base == "UNIT_DIED":
@@ -340,21 +352,26 @@ def detect_bottlenecks(kpi: KPI) -> list[str]:
             f"consecutive ticks (last {kpi.resources_last}/{kpi.capacity_last}) "
             f"— capital not working"
         )
-    moves = kpi.move_failed_cell + kpi.move_succeeded
-    if moves > 0 and kpi.move_failed_cell / moves > STUCK_MOVE_THRESHOLD:
+    # ``move_failed_cell`` predates the reason-aware counter. Keep it as a
+    # fallback for callers constructing KPI objects from the old schema.
+    failed_moves = max(kpi.move_failed, kpi.move_failed_cell)
+    moves = failed_moves + kpi.move_succeeded
+    if moves > 0 and failed_moves / moves > STUCK_MOVE_THRESHOLD:
         alerts.append(
-            f"UNIT_CLUMPING: {kpi.move_failed_cell}/{moves} move events blocked "
-            f"({kpi.move_failed_cell / moves:.1%}) — units blocked (often a few "
-            f"deadlocked Workers, not a full-team jam)"
+            f"UNIT_CLUMPING: {failed_moves}/{moves} move events blocked "
+            f"({failed_moves / moves:.1%}; CELL_UNIT_LIMIT {kpi.move_failed_cell}, "
+            f"MOVE_CONTESTED {kpi.move_failed_contested}) — units blocked "
+            f"(often a few deadlocked Workers, not a full-team jam)"
         )
     if kpi.core_hp_min <= CORE_HP_WARN or kpi.core_died > 0:
         alerts.append(
             f"CORE_DEFENSE: core hp dipped to {kpi.core_hp_min} "
             f"(died {kpi.core_died}x) — defense failed, stored resources lost"
         )
-    if kpi.enemy_core_destroyed == 0 and kpi.ticks_with_enemy_visible > 0:
+    if kpi.enemy_core_destroyed == 0 and kpi.ticks_with_enemy_core_visible > 0:
         alerts.append(
-            f"NO_RAID: enemies were visible for {kpi.ticks_with_enemy_visible} ticks "
+            f"NO_RAID: enemy Cores were visible for "
+            f"{kpi.ticks_with_enemy_core_visible} ticks "
             f"but 0 enemy Cores destroyed — a raid was available but not taken "
             f"(note: enemy-core loot is variable via CORE_RESOURCES_CAPTURED, not a "
             f"flat +6; see LESSONS L10)"
@@ -408,6 +425,7 @@ def detect_bottlenecks(kpi: KPI) -> list[str]:
 def report(kpi: KPI, alerts: list[str]) -> str:
     if kpi.records == 0:
         return "No game data to report."
+    failed_moves = max(kpi.move_failed, kpi.move_failed_cell)
     lines = []
     lines.append("=" * 60)
     lines.append("ARENA HERO — BATTLE TELEMETRY")
@@ -454,12 +472,15 @@ def report(kpi: KPI, alerts: list[str]) -> str:
         f"{kpi.enemy_core_destroyed} enemy cores destroyed"
     )
     lines.append(
-        f"Friction       : {kpi.move_failed_cell} blocked moves, "
+        f"Friction       : {failed_moves} blocked moves "
+        f"(CELL_UNIT_LIMIT {kpi.move_failed_cell}, "
+        f"MOVE_CONTESTED {kpi.move_failed_contested}), "
         f"{kpi.resource_not_found} resource-not-found, "
         f"{kpi.core_move_failed} core-move-failed"
     )
     lines.append(
-        f"Enemy visible  : {kpi.ticks_with_enemy_visible} ticks"
+        f"Enemy visible  : {kpi.ticks_with_enemy_visible} ticks "
+        f"(enemy Core {kpi.ticks_with_enemy_core_visible})"
     )
     if kpi.decide_ms_list:
         n = len(kpi.total_ms_list)

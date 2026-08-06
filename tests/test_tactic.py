@@ -2943,6 +2943,54 @@ def test_monitor_backward_compat_no_timing() -> None:
     assert "total_ms" not in rec
 
 
+def test_monitor_classifies_move_failures_and_enemy_core_visibility(tmp_path) -> None:
+    from meta import monitor
+
+    line = (
+        "t100 r5/10 pop2(W2 V0 R0) core@0,0 hp5/sh5/NORMAL "
+        "W[-] O[-] vis2[4,4C,5,5WORKER] res0[] obs0 beacon0,0 "
+        "eco[a0,av0,ah0,blk0,cool0,unr0,harv0,dep0] "
+        "TM[1,2,3] ST[ACCEPTED] "
+        "ev[UNIT_MOVE_FAILED.MOVE_CONTESTED;UNIT_MOVE_FAILED.CELL_UNIT_LIMIT;"
+        "UNIT_MOVE_SUCCEEDED] plan[-]\n"
+    )
+    log_path = tmp_path / "game.log"
+    log_path.write_text(line, encoding="utf-8")
+
+    record = monitor._parse_line(line)
+    assert record is not None
+    assert record["vis_core"] is True
+
+    kpi = monitor.analyze(log_path)
+    assert kpi.move_failed == 2
+    assert kpi.move_failed_contested == 1
+    assert kpi.move_failed_cell == 1
+    assert kpi.move_succeeded == 1
+    assert kpi.ticks_with_enemy_visible == 1
+    assert kpi.ticks_with_enemy_core_visible == 1
+    alerts = monitor.detect_bottlenecks(kpi)
+    assert any("UNIT_CLUMPING" in alert for alert in alerts)
+    assert any("NO_RAID" in alert for alert in alerts)
+
+
+def test_monitor_does_not_call_worker_visibility_no_raid(tmp_path) -> None:
+    from meta import monitor
+
+    line = (
+        "t100 r5/10 pop2(W2 V0 R0) core@0,0 hp5/sh5/NORMAL "
+        "W[-] O[-] vis1[5,5WORKER] res0[] obs0 beacon0,0 "
+        "eco[a0,av0,ah0,blk0,cool0,unr0,harv0,dep0] "
+        "TM[1,2,3] ST[ACCEPTED] ev[] plan[-]\n"
+    )
+    log_path = tmp_path / "game.log"
+    log_path.write_text(line, encoding="utf-8")
+
+    kpi = monitor.analyze(log_path)
+    assert kpi.ticks_with_enemy_visible == 1
+    assert kpi.ticks_with_enemy_core_visible == 0
+    assert not any("NO_RAID" in alert for alert in monitor.detect_bottlenecks(kpi))
+
+
 def test_unique_tick_dedup() -> None:
     from meta.monitor import analyze, KPI
     import tempfile
