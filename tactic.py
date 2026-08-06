@@ -224,10 +224,33 @@ def _next_explore_col_off(
     return best_off
 
 
-# Sweep radius cap: a worker explores within this Manhattan radius of the Core
-# only. Beyond it the deposit round trip is a net loss and workers were observed
-# stranding 60-88 cells out (never returning). Steers back toward the Core.
+# Sweep radius cap: a worker normally explores within this Manhattan radius of
+# the Core. Beyond it the deposit round trip is a net loss and workers were
+# observed stranding 60-88 cells out (never returning). A prolonged resource
+# drought temporarily expands the *empty-worker* frontier so refill nodes in a
+# neighbouring chunk can be discovered; laden workers still use the fixed
+# return path below.
 MAX_SWEEP_RADIUS = 40
+MAX_DROUGHT_SWEEP_RADIUS = 96
+DROUGHT_EXPAND_EVERY = 8
+DROUGHT_EXPAND_STEP = 16
+
+
+def _exploration_radius() -> int:
+    """Return the current empty-worker discovery radius.
+
+    The server refills natural nodes every four Ticks, so a zero-resource
+    window is meaningful only after several refill opportunities. Expanding in
+    16-cell steps keeps normal delivery trips short while eventually reaching
+    adjacent chunks when the home chunk remains empty.
+    """
+    if _resource_absence_streak < DROUGHT_EXPAND_EVERY + 1:
+        return MAX_SWEEP_RADIUS
+    steps = (_resource_absence_streak - 1) // DROUGHT_EXPAND_EVERY
+    return min(
+        MAX_DROUGHT_SWEEP_RADIUS,
+        MAX_SWEEP_RADIUS + steps * DROUGHT_EXPAND_STEP,
+    )
 
 # Per-Worker exploration memory, keyed by the Unit UUID string. Each entry is
 # [direction_index_into_DIRECTIONS, steps_taken_in_this_leg]. This is not a
@@ -309,6 +332,7 @@ class ResourceHint:
 
 _resource_hints: dict[tuple[int, int], ResourceHint] = {}
 _resource_telemetry: dict[str, int] = {}
+_resource_absence_streak = 0
 _RESOURCE_COOLDOWN_BASE = 4
 _RESOURCE_COOLDOWN_CAP = 64
 _RESOURCE_FAILURE_CAP = 5
@@ -890,9 +914,11 @@ def _frontier_candidates(
     core_pos: tuple[int, int],
     blocked: frozenset[tuple[int, int]],
     tick: int | None = None,
+    radius: int | None = None,
 ) -> list[tuple[int, int]]:
     """Build unknown boundary cells, with a radial cold-start fallback."""
     effective_tick = 0 if tick is None else tick
+    radius_limit = MAX_SWEEP_RADIUS if radius is None else radius
     _prune_explore_target_cooldowns(effective_tick)
 
     def eligible(cell: tuple[int, int]) -> bool:
@@ -910,7 +936,7 @@ def _frontier_candidates(
             if (
                 eligible(cell)
                 and cell != core_pos
-                and _manhattan(cell, core_pos) <= MAX_SWEEP_RADIUS
+                and _manhattan(cell, core_pos) <= radius_limit
             ):
                 candidates.add(cell)
     if not candidates:
@@ -957,8 +983,10 @@ def _assign_explore_targets(
     core_pos: tuple[int, int],
     blocked: frozenset[tuple[int, int]],
     tick: int = 0,
+    radius: int | None = None,
 ) -> dict[str, tuple[int, int]]:
     """Assign stable, mutually separated frontier targets to idle Workers."""
+    radius_limit = _exploration_radius() if radius is None else radius
     _prune_explore_target_cooldowns(tick)
     live_ids = {worker_id for worker_id, _ in workers}
     for worker_id in list(_explore_targets):
@@ -968,12 +996,14 @@ def _assign_explore_targets(
             or target in blocked
             or _explore_target_is_cooled(target, tick)
             or _frontier_gain(target, blocked) == 0
-            or _manhattan(target, core_pos) > MAX_SWEEP_RADIUS
+            or _manhattan(target, core_pos) > radius_limit
         ):
             _explore_progress.pop(worker_id, None)
             del _explore_targets[worker_id]
 
-    candidates = _frontier_candidates(core_pos, blocked, tick=tick)
+    candidates = _frontier_candidates(
+        core_pos, blocked, tick=tick, radius=radius_limit
+    )
     selected = list(_explore_targets.values())
     sector_counts: Counter[tuple[int, int]] = Counter(
         _explore_sector(target, core_pos) for target in selected
@@ -1375,6 +1405,7 @@ def _explore_step(
     avoid: frozenset[tuple[int, int]] | None = None,
     force_band: int | None = None,
     fleet_size: int = 1,
+    sweep_radius: int | None = None,
 ) -> Direction | None:
     """Return one chunk-anchored boustrophedon step for a Worker.
 
@@ -1432,7 +1463,10 @@ def _explore_step(
         south_init = 0 if worker_index % 2 == 0 else 1
         state = [0, south_init, None, None]
         _explore_state[worker_id] = state
-    # Sweep-radius cap: a worker must not wander beyond economic reach of the
+    # Sweep-radius cap: a worker must not wander beyond the current discovery
+    # radius. Empty workers may expand this radius during a resource drought;
+    # laden workers never call this path unless the Core is full and use the
+    # fixed default instead.
     # Core (the deposit sink). Past ~40 cells the delivery round trip is a net
     # loss AND the worker never returns — observed workers stranded 60-88 cells
     # out (x 30-44, y 276-297) while north resources near the Core sat
@@ -1442,7 +1476,8 @@ def _explore_step(
     # changes the locally preferred A* branch, clearing history every Tick can
     # make the Worker oscillate between the same two cells outside the scan
     # radius.
-    if _manhattan(pos, core_pos) > MAX_SWEEP_RADIUS:
+    radius_limit = MAX_SWEEP_RADIUS if sweep_radius is None else sweep_radius
+    if _manhattan(pos, core_pos) > radius_limit:
         step = _astar_step(pos, core_pos, blocked, blocked)
         avoid = _avoid_set(worker_id)
         if step is not None and avoid is not None:
@@ -1615,6 +1650,7 @@ def _threats_to_core(
 
 def _control_workers(turn: "Turn", core_pos: tuple[int, int]) -> None:
     resource_cells = turn.resource_cells
+    explore_radius = _exploration_radius()
     # Base blocked set: obstacle terrain plus visible enemy Core/Unit cells.
     # A Worker that steps onto an enemy cell fails with MOVE_DESTINATION_OCCUPIED
     # every tick and deadlocks, so enemy positions must be routed around.
@@ -1956,6 +1992,7 @@ def _control_workers(turn: "Turn", core_pos: tuple[int, int]) -> None:
                 orig_index, wid, pos, core_pos, blocked_empty,
                 target_col=None, avoid=_avoid_set(wid),
                 fleet_size=len(turn.workers),
+                sweep_radius=explore_radius,
             )
         if step is not None:
             _prev_pos[wid] = pos
@@ -2761,7 +2798,7 @@ def _observe_resources(turn: "Turn") -> None:
     Add newly-visible resources; remove cells confirmed bare (visible and NOT
     a resource); remove cells harvested successfully this Tick.
     """
-    global _known_resources, _resource_telemetry
+    global _known_resources, _resource_telemetry, _resource_absence_streak
     _resource_telemetry = {
         "resource_failures": sum(
             1
@@ -2827,6 +2864,19 @@ def _observe_resources(turn: "Turn") -> None:
             _known_resources.discard(cell)
             _resource_hints.pop(cell, None)
             changed = True
+    active_hints = any(
+        _resource_age(cell, turn.tick) <= _MAX_HISTORY_RESOURCE_AGE
+        and _resource_hints.get(cell, ResourceHint(0, "legacy")).cooldown_until
+        <= turn.tick
+        for cell in _known_resources
+    )
+    if turn.resource_cells or active_hints:
+        _resource_absence_streak = 0
+    else:
+        _resource_absence_streak += 1
+    # Keep this internal value available to live diagnostics without changing
+    # the compact log contract consumed by existing monitor tests.
+    _resource_telemetry["drought"] = _resource_absence_streak
     if changed:
         _mark_persistent_state_dirty()
 

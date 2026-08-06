@@ -51,6 +51,7 @@ def _reset_explore_state(tmp_path, monkeypatch) -> None:
     tactic._known_resources.clear()
     tactic._resource_hints.clear()
     tactic._resource_telemetry.clear()
+    tactic._resource_absence_streak = 0
     tactic._persistent_state_dirty = False
     tactic._known_obstacles.clear()
     tactic._known_enemy_cores.clear()
@@ -68,6 +69,7 @@ def _reset_explore_state(tmp_path, monkeypatch) -> None:
     tactic._known_resources.clear()
     tactic._resource_hints.clear()
     tactic._resource_telemetry.clear()
+    tactic._resource_absence_streak = 0
     tactic._persistent_state_dirty = False
     tactic._known_obstacles.clear()
     tactic._known_enemy_cores.clear()
@@ -1010,6 +1012,35 @@ def test_frontier_targets_stay_near_current_core_after_migration() -> None:
     )
 
     assert tactic._manhattan(targets[worker_id], (0, 0)) <= tactic.MAX_SWEEP_RADIUS
+
+
+def test_resource_drought_expands_empty_worker_frontier() -> None:
+    # A fully scanned home radius must not trap every Worker in a dead ring
+    # while refill nodes are being placed in a neighbouring chunk.
+    tactic._explored_cells.update(
+        (x, y)
+        for x in range(-tactic.MAX_SWEEP_RADIUS, tactic.MAX_SWEEP_RADIUS + 1)
+        for y in range(-tactic.MAX_SWEEP_RADIUS, tactic.MAX_SWEEP_RADIUS + 1)
+        if abs(x) + abs(y) <= tactic.MAX_SWEEP_RADIUS
+    )
+    tactic._resource_absence_streak = tactic.DROUGHT_EXPAND_EVERY * 2 + 1
+
+    radius = tactic._exploration_radius()
+    assert radius > tactic.MAX_SWEEP_RADIUS
+    candidates = tactic._frontier_candidates(
+        (0, 0), frozenset(), tick=20, radius=radius
+    )
+    assert any(tactic._manhattan(cell, (0, 0)) > tactic.MAX_SWEEP_RADIUS for cell in candidates)
+
+
+def test_visible_resource_resets_drought_expansion() -> None:
+    tactic._resource_absence_streak = tactic.MAX_DROUGHT_SWEEP_RADIUS
+    turn = _turn(_workers_state([(0, 1)], resources=[(3, 0)]), tick=20)
+
+    tactic._observe_resources(turn)
+
+    assert tactic._resource_absence_streak == 0
+    assert tactic._exploration_radius() == tactic.MAX_SWEEP_RADIUS
 
 
 def test_astar_rejects_blocked_goal_unless_explicitly_allowed() -> None:
