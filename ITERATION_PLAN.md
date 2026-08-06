@@ -7,7 +7,7 @@
 | 字段 | 当前值 |
 |---|---|
 | 轮次 | `2026-08-06-R1` |
-| 基线提交 | `4ed9c8d393e0b03e6fa0c147d5d926912deba28e` |
+| 基线提交 | `df14f9ac85cb0dfcdd12df3833410e1f7909cbc2` |
 | 规则 / SDK | gameplay `v0.13` / Python SDK `0.2.8` |
 | 官方版本复核 | 2026-08-06，官方 source/version 与本地 bundle 一致 |
 | 最终目标 | 长期得到最多资源 |
@@ -42,7 +42,7 @@
 
 - **负责人**：待用户安排外部执行 Agent；主代理只负责审查、验收与上线决定。
 - **base SHA**：`4ed9c8d393e0b03e6fa0c147d5d926912deba28e`。
-- **建议分支 / worktree**：`codex/obs-001-timing` / 仓库外独立目录；是否开始由用户决定。
+- **执行位置**：现有 `main` 工作区；后续修复不再新建分支或 worktree。
 - **允许文件**：`play.py`、`meta/monitor.py`、`tests/test_tactic.py`。
 - **禁止文件**：`.env`、`tactic.py`、`tactic_state.json`、所有运行日志和 LaunchAgent。
 - **问题**：当前只有动作/事件计数，没有 `decide`、`submit`、总本地耗时和唯一 Tick 口径，
@@ -120,12 +120,30 @@
 - **canary 前状态**：旧进程仍运行的是 OBS-001 代码；重启后只验收新 Tick，不能把旧日志混入
   RULE-001 行为结论。主指标仍是唯一 Tick 的入核资源，规则修复不能替代 500 Tick 观察门槛。
 
+### `RETURN-001` 载货 Worker 回程反向振荡修复（2026-08-06）
+
+- **触发证据**：`t61479` 发现并分配资源 `[321,134]`，`t61485` 成功采集；载货 Worker
+  在敌 Core 与障碍附近回程时可能重新进入最近离开的格子，直到 `t61517` 仍未入核。
+- **根因**：载货回程的 A* 首步没有检查反向历史；回退路径还会无条件清空 `_pos_history`，使
+  动态阻塞改变局部最优分支后反复走同一短环。
+- **修复**：`_control_workers()` 对 A* 首步应用 `_avoid_set()`，命中最近历史格时改用避回头的
+  贪心步；仅在真正卡死时清理历史。补充
+  `test_laden_worker_return_does_not_backtrack_into_recent_cell`。
+- **提交与静态验收**：提交 `df14f9a` 已快进到 `main` 并推送；全量 `112 passed`，编译、依赖和
+  `git diff --check` 均通过。
+- **新进程 canary**：LaunchAgent 唯一 PID `26495`，窗口 `t61524..t61545` 共 `22` 个唯一
+  Tick，重复 `0`、失败 `0`、窗口错误 `0`、缺口 `0`；`decide_ms` P50/P95/P99 为
+  `23.5/43.7/72.44ms`，Core 保持 `hp5/sh5`。窗口自然资源为 `0`，因此采集/交付样本为 `0`，
+  只能证明链路和回程补丁未引入协议或时限回归，不能宣称资源收益已改善。
+- **后续门槛**：继续在单实例 `main` 进程上累计至少 `200` 个唯一 Tick、`50` 次完整
+  `HARVEST_SUCCEEDED -> DEPOSIT_SUCCEEDED`，再评估回程 P50/P95 和入核资源/Tick。
+
 ## 候选资源实验：`EXP-001`
 
 - **当前实现状态**：`STATIC_VERIFIED -> LIVE_CANARY`。本轮先落地保护性修复，不把它当作收益
   实验结论：历史提示超过 256 Tick 不再派发；无可见资源且空闲 Worker 达 3 个时保留 1 个前沿
   探索者；日志记录 `stale/exp` 供归因。
-- **静态证据（2026-08-06）**：109 个 pytest、compileall、`uv pip check`、`git diff --check`
+- **静态证据（2026-08-06）**：112 个 pytest、compileall、`uv pip check`、`git diff --check`
   通过。监控同时修复 Tick 缺口、失败提交耗时和 `CORE_SPAWN_SUCCEEDED` 计数。
 - **上线门槛**：重启后唯一 `play.py` 进程连续 20 Tick 无认证/协议/提交/窗口错误；随后至少
   200 个唯一 Tick、50 次历史分配和 50 个采集入核样本，再比较主指标，不足时保持观察态。
