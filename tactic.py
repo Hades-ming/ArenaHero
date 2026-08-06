@@ -713,9 +713,23 @@ def _worker_resource_assignments(
         and explorer_candidates
     ):
         core_pos = turn.core.position if turn.core is not None else (0, 0)
+        visible_targets = visible_resources & set(resources)
+
+        def explorer_score(worker: "Worker") -> tuple[int, int, str]:
+            # 先保留离当前可见资源最远的 Worker，避免把最近采集者误留在探索线。
+            visible_distance = min(
+                (_manhattan(worker.position, resource) for resource in visible_targets),
+                default=0,
+            )
+            return (
+                visible_distance,
+                _manhattan(worker.position, core_pos),
+                str(worker.id),
+            )
+
         explorer = max(
             explorer_candidates,
-            key=lambda worker: (_manhattan(worker.position, core_pos), str(worker.id)),
+            key=explorer_score,
         )
         dispatch_workers = [worker for worker in workers if worker is not explorer]
         _resource_telemetry["explore_reserved"] = 1
@@ -1559,7 +1573,8 @@ def _control_workers(turn: "Turn", core_pos: tuple[int, int]) -> None:
         # switching the sweep to a DIFFERENT column (clearing explore state
         # alone re-initializes to the SAME column and re-enters the pocket) and
         # stepping outward.
-        if _is_boxed_in(wid):
+        # 带货 Worker 必须优先回 Core；探索脱困会把它反向带离交付路线。
+        if worker.cargo == 0 and _is_boxed_in(wid):
             st = _explore_state.get(wid)
             col_off = st[0] if st is not None and len(st) >= 1 else 0
             # Keep the half-zone direction on escape (even -> north, odd ->

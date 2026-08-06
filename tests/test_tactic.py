@@ -309,6 +309,25 @@ def test_visible_resources_cover_workers_before_history_reservation() -> None:
     assert tactic._resource_telemetry["explore_reserved"] == 0
 
 
+def test_visible_resource_keeps_nearest_worker_out_of_exploration_slot() -> None:
+    visible = (321, 98)
+    remembered = (100, 0)
+    tactic._known_resources.add(remembered)
+    tactic._resource_hints[remembered] = tactic.ResourceHint(19, "history")
+    turn = _turn(
+        _workers_state([(321, 95), (345, 126)], resources=[visible]),
+        tick=20,
+    )
+
+    assignments = tactic._worker_resource_assignments(turn)
+
+    nearest_worker = str(turn.workers[0].id)
+    distant_worker = str(turn.workers[1].id)
+    assert assignments[nearest_worker] == visible
+    assert distant_worker not in assignments
+    assert tactic._resource_telemetry["explore_reserved"] == 1
+
+
 def test_very_old_history_hint_is_not_an_active_resource_target() -> None:
     cell = (100, 0)
     tactic._known_resources.add(cell)
@@ -3060,6 +3079,41 @@ def test_worker_harvests_resource_before_boxed_escape() -> None:
     action = _action(turn.plan, WORKER_ID)
     assert action is not None
     assert action.type == "HARVEST"
+
+
+def test_laden_worker_uses_return_path_before_boxed_escape() -> None:
+    state = _state(
+        objects=[
+            {
+                "kind": "CORE",
+                "id": str(CORE_ID),
+                "controlled": True,
+                "owner_username": "arena_hero",
+                "position": [0, 0],
+                "hp": 5,
+                "shield": 5,
+                "state": "NORMAL",
+            },
+            {
+                "kind": "UNIT",
+                "id": str(WORKER_ID),
+                "controlled": True,
+                "position": [3, 0],
+                "hp": 2,
+                "unit_type": "WORKER",
+                "cargo": 1,
+            },
+        ]
+    )
+    tactic._pos_history[str(WORKER_ID)] = [(3, 0), (4, 0), (3, 0), (4, 0)]
+
+    turn = _turn(state)
+    decide(turn)
+
+    action = _action(turn.plan, WORKER_ID)
+    assert action is not None
+    assert action.type == "MOVE"
+    assert action.direction == Direction.LEFT
 
 
 # ---------------------------------------------------------------------------
