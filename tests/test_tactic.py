@@ -53,6 +53,7 @@ def _reset_explore_state(tmp_path, monkeypatch) -> None:
     tactic._resource_hints.clear()
     tactic._resource_telemetry.clear()
     tactic._resource_absence_streak = 0
+    tactic._last_harvest_tick = None
     tactic._persistent_state_dirty = False
     tactic._known_obstacles.clear()
     tactic._known_enemy_cores.clear()
@@ -72,6 +73,7 @@ def _reset_explore_state(tmp_path, monkeypatch) -> None:
     tactic._resource_hints.clear()
     tactic._resource_telemetry.clear()
     tactic._resource_absence_streak = 0
+    tactic._last_harvest_tick = None
     tactic._persistent_state_dirty = False
     tactic._known_obstacles.clear()
     tactic._known_enemy_cores.clear()
@@ -237,17 +239,49 @@ def _workers_state(
     return _state(population=len(positions), objects=objects)
 
 
-def test_distant_known_resource_is_retained_and_assigned() -> None:
-    distant = (100, 0)
+def test_distant_history_resource_is_retained_but_not_assigned_when_healthy() -> None:
+    distant = (50, 0)
     tactic._known_resources.add(distant)
-    turn = _turn(_workers_state([(1, 0)]))
+    tactic._resource_hints[distant] = tactic.ResourceHint(19, "history")
+    turn = _turn(_workers_state([(1, 0)]), tick=20)
 
     tactic._observe_resources(turn)
 
     assert distant in tactic._known_resources
+    assert tactic._worker_resource_assignments(turn) == {}
+    assert tactic._resource_telemetry["far"] == 1
+
+
+def test_distant_history_resource_is_assigned_after_harvest_drought() -> None:
+    distant = (50, 0)
+    tactic._known_resources.add(distant)
+    tactic._resource_hints[distant] = tactic.ResourceHint(1, "history")
+    tactic._last_harvest_tick = 1
+    turn = _turn(_workers_state([(1, 0)]), tick=30)
+
+    assignments = tactic._worker_resource_assignments(turn)
+
+    assert assignments == {str(UUID(int=0x6000)): distant}
+    assert tactic._resource_telemetry["far"] == 0
+
+
+def test_visible_distant_resource_is_always_assignable() -> None:
+    distant = (50, 0)
+    turn = _turn(_workers_state([(1, 0)], resources=[distant]), tick=20)
+    tactic._observe_resources(turn)
+
     assert tactic._worker_resource_assignments(turn) == {
         str(UUID(int=0x6000)): distant
     }
+
+
+def test_worker_on_visible_distant_resource_harvests_immediately() -> None:
+    distant = (50, 0)
+    turn = _turn(_workers_state([distant], resources=[distant]), tick=20)
+
+    tactic._control_workers(turn, turn.core.position)
+
+    assert _action(turn.plan, UUID(int=0x6000)).type == "HARVEST"
 
 
 def test_history_dispatch_reserves_a_worker_for_exploration() -> None:
@@ -378,6 +412,40 @@ def test_visible_resource_claim_stays_with_worker_until_resolution() -> None:
     assert second_id not in second_assignments
 
 
+def test_history_claim_keeps_progress_until_visible_node_is_decisively_closer() -> None:
+    history = (20, 0)
+    visible = (15, 0)
+    first_id = str(UUID(int=0x6000))
+    tactic._known_resources.add(history)
+    tactic._resource_hints[history] = tactic.ResourceHint(19, "history")
+    tactic._resource_claims[first_id] = history
+    turn = _turn(
+        _workers_state([(12, 0), (0, 1)], resources=[visible]),
+        tick=20,
+    )
+
+    assignments = tactic._worker_resource_assignments(turn)
+
+    assert assignments[first_id] == history
+
+
+def test_history_claim_yields_when_visible_node_is_much_closer() -> None:
+    history = (20, 0)
+    visible = (13, 0)
+    first_id = str(UUID(int=0x6000))
+    tactic._known_resources.add(history)
+    tactic._resource_hints[history] = tactic.ResourceHint(19, "history")
+    tactic._resource_claims[first_id] = history
+    turn = _turn(
+        _workers_state([(12, 0), (0, 1)], resources=[visible]),
+        tick=20,
+    )
+
+    assignments = tactic._worker_resource_assignments(turn)
+
+    assert assignments[first_id] == visible
+
+
 def test_very_old_history_hint_is_not_an_active_resource_target() -> None:
     cell = (100, 0)
     tactic._known_resources.add(cell)
@@ -451,6 +519,30 @@ def test_control_workers_reports_exploration_reservation_without_resources() -> 
 
     assert tactic._resource_telemetry["explore_reserved"] == 1
     assert len(turn.plan.unit_actions) == 3
+
+
+def test_worker_destination_is_reserved_within_one_tick(monkeypatch) -> None:
+    """同 Tick 的两个 Worker 不应预约同一个下一格。"""
+    turn = _turn(_workers_state([(0, 2), (0, 2)]))
+
+    monkeypatch.setattr(
+        tactic,
+        "_assign_explore_targets",
+        lambda *args, **kwargs: {},
+    )
+    monkeypatch.setattr(
+        tactic,
+        "_explore_step",
+        lambda *args, **kwargs: Direction.RIGHT,
+    )
+
+    tactic._control_workers(turn, turn.core.position)
+
+    first_action = _action(turn.plan, UUID(int=0x6000))
+    second_action = _action(turn.plan, UUID(int=0x6001))
+    assert first_action is not None
+    assert first_action.direction == Direction.RIGHT
+    assert second_action is None
 
 
 def test_visible_resource_priority_over_nearer_history_hint() -> None:
@@ -724,7 +816,7 @@ def test_reloaded_cooldown_expires_and_restores_assignment(
 ) -> None:
     state_path = tmp_path / "tactic_state.json"
     monkeypatch.setattr(tactic, "_STATE_PATH", state_path)
-    cell = (100, 0)
+    cell = (25, 0)
     tactic._known_resources.add(cell)
     tactic._resource_hints[cell] = tactic.ResourceHint(
         last_confirmed_tick=5,
@@ -932,7 +1024,7 @@ def test_resource_telemetry_log_is_monitorable_and_never_contains_api_key(
     # Legacy callers may still omit the optional timing/status arguments.
     line = play._log_line(turn, accepted=None)
 
-    assert "eco[a1,av1,ah0,stale0,exp0,blk0,cool0,unr0,harv0,dep0]" in line
+    assert "eco[a1,av1,ah0,stale0,far0,exp0,blk0,cool0,unr0,harv0,dep0]" in line
     assert fake_key not in line
     record = monitor._parse_line(line)
     assert record is not None
@@ -941,6 +1033,7 @@ def test_resource_telemetry_log_is_monitorable_and_never_contains_api_key(
         "av": 1,
         "ah": 0,
         "stale": 0,
+        "far": 0,
         "exp": 0,
         "blk": 0,
         "cool": 0,
@@ -2844,6 +2937,19 @@ def test_peacetime_bridge_stops_after_twelfth_worker() -> None:
     assert _core_action(turn.plan) is None
 
 
+def test_full_peacetime_army_does_not_grow_workers_past_bridge_cap() -> None:
+    # Combat reserve complete should not reopen the larger population budget:
+    # the discovery bridge remains capped at W12 until a later policy changes it.
+    state = _state_with_workers(
+        n_workers=12, resources=8, n_vanguards=1, n_rangers=1
+    )
+    turn = _turn(state)
+
+    decide(turn)
+
+    assert _core_action(turn.plan) is None
+
+
 def test_visible_enemy_core_disables_worker_bridge() -> None:
     # A visible Core is an attack signal even when it is outside the local
     # threat radius.  Do not spend the bank on a Worker while the strike force
@@ -3798,6 +3904,32 @@ def test_monitor_detects_tick_gaps_and_counts_core_spawns(tmp_path) -> None:
     assert kpi.spawn == 1
     assert kpi.resource_drops == 0
     assert any("TICK_GAP" in alert for alert in monitor.detect_bottlenecks(kpi))
+
+
+def test_monitor_parses_compound_events_with_amount_payloads(tmp_path) -> None:
+    from meta import monitor
+
+    line = (
+        "t10 r5/10 pop2(W2 V0 R0) core@0,0 hp5/sh5/NORMAL "
+        "W[-] O[-] vis0[-] res0[] obs0 beacon0,0 "
+        "eco[a0,av0,ah0,blk0,cool0,unr0,harv1,dep1] "
+        "TM[1,2,3] ST[ACCEPTED] "
+        "ev[HARVEST_SUCCEEDED[1];CORE_SPAWN_SUCCEEDED;DEPOSIT_SUCCEEDED[1]] plan[-]\n"
+    )
+    log_path = tmp_path / "game.log"
+    log_path.write_text(line, encoding="utf-8")
+
+    record = monitor._parse_line(line)
+    assert record is not None
+    assert record["events"] == [
+        "HARVEST_SUCCEEDED[1]",
+        "CORE_SPAWN_SUCCEEDED",
+        "DEPOSIT_SUCCEEDED[1]",
+    ]
+    kpi = monitor.analyze(log_path)
+    assert kpi.harvest == 1
+    assert kpi.deposit == 1
+    assert kpi.spawn == 1
 
 
 @pytest.mark.parametrize(

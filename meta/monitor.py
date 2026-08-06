@@ -34,7 +34,11 @@ RE_CORE = re.compile(r"core@([^ ]+) hp(\d+)/sh(\d+)/(\w+)")
 RE_VIS = re.compile(r"vis(\d+)\[([^\]]*)\]")
 RE_VIS_CORE = re.compile(r"(?:^|,)-?\d+,-?\d+C(?:,|$)")
 RE_ECO = re.compile(r"eco\[([^\]]*)\]")
-RE_EV = re.compile(r"ev\[([^\]]*)\]")
+# Event payloads may contain their own amount brackets, e.g.
+# ``ev[HARVEST_SUCCEEDED[1];CORE_SPAWN_SUCCEEDED]``. Match the outer event
+# field by its following ``plan[`` delimiter instead of stopping at the first
+# inner closing bracket.
+RE_EV = re.compile(r"ev\[(.*?)\]\s+plan\[")
 RE_TM = re.compile(r"TM\[(\d+),(\d+),(\d+)\]")
 RE_STATUS = re.compile(r"ST\[([A-Z_]+)\]")
 RE_ERROR = re.compile(r"ER\[([A-Z0-9_.-]{1,64})\]")
@@ -102,6 +106,7 @@ class KPI:
     history_resource_assignments: int = 0
     blocked_resource_candidates: int = 0
     cooled_resource_candidates: int = 0
+    far_resource_candidates: int = 0
     stale_resource_candidates: int = 0
     explore_reservations: int = 0
     unreachable_resource_targets: int = 0
@@ -309,6 +314,7 @@ def analyze(path: str | Path) -> KPI:
             kpi.history_resource_assignments += eco.get("ah", 0)
             kpi.blocked_resource_candidates += eco.get("blk", 0)
             kpi.cooled_resource_candidates += eco.get("cool", 0)
+            kpi.far_resource_candidates += eco.get("far", 0)
             kpi.stale_resource_candidates += eco.get("stale", 0)
             kpi.explore_reservations += eco.get("exp", 0)
             kpi.unreachable_resource_targets += eco.get("unr", 0)

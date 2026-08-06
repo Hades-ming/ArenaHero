@@ -114,6 +114,12 @@ MIN_WORKERS_BEFORE_ARMY = 4
 # W12 so a mature V2 economy can add discovery capacity without crossing that
 # tier; any visible enemy still disables the bridge immediately.
 ECONOMY_BRIDGE_MAX_WORKERS = MIN_WORKERS_BEFORE_ARMY + 8
+# Healthy resource income should favor short round trips. A node farther away
+# remains in the persistent map, but it is only dispatched after a drought
+# makes the wider trip preferable to waiting idle.
+MAX_HARVEST_FROM_CORE = 30
+MAX_HARVEST_FROM_CORE_STARVED = 65
+HARVEST_STARVE_TICKS = 24
 # Peacetime standing reserve now SCALES with the Worker fleet via
 # _standing_army_targets (a floor of V1/R1, growing ~one combat pair per 8
 # Workers up to the first-price-step population budget). These legacy constants document
@@ -324,6 +330,10 @@ _known_resources: set[tuple[int, int]] = set()
 # 事实，也不落盘；当前可见资源一旦被认领，在到达前不因距离变化而换主，避免
 # 每 Tick 的全局匹配让 Worker 在两个候选之间来回改派。
 _resource_claims: dict[str, tuple[int, int]] = {}
+# 历史认领也保留少量迟滞：只有当前可见节点明显更近时才换主，避免 Worker
+# 已经走了很长一段路却因为一个短暂的可见节点反复掉头。可见节点仍会被空闲
+# Worker 正常匹配；这个阈值只保护已有且正在兑现的历史路线。
+_RESOURCE_CLAIM_SWITCH_MARGIN = 6
 
 
 @dataclass
@@ -339,6 +349,7 @@ class ResourceHint:
 _resource_hints: dict[tuple[int, int], ResourceHint] = {}
 _resource_telemetry: dict[str, int] = {}
 _resource_absence_streak = 0
+_last_harvest_tick: int | None = None
 _RESOURCE_COOLDOWN_BASE = 4
 _RESOURCE_COOLDOWN_CAP = 64
 _RESOURCE_FAILURE_CAP = 5
@@ -677,6 +688,7 @@ def _resource_telemetry_summary() -> str:
         ("visible_assignments", "av"),
         ("history_assignments", "ah"),
         ("stale", "stale"),
+        ("far", "far"),
         ("explore_reserved", "exp"),
         ("blocked", "blk"),
         ("cooled", "cool"),
@@ -695,6 +707,40 @@ def _resource_age(cell: tuple[int, int], tick: int) -> int:
     if hint is None:
         return max(0, tick)
     return max(0, tick - hint.last_confirmed_tick)
+
+
+def _harvest_dispatch_radius(turn: "Turn") -> int:
+    """返回历史资源提示的主动派发半径。
+
+    当前可见资源不经过这个门槛；它们是本 Tick 的权威事实。门槛只约束
+    尚未确认的持久提示，避免健康经济期把空载 Worker 派去很远的陈旧坐标。
+    连续一段时间没有成功采集时放宽范围，让前沿扫描暂时找不到节点的局面
+    仍能利用相邻 Chunk 的持久提示恢复收入。
+    """
+    if (
+        _last_harvest_tick is not None
+        and turn.tick - _last_harvest_tick >= HARVEST_STARVE_TICKS
+    ):
+        return MAX_HARVEST_FROM_CORE_STARVED
+    return MAX_HARVEST_FROM_CORE
+
+
+def _history_claim_should_yield(
+    worker: "UnitView",
+    target: tuple[int, int],
+    visible_resources: set[tuple[int, int]],
+) -> bool:
+    """判断可见资源是否已经明显优于当前历史认领。"""
+    if not visible_resources:
+        return False
+    current_distance = _manhattan(tuple(worker.position), target)
+    nearest_visible = min(
+        _manhattan(tuple(worker.position), resource)
+        for resource in visible_resources
+    )
+    # 历史提示弱于当前状态，但已经走近的 Worker 不应因短暂可见节点每 Tick
+    # 掉头。只有可见节点领先一个明确的路径差距时才释放旧认领。
+    return nearest_visible + _RESOURCE_CLAIM_SWITCH_MARGIN < current_distance
 
 
 def _worker_resource_assignments(
@@ -755,9 +801,10 @@ def _worker_resource_assignments(
         if occupant is not None:
             fixed[str(occupant.id)] = resource
 
-    # 保留仍然有效的短期认领。当前可见资源优先于历史认领：一旦本 Tick
-    # 看见真实节点，旧历史认领释放回匹配池，但已经认领的可见节点继续由
-    # 原 Worker 负责，直到采集成功、失败或资源从可见视野中被确认消失。
+    # 保留仍然有效的短期认领。当前可见资源通常优先于历史认领，但已经
+    # 走近历史点的 Worker 保留少量迟滞，只有可见节点明显更近时才换主；
+    # 已认领的可见节点继续由原 Worker 负责，直到采集成功、失败或资源从
+    # 可见视野中被确认消失。
     for worker_id, target in list(_resource_claims.items()):
         worker = worker_by_id.get(worker_id)
         if (
@@ -765,7 +812,11 @@ def _worker_resource_assignments(
             or worker.cargo != 0
             or target not in eligible_resources
             or target in blocked_resources
-            or (visible_resources and target not in visible_resources)
+            or (
+                visible_resources
+                and target not in visible_resources
+                and _history_claim_should_yield(worker, target, visible_resources)
+            )
         ):
             del _resource_claims[worker_id]
 
@@ -790,13 +841,38 @@ def _worker_resource_assignments(
     }
     retained_worker_ids = set(retained)
     retained_targets = set(retained.values())
+    core_pos = tuple(turn.core.position) if turn.core is not None else None
+    dispatch_radius = _harvest_dispatch_radius(turn)
+
+    def far_history_for(
+        retained_targets_: set[tuple[int, int]],
+    ) -> set[tuple[int, int]]:
+        if core_pos is None:
+            return set()
+        return {
+            resource
+            for resource in eligible_resources - visible_resources
+            if resource not in retained_targets_
+            and min(
+                (_manhattan(worker.position, resource) for worker in workers),
+                default=MAX_HARVEST_FROM_CORE_STARVED + 1,
+            ) > 4
+            and _manhattan(core_pos, resource) > dispatch_radius
+        }
+
+    far_history_resources = far_history_for(retained_targets)
     resources = sorted(
-        eligible_resources - blocked_resources - set(fixed.values()) - retained_targets
+        eligible_resources
+        - blocked_resources
+        - set(fixed.values())
+        - retained_targets
+        - far_history_resources
     )
     _resource_telemetry.update(
         {
             "blocked": len((all_resources & blocked_resources) - set(fixed.values())),
             "cooled": len(cooled_resources),
+            "far": len(far_history_resources),
         }
     )
     # 只要候选里混有历史提示，就保留一个没有站在可见资源上的 Worker 做前沿
@@ -847,11 +923,13 @@ def _worker_resource_assignments(
             retained_targets.discard(retained.pop(explorer_id))
             retained_worker_ids.discard(explorer_id)
             assignments.pop(explorer_id, None)
+            far_history_resources = far_history_for(retained_targets)
             resources = sorted(
                 eligible_resources
                 - blocked_resources
                 - set(fixed.values())
                 - retained_targets
+                - far_history_resources
             )
         dispatch_workers = [
             worker
@@ -1769,10 +1847,32 @@ def _control_workers(turn: "Turn", core_pos: tuple[int, int]) -> None:
         idle_workers, core_pos, dynamically_blocked, tick=turn.tick
     )
     fallback_workers = list(idle_workers)
-    sorted_workers = sorted(turn.workers, key=lambda worker: str(worker.id))
-    for orig_index, worker in enumerate(sorted_workers):
+    # 逐 Tick 预约下一格，避免先提交的空载 Worker 抢走带货 Worker 的通道。
+    # 仍按 UUID 给探索列编号，保证输入顺序和历史路线稳定；执行顺序则让
+    # 带货 Worker 先规划回 Core，随后空载 Worker 避开已经预约的目的地。
+    reserved_destinations: set[tuple[int, int]] = set()
+
+    def queue_worker_move(worker: "Unit", step: Direction) -> bool:
+        dx, dy = step.delta
+        destination = (worker.position[0] + dx, worker.position[1] + dy)
+        if destination in reserved_destinations:
+            return False
+        worker.move(step)
+        reserved_destinations.add(destination)
+        return True
+
+    stable_workers = sorted(turn.workers, key=lambda worker: str(worker.id))
+    stable_index = {str(worker.id): index for index, worker in enumerate(stable_workers)}
+    worker_order = sorted(
+        stable_workers,
+        key=lambda worker: (worker.cargo == 0, str(worker.id)),
+    )
+    for worker in worker_order:
+        orig_index = stable_index[str(worker.id)]
         pos = worker.position
         wid = str(worker.id)
+        reserved_blocked = frozenset(reserved_destinations - {tuple(pos)})
+        reserved_away = base_blocked | reserved_blocked
         # An EMPTY Worker standing on a visible resource cell harvests
         # IMMEDIATELY, before the boxed-in/STUCK logic that could otherwise
         # shuttle it away in a move (observed: worker 68a41e parked on
@@ -1826,11 +1926,11 @@ def _control_workers(turn: "Turn", core_pos: tuple[int, int]) -> None:
             _prev_pos.pop(wid, None)
             _last_pos.pop(wid, None)
             _stuck_ticks[wid] = 0
-            step = _step_away_from(pos, core_pos, base_blocked, avoid=None)
+            step = _step_away_from(pos, core_pos, reserved_away, avoid=None)
             if step is not None:
                 _prev_pos[wid] = pos
                 _record_pos(wid, pos)
-                worker.move(step)
+                queue_worker_move(worker, step)
                 continue
         # Detect a stuck Worker (no movement for STUCK_TICKS): reset its
         # exploration state and anti-backtrack memory so it can pick a fresh
@@ -1853,7 +1953,9 @@ def _control_workers(turn: "Turn", core_pos: tuple[int, int]) -> None:
         # Each Worker paths around obstacles, enemies, and FULL friendly cells
         # (2 occupants), but may step onto a singly-occupied friendly cell or
         # its own current cell or the Core (to deposit).
-        blocked = (base_blocked | friendly_full) - {pos, core_pos}
+        blocked = (base_blocked | friendly_full | reserved_blocked) - {pos, core_pos}
+        if core_pos in reserved_destinations:
+            blocked = blocked | {core_pos}
         # A full Worker deposits if it is home, else heads home.
         if worker.cargo > 0:
             core_full = turn.resources >= turn.resource_capacity
@@ -1872,7 +1974,7 @@ def _control_workers(turn: "Turn", core_pos: tuple[int, int]) -> None:
                     if step is not None:
                         _prev_pos[wid] = pos
                         _record_pos(wid, pos)
-                        worker.move(step)
+                        queue_worker_move(worker, step)
                         continue
                 worker.deposit()
                 # Deposited: resume the assigned scan row, clearing any lock.
@@ -1897,7 +1999,7 @@ def _control_workers(turn: "Turn", core_pos: tuple[int, int]) -> None:
                     if step is not None:
                         _prev_pos[wid] = pos
                         _record_pos(wid, pos)
-                        worker.move(step)
+                        queue_worker_move(worker, step)
                     continue
                 # Deposit admission (user suggestion): when the Core cell is
                 # occupied, keep at least ONE adjacent cell open so the occupant
@@ -1916,7 +2018,7 @@ def _control_workers(turn: "Turn", core_pos: tuple[int, int]) -> None:
                         nxt = (core_pos[0] + d.delta[0], core_pos[1] + d.delta[1])
                         if nxt == pos:
                             continue  # the slot we occupy is not an exit
-                        if nxt in base_blocked:
+                        if nxt in reserved_away:
                             continue
                         if friendly_occupancy.get(nxt, 0) < 2:
                             free_adjacent += 1
@@ -1927,7 +2029,7 @@ def _control_workers(turn: "Turn", core_pos: tuple[int, int]) -> None:
                         if step is not None:
                             _prev_pos[wid] = pos
                             _record_pos(wid, pos)
-                            worker.move(step)
+                            queue_worker_move(worker, step)
                     continue
                 # A* path back to the Core. Greedy _step_toward wedges in
                 # obstacle-dense stone-corner terrain: a laden Worker 20+ cells
@@ -1951,7 +2053,7 @@ def _control_workers(turn: "Turn", core_pos: tuple[int, int]) -> None:
                 if step is not None:
                     _prev_pos[wid] = pos
                     _record_pos(wid, pos)
-                    worker.move(step)
+                    queue_worker_move(worker, step)
             continue
         # An EMPTY Worker must not enter the Core cell: it only occupies the
         # 2/2 slot and deadlocks laden deposits (observed: empty worker 414e50
@@ -2000,7 +2102,7 @@ def _control_workers(turn: "Turn", core_pos: tuple[int, int]) -> None:
             if step is not None:
                 _prev_pos[wid] = pos
                 _record_pos(wid, pos)
-                worker.move(step)
+                queue_worker_move(worker, step)
                 continue
 
         # No resource task: move toward this Worker's stable, globally dispersed
@@ -2066,7 +2168,7 @@ def _control_workers(turn: "Turn", core_pos: tuple[int, int]) -> None:
         if step is not None:
             _prev_pos[wid] = pos
             _record_pos(wid, pos)
-            worker.move(step)
+            queue_worker_move(worker, step)
         else:
             # The sweep found no legal step (trapped in an obstacle pocket or
             # parked on the Core cell). WAITing here loops forever: STUCK
@@ -2076,13 +2178,13 @@ def _control_workers(turn: "Turn", core_pos: tuple[int, int]) -> None:
             # open adjacent cell using base_blocked (not blocked_empty), so the
             # Core cell is reachable as a last-resort exit — moving beats a
             # permanent stall.
-            step = _step_away_from(pos, core_pos, base_blocked, avoid=None)
+            step = _step_away_from(pos, core_pos, reserved_away, avoid=None)
             if step is None:
-                step = _step_toward(pos, core_pos, base_blocked, avoid=None)
+                step = _step_toward(pos, core_pos, reserved_away, avoid=None)
             if step is not None:
                 _prev_pos[wid] = pos
                 _record_pos(wid, pos)
-                worker.move(step)
+                queue_worker_move(worker, step)
 
 
 def _vanguard_guard_targets(
@@ -2704,13 +2806,14 @@ def _control_core(
             core.spawn(UnitType.RANGER)
             return
 
-    # Budget-aware Worker target: the effective ceiling is the population
-    # target minus the standing army's population cost. A fixed TARGET_WORKERS
-    # ignored the army and pushed the fleet into the next price step.
-    # TARGET_WORKERS remains as a public compatibility constant; the live
-    # ceiling is derived from the current standing-army population cost.
-    worker_target = FREE_UPKEEP_CAP - (
-        len(turn.vanguards) + len(turn.rangers)
+    # Budget-aware Worker target: subtract the standing army from the soft
+    # population budget, then apply the explicit peaceful discovery bridge cap.
+    # The latter prevents a completed V/R reserve from reopening the old W18
+    # path while the live economy is still being measured.
+    combat_count = len(turn.vanguards) + len(turn.rangers)
+    worker_target = min(
+        FREE_UPKEEP_CAP - combat_count,
+        ECONOMY_BRIDGE_MAX_WORKERS,
     )
     wants_worker = len(turn.workers) < worker_target
     army_short = (
@@ -2727,7 +2830,6 @@ def _control_core(
         and len(turn.workers) < ECONOMY_BRIDGE_MAX_WORKERS
         and (len(turn.vanguards) + len(turn.rangers)) > 0
     )
-    combat_count = len(turn.vanguards) + len(turn.rangers)
     if army_short and not bridge_worker_allowed:
         # A cold start still builds its first combat pair before growing past
         # the economy floor. Once a combat Unit exists, stop the bridge at its
@@ -2868,6 +2970,7 @@ def _observe_resources(turn: "Turn") -> None:
     a resource); remove cells harvested successfully this Tick.
     """
     global _known_resources, _resource_telemetry, _resource_absence_streak
+    global _last_harvest_tick
     _resource_telemetry = {
         "resource_failures": sum(
             1
@@ -2890,6 +2993,18 @@ def _observe_resources(turn: "Turn") -> None:
             if event.event_type == "DEPOSIT_SUCCEEDED"
         ),
     }
+    harvest_ticks = [
+        event.tick
+        for event in turn.events
+        if event.event_type == "HARVEST_SUCCEEDED"
+    ]
+    if harvest_ticks:
+        _last_harvest_tick = max(harvest_ticks)
+    elif _last_harvest_tick is None:
+        # A fresh process still needs a finite drought clock; otherwise a
+        # persisted map with no successful harvest could stay in healthy mode
+        # forever after a restart.
+        _last_harvest_tick = turn.tick
     changed = False
     # Remove cells harvested this Tick (the event carries the harvest cell).
     for event in turn.events:
@@ -3099,6 +3214,7 @@ def _clear_exploration_state() -> None:
     the old neighborhood, but persistent resource and map facts remain valid
     until a fresh Turn explicitly disproves them.
     """
+    global _last_harvest_tick
     _explore_state.clear()
     _explore_targets.clear()
     _explore_progress.clear()
@@ -3108,6 +3224,9 @@ def _clear_exploration_state() -> None:
     _prev_pos.clear()
     _last_pos.clear()
     _stuck_ticks.clear()
+    _last_harvest_tick = None
+
+
 def decide(turn: "Turn") -> None:
     """Queue a complete plan for one Turn based only on its authoritative state.
 
