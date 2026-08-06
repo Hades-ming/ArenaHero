@@ -293,3 +293,15 @@
   失败记录、错误码和重复记录单独计数。
 - **复用规则**：先用唯一 Tick 和错误护栏确认观测链路，再分层判断算法复杂度、网络延迟和资源收益；
   任何低采集告警都必须回到战术/战场状态取证，不能由 telemetry 改动背锅。
+
+## L18 — 同 Tick 资源账本必须覆盖交付、Unit HEAL 与 Core 动作
+- **现象**：Unit HEAL 在 Core 动作之前结算，但策略曾用同一个 `turn.resources` 分别判断多个
+  Unit 的 HEAL 和 Core 的生产/修盾；同一 Tick 可能同时排出总成本超过库存的动作，失败只在下个
+  state 中暴露，既浪费动作窗口，也会占住 Core 格。
+- **根因**：规则顺序是 Worker deposit -> combat -> Unit HEAL -> Core action；决策代码按控制器
+  分组执行，没有把 pending deposit 的可接收数量和低血 Unit 的完整恢复成本放入同一预算。
+- **修复（2026-08-06）**：先计算不超过 Core 容量的 pending deposit，再按 raw UUID 顺序预留
+  Vanguard/Ranger 的低血 HEAL 成本，剩余预算才交给 Core 修盾/生产；资源不足时不排队第二个
+  HEAL。可见敌人不再要求先有 2 个 Worker，Core 会立即尝试建立 Vanguard。
+- **复用规则**：凡是同 Tick 有多个资源消费者，先按完整结算顺序建立预算，再排动作；测试必须
+  同时断言 Unit action、Core action 和 pending deposit，不要只验证单个纯函数的目标数量。

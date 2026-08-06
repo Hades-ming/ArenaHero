@@ -1198,6 +1198,58 @@ def test_ranger_shoots_visible_legal_target() -> None:
     assert tuple(action.expected_cell) == (0, 2)
 
 
+def test_ranger_prioritizes_near_core_raider_over_distant_enemy_core() -> None:
+    state = _state(
+        resources=0,
+        population=1,
+        objects=[
+            {
+                "kind": "CORE",
+                "id": str(CORE_ID),
+                "controlled": True,
+                "owner_username": "arena_hero",
+                "position": [0, 0],
+                "hp": 5,
+                "shield": 5,
+                "state": "NORMAL",
+            },
+            {
+                "kind": "UNIT",
+                "id": str(RANGER_ID),
+                "controlled": True,
+                "position": [0, 0],
+                "hp": 2,
+                "unit_type": "RANGER",
+                "cargo": None,
+            },
+            {
+                "kind": "CORE",
+                "id": str(ENEMY_CORE_ID),
+                "controlled": False,
+                "owner_username": "rival",
+                "position": [0, 3],
+                "hp": 5,
+                "shield": 5,
+                "state": "NORMAL",
+            },
+            {
+                "kind": "UNIT",
+                "id": str(ENEMY_UNIT_ID),
+                "controlled": False,
+                "position": [1, 0],
+                "hp": 2,
+                "unit_type": "RANGER",
+                "cargo": None,
+            },
+        ],
+    )
+    turn = _turn(state)
+    decide(turn)
+    action = _action(turn.plan, RANGER_ID)
+    assert action.type == "SHOOT"
+    assert action.target_id == ENEMY_UNIT_ID
+
+
 def test_ranger_shoots_visible_diagonal_target() -> None:
     state = _state(
         population=2,
@@ -1726,6 +1778,99 @@ def test_core_does_not_repair_when_shield_full() -> None:
     # Shield full -> no repair. Should consider spawning instead.
     core_act = _core_action(turn.plan)
     assert core_act is None or core_act.type != "REPAIR_SHIELD"
+
+
+def test_unit_heal_reservation_prevents_core_overspend() -> None:
+    objects = [
+        {
+            "kind": "CORE",
+            "id": str(CORE_ID),
+            "controlled": True,
+            "owner_username": "arena_hero",
+            "position": [0, 0],
+            "hp": 5,
+            "shield": 5,
+            "state": "NORMAL",
+        },
+        {
+            "kind": "UNIT",
+            "id": str(RANGER_ID),
+            "controlled": True,
+            "position": [0, 0],
+            "hp": 1,
+            "unit_type": "RANGER",
+            "cargo": None,
+        },
+    ]
+    for index, position in enumerate([(1, 0), (-1, 0), (0, 1), (0, -1)]):
+        objects.append(
+            {
+                "kind": "UNIT",
+                "id": str(UUID(int=0x6000 + index)),
+                "controlled": True,
+                "position": list(position),
+                "hp": 2,
+                "unit_type": "WORKER",
+                "cargo": 0,
+            }
+        )
+    state = _state(resources=10, population=5, objects=objects)
+    turn = _turn(state)
+    decide(turn)
+    assert _action(turn.plan, RANGER_ID).type == "HEAL"
+    # The Ranger consumes the one resource needed to reach full HP before the
+    # Core action. The remaining 9 cannot fund the 10-cost Vanguard spawn.
+    assert _core_action(turn.plan) is None
+
+
+def test_unit_heals_are_reserved_in_uuid_order() -> None:
+    state = _state(
+        resources=3,
+        population=3,
+        objects=[
+            {
+                "kind": "CORE",
+                "id": str(CORE_ID),
+                "controlled": True,
+                "owner_username": "arena_hero",
+                "position": [0, 0],
+                "hp": 5,
+                "shield": 5,
+                "state": "NORMAL",
+            },
+            {
+                "kind": "UNIT",
+                "id": str(WORKER_ID),
+                "controlled": True,
+                "position": [1, 0],
+                "hp": 2,
+                "unit_type": "WORKER",
+                "cargo": 0,
+            },
+            {
+                "kind": "UNIT",
+                "id": str(VANGUARD_ID),
+                "controlled": True,
+                "position": [0, 0],
+                "hp": 1,
+                "unit_type": "VANGUARD",
+                "cargo": None,
+            },
+            {
+                "kind": "UNIT",
+                "id": str(RANGER_ID),
+                "controlled": True,
+                "position": [0, 0],
+                "hp": 1,
+                "unit_type": "RANGER",
+                "cargo": None,
+            },
+        ],
+    )
+    turn = _turn(state)
+    decide(turn)
+    assert _action(turn.plan, VANGUARD_ID).type == "HEAL"
+    assert _action(turn.plan, RANGER_ID).type != "HEAL"
 
 
 def test_core_spawns_worker_below_target() -> None:
@@ -2270,6 +2415,16 @@ def test_standing_army_expands_defense_line_under_threat() -> None:
     state = _state_with_workers(
         n_workers=4, resources=10, n_vanguards=1, n_rangers=1, threat=True
     )
+    turn = _turn(state)
+    decide(turn)
+    act = _core_action(turn.plan)
+    assert act is not None
+    assert act.type == "SPAWN"
+    assert act.unit_type.value == "VANGUARD"
+
+
+def test_visible_enemy_triggers_attack_spawn_with_one_worker() -> None:
+    state = _state_with_workers(n_workers=1, resources=10, threat=True)
     turn = _turn(state)
     decide(turn)
     act = _core_action(turn.plan)

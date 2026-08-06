@@ -32,7 +32,7 @@
 | 优先级 | 任务 | 状态 | 目的 | 执行顺序 |
 |---:|---|---|---|---:|
 | P0 | `OBS-001` 决策耗时与唯一 Tick 观测 | `OBSERVING` | 建立可信性能/链路基线，行为零变化 | 1 |
-| P1 | `RULE-001` 修复 `4ed9c8d` 规则与策略缺陷 | `PROPOSED` | 防止错误目标优先、资源争用和不可达军备目标 | 2 |
+| P1 | `RULE-001` 修复 `4ed9c8d` 规则与策略缺陷 | `STATIC_VERIFIED -> LIVE_CANARY` | 防止错误目标优先、资源争用和不可达军备目标 | 2 |
 | P1 | `EXP-001` 历史资源与探索名额竞争 | `DISCOVERED` | 避免所有 Worker 被陈旧历史点占满 | 3 |
 | P2 | `PERF-001` 前 K 候选 A* / EV | `DISCOVERED` | 降低全量搜索，升级往返收益估计 | 4 |
 
@@ -79,7 +79,7 @@
   成功 Tick、资源刷新覆盖和收益主指标尚未完成，因此状态保持 `OBSERVING`，禁止宣称优化完成。
 - **代码交付**：`8cd6f20` 已推送到 `origin/codex/obs-001-timing`；治理文档基线合并提交待推送。
 
-## 待批准修复：`RULE-001`
+## `RULE-001` 修复与验收
 
 首轮专家在 `4ed9c8d` 发现三项需连续 Tick 集成测试确认的问题：
 
@@ -90,8 +90,21 @@
 3. `_standing_army_targets(18/19)` 返回 `V1/R1`，但人口到 19 后 Core 停产；纯函数测试不能证明
    连续 Tick 真能重建两个兵种。
 
-批准前必须补齐：多目标 Ranger 测试、Unit HEAL + Core action 资源账本测试、`W18/W19`
-连续 Tick 生产测试，以及“带货 Worker 距 Core <=2 + Core 格低血战斗单位”的交付压力测试。
+本次已补齐多目标 Ranger 与 Unit HEAL + Core action 资源账本测试；`W18/W19` 连续 Tick
+生产和“带货 Worker 距 Core <=2 + Core 格低血战斗单位”的交付压力测试仍属于后续 live
+验收项，不能用纯函数结果替代。
+
+### `RULE-001` 主代理修复验收（2026-08-06）
+
+- **静态状态**：`STATIC_VERIFIED`；全量测试 `104 passed`，`compileall`、锁文件 dry-run、
+  `uv pip check`、`git diff --check` 均通过。
+- **已修复**：近核两格敌人优先于远端敌 Core；同 Tick 交付入账后的资源先扣除按 UUID 排序的
+  Unit HEAL 预留，再决定 Core 修盾/生产；可见敌人时取消不必要的 2 Worker 军备门槛，至少
+  立即尝试建立 Vanguard。
+- **安全边界**：HEAL 仍只针对 Core 同格、低血的 Vanguard/Ranger；pending deposit 只计入
+  当前 Core 容量实际能接收的货物，不把溢出 cargo 当成可用资源。
+- **canary 前状态**：旧进程仍运行的是 OBS-001 代码；重启后只验收新 Tick，不能把旧日志混入
+  RULE-001 行为结论。主指标仍是唯一 Tick 的入核资源，规则修复不能替代 500 Tick 观察门槛。
 
 ## 候选资源实验：`EXP-001`
 

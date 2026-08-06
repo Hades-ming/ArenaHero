@@ -1320,15 +1320,17 @@ def _select_ranger_target(
     """Choose a visible enemy the Ranger can legally shoot this Tick.
 
     Rules: shared cardinal or exact-diagonal line, range 1-3, no obstacle strictly
-    between. Enemy Cores are prioritized: destroying one removes the enemy fleet
-    and can capture its stockpiled resources (variable loot, not a flat +6; see
-    ``CORE_RESOURCES_CAPTURED``). Among Units, prefer a one-shot-killable (hp==1)
-    and a FLEEING
-    target (farther from the Core than its last-known position) so driven-off
-    raiders are finished, not let to escape (8th review, rank 3).
+    between. An enemy within two cells of our Core is prioritized before a
+    distant enemy Core: keeping the stored economy alive dominates a speculative
+    raid. Among equally urgent targets, enemy Cores still win because destroying
+    one removes the enemy fleet and can capture its stockpiled resources
+    (variable loot, not a flat +6; see ``CORE_RESOURCES_CAPTURED``). Units then
+    prefer a one-shot-killable (hp==1) and a FLEEING target (farther from the
+    Core than its last-known position) so driven-off raiders are finished, not
+    let to escape (8th review, rank 3).
     """
     best: UnitView | CoreView | None = None
-    best_key: tuple[int, int, int, int, str] | None = None
+    best_key: tuple[int, int, int, int, int, str] | None = None
     for enemy in enemies:
         cell = enemy.position
         if not _same_fire_line(ranger_pos, cell):
@@ -1348,8 +1350,8 @@ def _select_ranger_target(
             if _manhattan(cell, core_pos) > _manhattan(last_pos, core_pos):
                 fleeing = 0  # moving away from the Core = escaping
         key = (
-            0 if is_core else 1,
             0 if _manhattan(cell, core_pos) <= 2 else 1,
+            0 if is_core else 1,
             finishable,
             fleeing,
             dist,
@@ -1760,7 +1762,60 @@ def _vanguard_guard_targets(
     return targets
 
 
-def _control_vanguards(turn: "Turn", core_pos: tuple[int, int]) -> None:
+def _pending_deposit_amount(turn: "Turn") -> int:
+    """计算本 Tick 进入 Core 的可用 Worker 货物上限。"""
+    core = turn.core
+    if core is None or core.view.state != "NORMAL":
+        return 0
+    space = max(0, turn.resource_capacity - turn.resources)
+    if space == 0:
+        return 0
+    cargo = sum(
+        max(0, worker.cargo)
+        for worker in turn.workers
+        if worker.position == core.position and worker.cargo > 0
+    )
+    return min(space, cargo)
+
+
+def _reserve_unit_heals(
+    turn: "Turn",
+    core_pos: tuple[int, int],
+    available_resources: int,
+) -> tuple[frozenset[str], int]:
+    """按实际结算顺序预留 Unit HEAL 资源，避免 Core 动作透支。"""
+    core = turn.core
+    if core is None or core.view.state != "NORMAL":
+        return frozenset(), available_resources
+
+    candidates: list[tuple[str, int]] = []
+    for unit in sorted(turn.units, key=lambda item: str(item.id)):
+        if unit.position != core_pos:
+            continue
+        if unit.unit_type == "VANGUARD" and unit.hp <= 1:
+            missing = 4 - unit.hp
+        elif unit.unit_type == "RANGER" and unit.hp <= 1:
+            missing = 2 - unit.hp
+        else:
+            continue
+        if missing > 0:
+            candidates.append((str(unit.id), missing))
+
+    reserved: set[str] = set()
+    remaining = max(0, available_resources)
+    for unit_id, cost in candidates:
+        if cost > remaining:
+            continue
+        reserved.add(unit_id)
+        remaining -= cost
+    return frozenset(reserved), remaining
+
+
+def _control_vanguards(
+    turn: "Turn",
+    core_pos: tuple[int, int],
+    heal_ids: frozenset[str] | None = None,
+) -> None:
     enemies = turn.visible_enemies
     obstacles = frozenset(turn.obstacle_cells) | _known_obstacles
     friendly_occ = Counter(tuple(unit.position) for unit in turn.units)
@@ -1775,12 +1830,17 @@ def _control_vanguards(turn: "Turn", core_pos: tuple[int, int]) -> None:
         # HEAL at the Core: post-combat HP recovery costs 1 resource per HP
         # (SDK arena-hero 0.2.8, v0.8 rules). A 1-HP Vanguard (max 4) recovers
         # 3 HP for 3 resources vs 10 to rebuild — 3.3x ROI.
-        if (
-            core_normal
-            and vanguard.position == core_pos
-            and vanguard.hp <= 1
-            and resources >= 3
-        ):
+        should_heal = (
+            str(vanguard.id) in heal_ids
+            if heal_ids is not None
+            else (
+                core_normal
+                and vanguard.position == core_pos
+                and vanguard.hp <= 1
+                and resources >= 3
+            )
+        )
+        if should_heal:
             vanguard.heal()
             continue
         sweep_dir = _vanguard_sweep_target(vanguard.position, enemies)
@@ -1998,7 +2058,11 @@ def _guard_step(
     return best_dir
 
 
-def _control_rangers(turn: "Turn", core_pos: tuple[int, int]) -> None:
+def _control_rangers(
+    turn: "Turn",
+    core_pos: tuple[int, int],
+    heal_ids: frozenset[str] | None = None,
+) -> None:
     obstacles = frozenset(turn.obstacle_cells) | _known_obstacles
     enemies = turn.visible_enemies
     resources = turn.resources
@@ -2007,12 +2071,17 @@ def _control_rangers(turn: "Turn", core_pos: tuple[int, int]) -> None:
         # HEAL at the Core: post-combat HP recovery costs 1 resource per HP
         # (SDK arena-hero 0.2.8, v0.8 rules). A 1-HP Ranger (max 2) recovers
         # to full for 1 resource vs 12 to rebuild — 12x ROI.
-        if (
-            core_normal
-            and ranger.position == core_pos
-            and ranger.hp <= 1
-            and resources >= 1
-        ):
+        should_heal = (
+            str(ranger.id) in heal_ids
+            if heal_ids is not None
+            else (
+                core_normal
+                and ranger.position == core_pos
+                and ranger.hp <= 1
+                and resources >= 1
+            )
+        )
+        if should_heal:
             ranger.heal()
             continue
         target = _select_ranger_target(ranger.position, enemies, obstacles, core_pos)
@@ -2137,6 +2206,7 @@ def _control_core(
     turn: "Turn",
     threats: list[UnitView | CoreView],
     enemy_core_visible: bool = False,
+    available_resources: int | None = None,
 ) -> None:
     core = turn.core
     if core is None:
@@ -2147,9 +2217,11 @@ def _control_core(
         return
 
     resources = turn.resources
+    if available_resources is None:
+        available_resources = resources + _pending_deposit_amount(turn)
     # Repair shield first when under threat and there is space and a spare
     # resource. Holding the Beacon raises the cap to 10, so use the live cap.
-    if threats and resources >= 1:
+    if threats and available_resources >= 1:
         friendly_ids = {u.id for u in turn.units}
         friendly_ids.add(core.id)
         owns_beacon = (
@@ -2191,12 +2263,10 @@ def _control_core(
         return
     if population >= FREE_UPKEEP_CAP - 1:
         return
-    # Deposits resolve before spawn in the same Tick (rules: resolution order),
-    # so a colocated Worker's cargo counts toward the spawn cost.
-    pending_deposit = sum(
-        w.cargo for w in turn.workers if w.position == core.position
-    )
-    effective_resources = resources + pending_deposit
+    # Deposits resolve before Unit heals and the Core action in the same Tick;
+    # ``available_resources`` already includes only the amount that fits and
+    # excludes resources reserved for Unit HEAL actions.
+    effective_resources = available_resources
 
     # Standing-army priorities. Combat Units are built BEFORE growing the Worker
     # fleet past the economy floor, so a surprise raid always meets return fire.
@@ -2236,9 +2306,7 @@ def _control_core(
     # while the enemy raids unchecked.
     enemy_present = threatened or enemy_core_visible
     economy_floor_met = len(turn.workers) >= MIN_WORKERS_BEFORE_ARMY
-    army_floor_met = len(turn.workers) >= (
-        MIN_WORKERS_BEFORE_ARMY if not enemy_present else 2
-    )
+    army_floor_met = enemy_present or len(turn.workers) >= MIN_WORKERS_BEFORE_ARMY
 
     if economy_floor_met or army_floor_met:
         # Rangers are the strongest defender (range-3 return fire from a
@@ -2634,8 +2702,20 @@ def decide(turn: "Turn") -> None:
             if unit.position == beacon_pos and str(unit.id) not in turn.plan:
                 unit.pickup_beacon()
                 break
-    _control_rangers(turn, core_pos)
-    _control_vanguards(turn, core_pos)
-    _control_core(turn, threats, enemy_core_visible=enemy_core_visible)
+    # Worker deposits happen before Unit HEAL and the Core action. Reserve the
+    # exact full-heal costs in raw UUID order so later actions cannot knowingly
+    # spend the same resources twice.
+    available_resources = turn.resources + _pending_deposit_amount(turn)
+    heal_ids, available_resources = _reserve_unit_heals(
+        turn, core_pos, available_resources
+    )
+    _control_rangers(turn, core_pos, heal_ids=heal_ids)
+    _control_vanguards(turn, core_pos, heal_ids=heal_ids)
+    _control_core(
+        turn,
+        threats,
+        enemy_core_visible=enemy_core_visible,
+        available_resources=available_resources,
+    )
     _control_workers(turn, core_pos)
     _flush_persistent_state()
