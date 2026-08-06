@@ -1671,11 +1671,16 @@ def _control_workers(turn: "Turn", core_pos: tuple[int, int]) -> None:
                     pos, core_pos, base_blocked, blocked,
                     allow_blocked_goal=True,
                 )
+                avoid = _avoid_set(wid)
+                if step is not None and avoid is not None:
+                    ddx, ddy = step.delta
+                    next_cell = (pos[0] + ddx, pos[1] + ddy)
+                    if next_cell in avoid:
+                        step = _step_toward(pos, core_pos, blocked, avoid=avoid)
                 if step is None:
-                    step = _step_toward(pos, core_pos, blocked, avoid=_avoid_set(wid))
+                    step = _step_toward(pos, core_pos, blocked, avoid=avoid)
                     if step is None:
                         step = _step_toward(pos, core_pos, blocked, avoid=None)
-                        _pos_history.pop(wid, None)
                 if step is not None:
                     _prev_pos[wid] = pos
                     _record_pos(wid, pos)

@@ -1745,6 +1745,44 @@ def test_out_of_radius_return_does_not_backtrack_into_recent_cell() -> None:
     assert step != Direction.DOWN
 
 
+def test_laden_worker_return_does_not_backtrack_into_recent_cell() -> None:
+    state = _state(
+        core_pos=(50, 0),
+        beacon_pos=(100, 100),
+        objects=[
+            {
+                "kind": "CORE",
+                "id": str(CORE_ID),
+                "controlled": True,
+                "owner_username": "arena_hero",
+                "position": [50, 0],
+                "hp": 5,
+                "shield": 5,
+                "state": "NORMAL",
+            },
+            {
+                "kind": "UNIT",
+                "id": str(WORKER_ID),
+                "controlled": True,
+                "position": [0, 0],
+                "hp": 2,
+                "unit_type": "WORKER",
+                "cargo": 1,
+            },
+            {"kind": "OBSTACLE", "positions": [[1, 0], [0, -1]]},
+        ],
+    )
+    tactic._pos_history[str(WORKER_ID)] = [(0, 1)]
+    turn = _turn(state)
+
+    decide(turn)
+
+    action = _action(turn.plan, WORKER_ID)
+    assert action is not None
+    assert action.type == "MOVE"
+    assert action.direction != Direction.DOWN
+
+
 # ---------------------------------------------------------------------------
 # Core actions: repair and spawn
 # ---------------------------------------------------------------------------
