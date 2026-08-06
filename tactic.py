@@ -115,9 +115,11 @@ MIN_WORKERS_BEFORE_ARMY = 4
 # Core is not under immediate threat.  The W8 bridge still left long quiet
 # windows with only one or two resource points found, while the next dynamic
 # price tier is not reached until population 20.  Extend the bounded bridge to
-# W12 so a mature V2 economy can add discovery capacity without crossing that
-# tier; any visible enemy still disables the bridge immediately.
-ECONOMY_BRIDGE_MAX_WORKERS = MIN_WORKERS_BEFORE_ARMY + 8
+# W15 so a mature economy can add enough discovery capacity to overlap the
+# long resource return trips observed in the live log without crossing the
+# population-20 dynamic-price boundary. With the standing V1/R1 floor this is
+# population 19; any visible enemy still disables the bridge immediately.
+ECONOMY_BRIDGE_MAX_WORKERS = MIN_WORKERS_BEFORE_ARMY + 11
 # Healthy resource income should favor short round trips. A node farther away
 # remains in the persistent map, but it is only dispatched after a drought
 # makes the wider trip preferable to waiting idle.
@@ -281,6 +283,15 @@ _explore_target_failures: dict[tuple[int, int], int] = {}
 _EXPLORE_COOLDOWN_BASE = 4
 _EXPLORE_COOLDOWN_CAP = 32
 _EXPLORE_STALL_TICKS = 6
+# 先覆盖四个主方向，再让剩余 Worker 选择各自最近的有效前沿。这样既保留
+# 分散探索，又不会为了追求一个远端高 frontier_gain 目标，让整队在已探索
+# 地面上行走几十个 Tick。
+_EXPLORATION_SECTOR_COVER = 4
+# Natural nodes refill in tracked chunks every four logical Ticks.  Keep a
+# small, stable patrol cohort on the persisted chunk sweep so refilled nodes in
+# already-explored ground are rediscovered while the rest of the fleet pursues
+# new frontier cells.
+_RESOURCE_REFRESH_PATROL_WORKERS = 2
 
 
 @dataclass
@@ -694,6 +705,7 @@ def _resource_telemetry_summary() -> str:
         ("stale", "stale"),
         ("far", "far"),
         ("explore_reserved", "exp"),
+        ("refresh_reservations", "ref"),
         ("blocked", "blk"),
         ("cooled", "cool"),
         ("unreachable", "unr"),
@@ -789,6 +801,7 @@ def _worker_resource_assignments(
         {
             "stale": len(stale_resources),
             "explore_reserved": 0,
+            "refresh_reservations": 0,
         }
     )
     fixed: dict[str, tuple[int, int]] = {}
@@ -848,6 +861,19 @@ def _worker_resource_assignments(
     core_pos = tuple(turn.core.position) if turn.core is not None else None
     dispatch_radius = _harvest_dispatch_radius(turn)
 
+    def retained_progress_targets() -> set[tuple[int, int]]:
+        """保留已经走近或走过半程的历史认领。"""
+        keep: set[tuple[int, int]] = set()
+        for worker_id, target in retained.items():
+            worker = worker_by_id.get(worker_id)
+            if worker is None or core_pos is None:
+                continue
+            remaining = _manhattan(tuple(worker.position), target)
+            total = _manhattan(core_pos, target)
+            if remaining <= 6 or remaining * 2 <= total:
+                keep.add(target)
+        return keep
+
     def far_history_for(
         retained_targets_: set[tuple[int, int]],
     ) -> set[tuple[int, int]]:
@@ -864,7 +890,17 @@ def _worker_resource_assignments(
             and _manhattan(core_pos, resource) > dispatch_radius
         }
 
-    far_history_resources = far_history_for(retained_targets)
+    # A retained claim is an intent, not a waiver of the healthy round-trip
+    # radius.  Release a remote claim before it consumes dozens of movement
+    # Ticks, but let a Worker that is already near or past halfway finish it.
+    far_history_resources = far_history_for(retained_progress_targets())
+    for worker_id, target in list(retained.items()):
+        if target in far_history_resources:
+            del retained[worker_id]
+            _resource_claims.pop(worker_id, None)
+    retained_worker_ids = set(retained)
+    retained_targets = set(retained.values())
+    far_history_resources = far_history_for(retained_progress_targets())
     resources = sorted(
         eligible_resources
         - blocked_resources
@@ -1160,6 +1196,7 @@ def _assign_explore_targets(
         _explore_sector(target, core_pos) for target in selected
     )
     result: dict[str, tuple[int, int]] = {}
+    sector_target_budget = min(len(workers), _EXPLORATION_SECTOR_COVER)
     for worker_id, position in sorted(workers):
         existing = _explore_targets.get(worker_id)
         if existing is not None:
@@ -1168,6 +1205,16 @@ def _assign_explore_targets(
         available = [candidate for candidate in candidates if candidate not in selected]
         if not available:
             break
+        # 先保留至少一个未覆盖主方向；达到方向覆盖目标后，候选优先按
+        # 当前 Worker 的到达距离排序，尽快让其视野触达未知边界。
+        spaced = [
+            candidate
+            for candidate in available
+            if not selected
+            or min(_manhattan(candidate, other) for other in selected) >= 6
+        ]
+        if spaced:
+            available = spaced
 
         def score(candidate: tuple[int, int]) -> tuple[int, int, int, int, int, int]:
             separation = (
@@ -1180,11 +1227,15 @@ def _assign_explore_targets(
             # so a dense east edge could claim every idle Worker and recreate
             # the user's observed southeast cluster.
             sector = _explore_sector(candidate, core_pos)
+            new_sector = (
+                len(sector_counts) < sector_target_budget
+                and sector_counts.get(sector, 0) == 0
+            )
             return (
-                -sector_counts.get(sector, 0),
+                1 if new_sector else 0,
+                -_manhattan(position, candidate),
                 _frontier_gain(candidate, blocked),
                 separation,
-                -_manhattan(position, candidate),
                 -candidate[0],
                 -candidate[1],
             )
@@ -1847,8 +1898,28 @@ def _control_workers(turn: "Turn", core_pos: tuple[int, int]) -> None:
     # 汇总把“正在探索”误报成没有探索保留。
     if not resource_cells and len(idle_workers) >= 3:
         _resource_telemetry["explore_reserved"] = 1
+    # Natural nodes refill in already-tracked chunks.  When no node is visible,
+    # reserve two stable empty Workers for the boustrophedon refresh sweep and
+    # let the remaining fleet continue the four-sector frontier search.  The
+    # reserve never removes a Worker assigned to a current visible resource.
+    frontier_workers = idle_workers
+    if not resource_cells and len(idle_workers) >= 4:
+        refresh_count = min(
+            _RESOURCE_REFRESH_PATROL_WORKERS, len(idle_workers) - 1
+        )
+        refresh_ids = {
+            worker_id
+            for worker_id, _ in sorted(idle_workers)[:refresh_count]
+        }
+        for worker_id in refresh_ids:
+            _explore_targets.pop(worker_id, None)
+            _explore_progress.pop(worker_id, None)
+        frontier_workers = [
+            worker for worker in idle_workers if worker[0] not in refresh_ids
+        ]
+        _resource_telemetry["refresh_reservations"] = refresh_count
     explore_targets = _assign_explore_targets(
-        idle_workers, core_pos, dynamically_blocked, tick=turn.tick
+        frontier_workers, core_pos, dynamically_blocked, tick=turn.tick
     )
     fallback_workers = list(idle_workers)
     # 逐 Tick 预约下一格，避免先提交的空载 Worker 抢走带货 Worker 的通道。

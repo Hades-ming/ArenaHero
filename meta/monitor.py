@@ -109,6 +109,7 @@ class KPI:
     far_resource_candidates: int = 0
     stale_resource_candidates: int = 0
     explore_reservations: int = 0
+    refresh_reservations: int = 0
     unreachable_resource_targets: int = 0
     harvested_resources: int = 0
     deposited_resources: int = 0
@@ -317,6 +318,7 @@ def analyze(path: str | Path) -> KPI:
             kpi.far_resource_candidates += eco.get("far", 0)
             kpi.stale_resource_candidates += eco.get("stale", 0)
             kpi.explore_reservations += eco.get("exp", 0)
+            kpi.refresh_reservations += eco.get("ref", 0)
             kpi.unreachable_resource_targets += eco.get("unr", 0)
             kpi.harvested_resources += eco.get("harv", 0)
             kpi.deposited_resources += eco.get("dep", 0)
@@ -500,7 +502,8 @@ def report(kpi: KPI, alerts: list[str]) -> str:
         f"{kpi.blocked_resource_candidates}, cooled "
         f"{kpi.cooled_resource_candidates}, stale "
         f"{kpi.stale_resource_candidates}, explore-reserved "
-        f"{kpi.explore_reservations}, unreachable "
+        f"{kpi.explore_reservations}, refresh-patrol "
+        f"{kpi.refresh_reservations}, unreachable "
         f"{kpi.unreachable_resource_targets}"
     )
     lines.append(

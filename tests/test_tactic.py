@@ -252,6 +252,30 @@ def test_distant_history_resource_is_retained_but_not_assigned_when_healthy() ->
     assert tactic._resource_telemetry["far"] == 1
 
 
+def test_remote_history_claim_is_released_before_a_long_trip() -> None:
+    distant = (50, 0)
+    worker_id = str(UUID(int=0x6000))
+    tactic._known_resources.add(distant)
+    tactic._resource_hints[distant] = tactic.ResourceHint(19, "history")
+    tactic._resource_claims[worker_id] = distant
+    turn = _turn(_workers_state([(1, 0)]), tick=20)
+
+    assert tactic._worker_resource_assignments(turn) == {}
+    assert worker_id not in tactic._resource_claims
+    assert tactic._resource_telemetry["far"] == 1
+
+
+def test_history_claim_near_target_is_kept_for_completion() -> None:
+    target = (30, 0)
+    worker_id = str(UUID(int=0x6000))
+    tactic._known_resources.add(target)
+    tactic._resource_hints[target] = tactic.ResourceHint(19, "history")
+    tactic._resource_claims[worker_id] = target
+    turn = _turn(_workers_state([(29, 0)]), tick=20)
+
+    assert tactic._worker_resource_assignments(turn) == {worker_id: target}
+
+
 def test_distant_history_resource_is_assigned_after_harvest_drought() -> None:
     distant = (50, 0)
     tactic._known_resources.add(distant)
@@ -519,6 +543,25 @@ def test_control_workers_reports_exploration_reservation_without_resources() -> 
 
     assert tactic._resource_telemetry["explore_reserved"] == 1
     assert len(turn.plan.unit_actions) == 3
+
+
+def test_control_workers_reserves_two_refresh_patrols_without_visible_resources(
+    monkeypatch,
+) -> None:
+    turn = _turn(_workers_state([(0, 1), (0, 2), (0, 3), (0, 4), (0, 5), (0, 6)]), tick=20)
+    captured: list[list[tuple[str, tuple[int, int]]]] = []
+
+    def fake_assign(workers, *args, **kwargs):
+        captured.append(list(workers))
+        return {}
+
+    monkeypatch.setattr(tactic, "_assign_explore_targets", fake_assign)
+    tactic._control_workers(turn, turn.core.position)
+
+    assert len(captured) == 1
+    assert len(captured[0]) == 4
+    assert tactic._resource_telemetry["refresh_reservations"] == 2
+    assert len(turn.plan.unit_actions) == 6
 
 
 def test_worker_destination_is_reserved_within_one_tick(monkeypatch) -> None:
@@ -1024,7 +1067,7 @@ def test_resource_telemetry_log_is_monitorable_and_never_contains_api_key(
     # Legacy callers may still omit the optional timing/status arguments.
     line = play._log_line(turn, accepted=None)
 
-    assert "eco[a1,av1,ah0,stale0,far0,exp0,blk0,cool0,unr0,harv0,dep0]" in line
+    assert "eco[a1,av1,ah0,stale0,far0,exp0,ref0,blk0,cool0,unr0,harv0,dep0]" in line
     assert fake_key not in line
     record = monitor._parse_line(line)
     assert record is not None
@@ -1035,6 +1078,7 @@ def test_resource_telemetry_log_is_monitorable_and_never_contains_api_key(
         "stale": 0,
         "far": 0,
         "exp": 0,
+        "ref": 0,
         "blk": 0,
         "cool": 0,
         "unr": 0,
@@ -1079,6 +1123,36 @@ def test_dispersed_exploration_targets_cover_multiple_directions() -> None:
         for index, a in enumerate(targets.values())
         for b in list(targets.values())[index + 1 :]
     ) >= 6
+
+
+def test_frontier_assignment_prefers_reachable_target_over_high_gain(
+    monkeypatch,
+) -> None:
+    """先兑现近处前沿，不能为未知格数量追逐远端目标。"""
+    worker_id = str(UUID(int=0x6000))
+    candidates = [(1, 0), (10, 0), (0, 1), (0, 10)]
+    monkeypatch.setattr(
+        tactic,
+        "_frontier_candidates",
+        lambda *args, **kwargs: candidates,
+    )
+    monkeypatch.setattr(
+        tactic,
+        "_frontier_gain",
+        lambda target, blocked: 100 if target == (10, 0) else 1,
+    )
+
+    targets = tactic._assign_explore_targets(
+        [(worker_id, (0, 0))],
+        (0, 0),
+        frozenset(),
+        tick=20,
+        radius=20,
+    )
+
+    target = targets[worker_id]
+    assert target != (10, 0)
+    assert tactic._manhattan((0, 0), target) == 1
 
 
 def test_exploration_target_stays_stable_until_frontier_is_lit() -> None:
@@ -2835,13 +2909,16 @@ def test_standing_army_spawns_vanguard_above_economy_floor() -> None:
     assert act.unit_type.value == "VANGUARD"
 
 
-def test_standing_army_banks_for_peacetime_ranger_reserve() -> None:
-    # 已有 Vanguard 防线，但 12 点资源会被 Ranger 全部消耗。和平期保留库存，
-    # 等待额外 5 点资源到账后再补齐 Ranger。
+def test_peacetime_worker_bridge_preserves_ranger_reserve() -> None:
+    # 已有 Vanguard 防线时，W12 仍可走有限的 Worker 桥接；支付 5 点后还会
+    # 保留 7 点库存，Ranger 的和平期 5 点储备闸门仍不会被绕过。
     state = _state_with_workers(n_workers=12, resources=12, n_vanguards=2)
     turn = _turn(state)
     decide(turn)
-    assert _core_action(turn.plan) is None
+    act = _core_action(turn.plan)
+    assert act is not None
+    assert act.type == "SPAWN"
+    assert act.unit_type.value == "WORKER"
 
 
 def test_standing_army_spawns_ranger_after_peacetime_reserve() -> None:
@@ -2930,12 +3007,12 @@ def test_peacetime_bridge_reaches_third_extra_worker() -> None:
     assert act.unit_type.value == "WORKER"
 
 
-def test_peacetime_bridge_reaches_twelfth_worker() -> None:
-    # A quiet W11/V2 economy may continue the bounded discovery bridge to W12.
-    # Population remains 13 before the spawn, well below the first dynamic
+def test_peacetime_bridge_reaches_fifteenth_worker() -> None:
+    # A quiet W14/V2 economy may continue the bounded discovery bridge to W15.
+    # Population remains 17 before the spawn, well below the first dynamic
     # price tier, while visible enemy signals still take the combat-first path.
     state = _state_with_workers(
-        n_workers=11, resources=8, n_vanguards=2, n_rangers=0
+        n_workers=14, resources=8, n_vanguards=2, n_rangers=0
     )
     turn = _turn(state)
 
@@ -2947,11 +3024,11 @@ def test_peacetime_bridge_reaches_twelfth_worker() -> None:
     assert act.unit_type.value == "WORKER"
 
 
-def test_peacetime_bridge_stops_after_twelfth_worker() -> None:
-    # Once W12 is reached, bank for the missing Ranger instead of growing
+def test_peacetime_bridge_stops_after_fifteenth_worker() -> None:
+    # Once W15 is reached, bank for the missing Ranger instead of growing
     # indefinitely; this preserves the bounded bridge and standing army floor.
     state = _state_with_workers(
-        n_workers=12, resources=8, n_vanguards=2, n_rangers=0
+        n_workers=15, resources=8, n_vanguards=2, n_rangers=0
     )
     turn = _turn(state)
 
@@ -2962,9 +3039,9 @@ def test_peacetime_bridge_stops_after_twelfth_worker() -> None:
 
 def test_full_peacetime_army_does_not_grow_workers_past_bridge_cap() -> None:
     # Combat reserve complete should not reopen the larger population budget:
-    # the discovery bridge remains capped at W12 until a later policy changes it.
+    # the discovery bridge remains capped at W15 until a later policy changes it.
     state = _state_with_workers(
-        n_workers=12, resources=8, n_vanguards=1, n_rangers=1
+        n_workers=15, resources=8, n_vanguards=1, n_rangers=1
     )
     turn = _turn(state)
 

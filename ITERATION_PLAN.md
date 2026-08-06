@@ -384,3 +384,44 @@
   Core 受损、移动/资源失败率不得上升；决策 P95 仍低于 1000ms。
 - **回滚**：连续两个 100-Tick 窗口入核资源/Tick 低于当前基线 10%，敌情下攻击生产延迟，
   出现 Core/协议/窗口故障，或新增 Core 格生产失败，即恢复上一策略提交；不删除地图备份。
+
+## `RESOURCE-DISPATCH-012` 近端前沿优先与四向覆盖（当前 STATIC_VERIFIED）
+
+- **当前证据**：唯一实例窗口 `t64191..t64237` 共 47 个 Tick，资源 `5 -> 9`，只有 2 次采集、
+  4 次交付；无协议、提交、窗口、移动失败或 Core 风险。持久探索格仅增加约 25 个，说明空载
+  Worker 大部分时间仍在已探索地面上前往远端边界。复现当前地图后，旧评分会为了较大的
+  `frontier_gain` 把 Worker 派到 50-70 格外，距离优先的反例测试在旧代码下失败。
+- **可证伪假设**：资源为空时，先让最多四个主方向各有一个近端前沿，再让剩余 Worker 选择自身
+  最近的可达前沿，可缩短“分配 -> 新增视野”的等待；四向覆盖仍能避免东南单侧聚集。
+- **实现范围**：仅修改 `_assign_explore_targets()` 的候选排序与回归测试；不改变资源事实、历史
+  提示、带货回程、战斗、生产和干旱半径。新增的方向覆盖预算为 4，候选之间保持至少 6 格间距，
+  目标仍是坐标意图，不保存 SDK 控制器。
+- **静态验收**：全量 pytest `151 passed`；compileall、`uv pip check`、`git diff --check` 通过。
+- **LIVE_CANARY**：重启前备份 `game.log` 与 `tactic_state.json`，确认只有一个 `play.py`；先观察
+  50 个唯一 Tick，记录新增探索格/Tick、`HARVEST_SUCCEEDED`、`DEPOSIT_SUCCEEDED`、采集到入核
+  延迟和 `MOVE_FAILED`。随后累计 200 个唯一 Tick、至少 50 条完整采集到入核链路，再与
+  `RESOURCE-DISPATCH-011` 的唯一 Tick 窗口比较入核资源/Tick。
+- **接受/回滚**：Core 存活且无协议/认证/提交/窗口错误；两个独立 100-Tick 窗口入核资源/Tick
+  不低于基线，新增探索格/Tick 提升且完整链路不退化 10% 以上。若连续两个窗口入核率低于基线
+  10%、带货回程 P95 上升 25%、出现移动失败/Core 风险或第二个客户端，恢复上一提交，不删除地图备份。
+
+## `RESOURCE-DISPATCH-013` Chunk 回扫与历史认领释放（待 LIVE_CANARY）
+
+- **当前证据**：live `t64264..t64324` 共 61 个唯一 Tick，资源 `0 -> 4`，无协议、提交、窗口、
+  Core 或移动故障；持久探索地图约 4,063 格，`exp1` 长时间持续。v0.14 每四个逻辑 Tick 在已跟踪
+  Chunk 内补充自然节点，全部空载 Worker 追前沿会漏掉已探索区域的补充资源。
+- **可证伪假设**：无当前可见资源时固定 2 个空载 Worker 做 Chunk 纵向回扫，其余 Worker 继续
+  四向前沿；健康期远端历史认领在 Worker 尚未接近或走过半程时释放，可提高发现率并减少长距离空载。
+- **实现范围**：`tactic.py` 新增回扫名额、`ref` 经济遥测及历史认领进度门槛；`meta/monitor.py` 汇总
+  `refresh_reservations`；补充资源调度和监控回归测试。已存在的 W15 桥接、可见资源优先、A* 回程和
+  持久地图事实不变。
+- **静态验收**：全量 `pytest -q`、`python -m compileall -q .`、`uv pip check`、`git diff --check`；
+  监控 JSON 必须能解析 `ref`，且敏感信息扫描无 API Key。
+- **LIVE_CANARY**：重启前备份 `game.log` 与 `tactic_state.json`，确认只有一个 `play.py`；先观察
+  50 个唯一 Tick，记录 `W`、`ref`、新增探索格、`HARVEST_SUCCEEDED`、`DEPOSIT_SUCCEEDED`、
+  采集到入核延迟、`far`、`CELL_UNIT_LIMIT` 和 Core 状态。累计 200 个唯一 Tick、至少 50 条完整
+  采集到入核链路后，再与 `RESOURCE-DISPATCH-012` 比较入核资源/Tick。
+- **接受/回滚**：Core 存活且无协议/认证/提交/窗口错误；两个独立 100-Tick 窗口入核资源/Tick
+  不低于基线，采集到入核 P95 不恶化 25%，`ref` 在无可见资源窗口保持约 2 且无额外移动失败。
+  若入核率连续两个窗口低于基线 10%、采集 P95 上升 25%、出现 Core/窗口故障或第二个客户端，
+  恢复上一提交，保留地图备份。
