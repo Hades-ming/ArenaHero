@@ -2754,9 +2754,9 @@ def test_peacetime_bridge_reaches_second_extra_worker() -> None:
 
 
 def test_peacetime_bridge_reaches_third_extra_worker() -> None:
-    # With no visible threat, keep one additional scout active while the
-    # missing Ranger is being funded.  W7 -> W8 is still below the first
-    # dynamic-price boundary and raises discovery capacity by another worker.
+    # With no visible threat, keep additional scouts active while the missing
+    # Ranger is being funded.  W7 -> W8 is still below the first dynamic-price
+    # boundary and raises discovery capacity by another worker.
     state = _state_with_workers(
         n_workers=7, resources=8, n_vanguards=2, n_rangers=0
     )
@@ -2768,6 +2768,36 @@ def test_peacetime_bridge_reaches_third_extra_worker() -> None:
     assert act is not None
     assert act.type == "SPAWN"
     assert act.unit_type.value == "WORKER"
+
+
+def test_peacetime_bridge_reaches_twelfth_worker() -> None:
+    # A quiet W11/V2 economy may continue the bounded discovery bridge to W12.
+    # Population remains 13 before the spawn, well below the first dynamic
+    # price tier, while visible enemy signals still take the combat-first path.
+    state = _state_with_workers(
+        n_workers=11, resources=8, n_vanguards=2, n_rangers=0
+    )
+    turn = _turn(state)
+
+    decide(turn)
+
+    act = _core_action(turn.plan)
+    assert act is not None
+    assert act.type == "SPAWN"
+    assert act.unit_type.value == "WORKER"
+
+
+def test_peacetime_bridge_stops_after_twelfth_worker() -> None:
+    # Once W12 is reached, bank for the missing Ranger instead of growing
+    # indefinitely; this preserves the bounded bridge and standing army floor.
+    state = _state_with_workers(
+        n_workers=12, resources=8, n_vanguards=2, n_rangers=0
+    )
+    turn = _turn(state)
+
+    decide(turn)
+
+    assert _core_action(turn.plan) is None
 
 
 def test_visible_enemy_core_disables_worker_bridge() -> None:
