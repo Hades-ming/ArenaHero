@@ -70,9 +70,9 @@ from arena_hero import (
 if TYPE_CHECKING:
     from arena_hero import Core, CoreView, Turn, Unit, UnitView
 
-# v0.14 has no per-Tick upkeep. Keep a conservative soft population cap at the
-# first dynamic-price step until live ROI data proves that higher production
-# prices pay back the extra scouting and defense capacity.
+# v0.14 has no per-Tick upkeep. Keep the first dynamic-price boundary as a
+# conservative soft population target: population 20 is allowed, while the
+# next production (at population 20) is the first dynamically priced unit.
 FREE_UPKEEP_CAP = 20
 # Comfortable Worker count the tactic tries to maintain. The fourth review
 # found TARGET_WORKERS=16 was unreachable at the observed harvest rate AND
@@ -82,13 +82,13 @@ FREE_UPKEEP_CAP = 20
 # skeptic personas) re-measured and found the binding constraint is node
 # DISCOVERY rate (~0.033 res/tick) not the chunk-quota ceiling (2.0/tick,
 # 34-64x headroom): more Workers find nodes faster, directly raising
-# throughput, and the first dynamic-price tier remains below pop 20. Raised 8 -> 12, then
+# throughput, and the first dynamic-price tier starts at production population 20. Raised 8 -> 12, then
 # 12 -> 15 after r hit the pop-14 capacity ceiling (70): more Workers both
 # raise discovery AND raise Core capacity (each Unit +5), letting r bank
 # past 70. Still below the first price step (pop 17 < 20). The bank reserve +
 # army-short gate still prevent draining deposits to r0.
-TARGET_WORKERS = 19
-MAX_WORKERS = 21
+TARGET_WORKERS = FREE_UPKEEP_CAP
+MAX_WORKERS = FREE_UPKEEP_CAP + 1
 # Bank reserve: never spend down to zero on a Worker spawn. A spawn must leave
 # the Core with at least this many resources afterward, so the economy keeps a
 # positive balance and the standing-army bank (toward the 10/12 combat Unit)
@@ -232,6 +232,29 @@ _explore_state: dict[str, list[int]] = {}
 # Stable per-Worker frontier targets. These are coordinate intents only; live
 # SDK controllers are always read from the current Turn.
 _explore_targets: dict[str, tuple[int, int]] = {}
+# Frontier targets are coordinate intents, not persistent terrain facts. A
+# target that A* proves unreachable is cooled briefly so every idle Worker does
+# not repeatedly select the same sealed pocket. A* budget exhaustion is kept as
+# a retryable condition and never enters this cooldown map.
+_explore_target_cooldown_until: dict[tuple[int, int], int] = {}
+_explore_target_failures: dict[tuple[int, int], int] = {}
+_EXPLORE_COOLDOWN_BASE = 4
+_EXPLORE_COOLDOWN_CAP = 32
+_EXPLORE_STALL_TICKS = 6
+
+
+@dataclass
+class ExploreProgress:
+    """Track whether a frontier target is making real progress."""
+
+    target: tuple[int, int]
+    position: tuple[int, int]
+    distance: int
+    frontier_gain: int
+    stalled_ticks: int = 0
+
+
+_explore_progress: dict[str, ExploreProgress] = {}
 # Recent-positions history per Worker, used to break multi-cell backtracking
 # cycles on the laden deposit return path through obstacle corridors. The
 # fifth review (skeptic persona) found a laden Worker trapped in a permanent
@@ -823,18 +846,52 @@ def _frontier_gain(
     )
 
 
+def _cooldown_explore_target(target: tuple[int, int], tick: int) -> None:
+    """Temporarily remove a frontier target that A* proved unreachable."""
+    failures = min(_explore_target_failures.get(target, 0) + 1, 5)
+    _explore_target_failures[target] = failures
+    delay = min(
+        _EXPLORE_COOLDOWN_CAP,
+        _EXPLORE_COOLDOWN_BASE * 2 ** (failures - 1),
+    )
+    _explore_target_cooldown_until[target] = tick + delay
+
+
+def _prune_explore_target_cooldowns(tick: int) -> None:
+    """Drop expired frontier cooldowns so the intent cache stays bounded."""
+    for target, until in list(_explore_target_cooldown_until.items()):
+        if until <= tick:
+            del _explore_target_cooldown_until[target]
+
+
+def _explore_target_is_cooled(target: tuple[int, int], tick: int) -> bool:
+    """Return whether a frontier target is still in its retry cooldown."""
+    return _explore_target_cooldown_until.get(target, 0) > tick
+
+
 def _frontier_candidates(
-    core_pos: tuple[int, int], blocked: frozenset[tuple[int, int]]
+    core_pos: tuple[int, int],
+    blocked: frozenset[tuple[int, int]],
+    tick: int | None = None,
 ) -> list[tuple[int, int]]:
     """Build unknown boundary cells, with a radial cold-start fallback."""
+    effective_tick = 0 if tick is None else tick
+    _prune_explore_target_cooldowns(effective_tick)
+
+    def eligible(cell: tuple[int, int]) -> bool:
+        return (
+            cell not in blocked
+            and cell not in _explored_cells
+            and not _explore_target_is_cooled(cell, effective_tick)
+        )
+
     candidates: set[tuple[int, int]] = set()
     for x, y in _explored_cells:
         for direction in DIRECTIONS:
             dx, dy = direction.delta
             cell = (x + dx, y + dy)
             if (
-                cell not in _explored_cells
-                and cell not in blocked
+                eligible(cell)
                 and cell != core_pos
                 and _manhattan(cell, core_pos) <= MAX_SWEEP_RADIUS
             ):
@@ -853,9 +910,11 @@ def _frontier_candidates(
                 (cx - radius // 2, cy + radius // 2),
                 (cx - radius // 2, cy - radius // 2),
             }
-            - blocked
-            - _explored_cells
         )
+        candidates = {
+            cell for cell in candidates
+            if eligible(cell) and cell != core_pos
+        }
     return sorted(candidates)
 
 
@@ -863,20 +922,24 @@ def _assign_explore_targets(
     workers: list[tuple[str, tuple[int, int]]],
     core_pos: tuple[int, int],
     blocked: frozenset[tuple[int, int]],
+    tick: int = 0,
 ) -> dict[str, tuple[int, int]]:
     """Assign stable, mutually separated frontier targets to idle Workers."""
+    _prune_explore_target_cooldowns(tick)
     live_ids = {worker_id for worker_id, _ in workers}
     for worker_id in list(_explore_targets):
         target = _explore_targets[worker_id]
         if (
             worker_id not in live_ids
             or target in blocked
+            or _explore_target_is_cooled(target, tick)
             or _frontier_gain(target, blocked) == 0
             or _manhattan(target, core_pos) > MAX_SWEEP_RADIUS
         ):
+            _explore_progress.pop(worker_id, None)
             del _explore_targets[worker_id]
 
-    candidates = _frontier_candidates(core_pos, blocked)
+    candidates = _frontier_candidates(core_pos, blocked, tick=tick)
     selected = list(_explore_targets.values())
     result: dict[str, tuple[int, int]] = {}
     for worker_id, position in sorted(workers):
@@ -907,6 +970,34 @@ def _assign_explore_targets(
         result[worker_id] = target
         selected.append(target)
     return result
+
+
+def _explore_target_has_stalled(
+    worker_id: str,
+    position: tuple[int, int],
+    target: tuple[int, int],
+    blocked: frozenset[tuple[int, int]],
+) -> bool:
+    """Detect repeated frontier ticks without distance or discovery progress."""
+    distance = _manhattan(position, target)
+    frontier_gain = _frontier_gain(target, blocked)
+    previous = _explore_progress.get(worker_id)
+    if previous is None or previous.target != target:
+        stalled_ticks = 0
+    else:
+        progressed = (
+            distance < previous.distance
+            or frontier_gain < previous.frontier_gain
+        )
+        stalled_ticks = 0 if progressed else previous.stalled_ticks + 1
+    _explore_progress[worker_id] = ExploreProgress(
+        target=target,
+        position=position,
+        distance=distance,
+        frontier_gain=frontier_gain,
+        stalled_ticks=stalled_ticks,
+    )
+    return stalled_ticks >= _EXPLORE_STALL_TICKS
 
 
 def _same_fire_line(a: tuple[int, int], b: tuple[int, int]) -> bool:
@@ -1508,6 +1599,7 @@ def _control_workers(turn: "Turn", core_pos: tuple[int, int]) -> None:
     )
     for worker_id in resource_assignments:
         _explore_targets.pop(worker_id, None)
+        _explore_progress.pop(worker_id, None)
     idle_workers = [
         (str(worker.id), tuple(worker.position))
         for worker in turn.workers
@@ -1525,7 +1617,7 @@ def _control_workers(turn: "Turn", core_pos: tuple[int, int]) -> None:
     if not resource_cells and len(idle_workers) >= 3:
         _resource_telemetry["explore_reserved"] = 1
     explore_targets = _assign_explore_targets(
-        idle_workers, core_pos, dynamically_blocked
+        idle_workers, core_pos, dynamically_blocked, tick=turn.tick
     )
     fallback_workers = list(idle_workers)
     sorted_workers = sorted(turn.workers, key=lambda worker: str(worker.id))
@@ -1746,9 +1838,13 @@ def _control_workers(turn: "Turn", core_pos: tuple[int, int]) -> None:
                 # 当前可见资源是真实目标，仍允许下面的贪心兜底。
                 _cooldown_resource(target, turn.tick)
                 _explore_targets.pop(wid, None)
+                _explore_progress.pop(wid, None)
                 fallback_workers.append((wid, tuple(pos)))
                 explore_targets = _assign_explore_targets(
-                    fallback_workers, core_pos, dynamically_blocked
+                    fallback_workers,
+                    core_pos,
+                    dynamically_blocked,
+                    tick=turn.tick,
                 )
             elif step is None:
                 step = _step_toward(pos, target, blocked_empty, avoid=_avoid_set(wid))
@@ -1762,10 +1858,55 @@ def _control_workers(turn: "Turn", core_pos: tuple[int, int]) -> None:
         # frontier target. The persistent map now actively drives exploration.
         target = explore_targets.get(wid)
         step = None
+        retargeted_frontier = False
         if target is not None:
-            step = _astar_step(pos, target, base_blocked, blocked_empty)
-            if step is None:
-                step = _step_toward(pos, target, blocked_empty, avoid=_avoid_set(wid))
+            if _explore_target_has_stalled(
+                wid, tuple(pos), target, dynamically_blocked
+            ):
+                _cooldown_explore_target(target, turn.tick)
+                _explore_targets.pop(wid, None)
+                _explore_progress.pop(wid, None)
+                explore_targets = _assign_explore_targets(
+                    idle_workers,
+                    core_pos,
+                    dynamically_blocked,
+                    tick=turn.tick,
+                )
+                target = explore_targets.get(wid)
+                retargeted_frontier = True
+            if target is not None and not retargeted_frontier:
+                step, budget_exhausted = _astar_step_result(
+                    pos, target, base_blocked, blocked_empty
+                )
+                target_sealed = all(
+                    (
+                        target[0] + direction.delta[0],
+                        target[1] + direction.delta[1],
+                    )
+                    in blocked_empty
+                    for direction in DIRECTIONS
+                )
+                if step is None and (target_sealed or not budget_exhausted):
+                    # A fully drained open set proves that this frontier cell
+                    # is unreachable. Do not follow it with a greedy detour;
+                    # cool it and select a fresh frontier instead.
+                    _cooldown_explore_target(target, turn.tick)
+                    _explore_targets.pop(wid, None)
+                    _explore_progress.pop(wid, None)
+                    explore_targets = _assign_explore_targets(
+                        idle_workers,
+                        core_pos,
+                        dynamically_blocked,
+                        tick=turn.tick,
+                    )
+                    target = None
+                    retargeted_frontier = True
+                elif step is None:
+                    # The expansion budget is a retryable condition, not proof
+                    # of a sealed target. Keep the intent and try again later.
+                    step = _step_toward(
+                        pos, target, blocked_empty, avoid=_avoid_set(wid)
+                    )
         if step is None:
             step = _explore_step(
                 orig_index, wid, pos, core_pos, blocked_empty,
@@ -2268,8 +2409,9 @@ def _standing_army_targets(n_workers: int) -> tuple[int, int]:
     with it, so a raid meets more return fire the more valuable the Core is
     (the 2026-08-02 Core loss was a raid against an economy with no army).
     Roughly one combat pair (Vanguard + Ranger) per 8 Workers, a floor of 1,
-    then shrunk to fit the conservative first-price-step budget (W + V + R <=
-    19, i.e. budget = FREE_UPKEEP_CAP - 1).
+    then shrunk to fit the conservative population target (W + V + R <= 20,
+    i.e. budget = FREE_UPKEEP_CAP). Population 20 is allowed; only the next
+    production pays the first dynamic-price premium.
 
     Ratchet-proof (10th review, rank 1): a raid that kills a Vanguard/Ranger
     does NOT lower the Worker count, so the old formula returned the same
@@ -2282,7 +2424,7 @@ def _standing_army_targets(n_workers: int) -> tuple[int, int]:
     vanguards = pairs
     rangers = pairs
     floor_v, floor_r = 1, 1  # hard floor — a dead combat Unit must be rebuilt
-    budget = FREE_UPKEEP_CAP - 1
+    budget = FREE_UPKEEP_CAP
     while n_workers + vanguards + rangers > budget:
         if vanguards > max(rangers, floor_v):
             vanguards -= 1
@@ -2331,7 +2473,7 @@ def _control_core(
         return
 
     # Spawn Workers toward the target fleet so the economy grows and explores
-    # faster, staying below the first dynamic-price step (population < 20). Only spawn
+    # faster, keeping the soft population target at 20. Only spawn
     # when the Core cell has room (Core + at most one colocated Unit) so it
     # does not fail with CELL_UNIT_LIMIT.
     #
@@ -2351,8 +2493,6 @@ def _control_core(
     )
     can_clear_occupied = core_full and colocated == laden_on_core and laden_on_core > 0
     if colocated >= 1 and not can_clear_occupied:
-        return
-    if population >= FREE_UPKEEP_CAP - 1:
         return
     # Deposits resolve before Unit heals and the Core action in the same Tick;
     # ``available_resources`` already includes only the amount that fits and
@@ -2377,7 +2517,7 @@ def _control_core(
         # Peacetime standing reserve scales with the Worker economy (user
         # requirement): a bigger fleet must field a bigger army so a raid
         # meets more return fire the more valuable the Core is. Growth is
-        # capped by the conservative first-price-step population budget below 20.
+        # capped by the conservative population target at 20.
         target_vanguards, target_rangers = _standing_army_targets(
             len(turn.workers)
         )
@@ -2414,12 +2554,12 @@ def _control_core(
             core.spawn(UnitType.RANGER)
             return
 
-    # Budget-aware Worker target (6th review, strategy STRAT-5): the effective
-    # ceiling is the conservative first-price-step population budget minus the standing army's pop
-    # cost. A fixed TARGET_WORKERS=19 ignored the army (e.g. V1R3 leaves room
-    # for only 15 Workers) and pushed the fleet into the next price step.
-    # TARGET_WORKERS remains as a legacy constant for the pre-army ceiling.
-    worker_target = FREE_UPKEEP_CAP - 1 - (
+    # Budget-aware Worker target: the effective ceiling is the population
+    # target minus the standing army's population cost. A fixed TARGET_WORKERS
+    # ignored the army and pushed the fleet into the next price step.
+    # TARGET_WORKERS remains as a public compatibility constant; the live
+    # ceiling is derived from the current standing-army population cost.
+    worker_target = FREE_UPKEEP_CAP - (
         len(turn.vanguards) + len(turn.rangers)
     )
     wants_worker = len(turn.workers) < worker_target
@@ -2456,6 +2596,9 @@ def _sync_explore_state(turn: "Turn") -> None:
     for uid in list(_explore_targets):
         if uid not in live:
             del _explore_targets[uid]
+    for uid in list(_explore_progress):
+        if uid not in live:
+            del _explore_progress[uid]
     for uid in list(_prev_pos):
         if uid not in live:
             del _prev_pos[uid]
@@ -2736,6 +2879,9 @@ def _clear_exploration_state() -> None:
     """
     _explore_state.clear()
     _explore_targets.clear()
+    _explore_progress.clear()
+    _explore_target_cooldown_until.clear()
+    _explore_target_failures.clear()
     _pos_history.clear()
     _prev_pos.clear()
     _last_pos.clear()

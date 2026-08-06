@@ -42,6 +42,9 @@ def _reset_explore_state() -> None:
     """Each test sees a clean per-Worker exploration memory."""
     tactic._explore_state.clear()
     tactic._explore_targets.clear()
+    tactic._explore_target_cooldown_until.clear()
+    tactic._explore_target_failures.clear()
+    tactic._explore_progress.clear()
     tactic._known_resources.clear()
     tactic._resource_hints.clear()
     tactic._resource_telemetry.clear()
@@ -56,6 +59,9 @@ def _reset_explore_state() -> None:
     yield
     tactic._explore_state.clear()
     tactic._explore_targets.clear()
+    tactic._explore_target_cooldown_until.clear()
+    tactic._explore_target_failures.clear()
+    tactic._explore_progress.clear()
     tactic._known_resources.clear()
     tactic._resource_hints.clear()
     tactic._resource_telemetry.clear()
@@ -757,6 +763,53 @@ def test_unreachable_resource_fallback_preserves_other_frontier_targets() -> Non
 
     assert first_worker in tactic._explore_targets
     assert tactic._explore_targets[second_worker] == stable_target
+
+
+def test_unreachable_frontier_target_is_cooled_and_reassigned() -> None:
+    worker_id = str(UUID(int=0x6000))
+    target = (10, 0)
+    tactic._explore_targets[worker_id] = target
+    tactic._known_obstacles.update({(9, 0), (11, 0), (10, -1), (10, 1)})
+    turn = _turn(_workers_state([(1, 0)]), tick=20)
+
+    decide(turn)
+
+    assert tactic._explore_target_cooldown_until[target] == 24
+    assert tactic._explore_targets.get(worker_id) != target
+    assert _action(turn.plan, UUID(int=0x6000)).type == "MOVE"
+
+
+def test_frontier_astar_budget_exhaustion_keeps_target_for_retry(monkeypatch) -> None:
+    worker_id = str(UUID(int=0x6000))
+    target = (10, 0)
+    tactic._explore_targets[worker_id] = target
+    turn = _turn(_workers_state([(1, 0)]), tick=20)
+
+    monkeypatch.setattr(
+        tactic,
+        "_astar_step_result",
+        lambda *args, **kwargs: (None, True),
+    )
+    decide(turn)
+
+    assert tactic._explore_targets[worker_id] == target
+    assert target not in tactic._explore_target_cooldown_until
+    assert _action(turn.plan, UUID(int=0x6000)).direction == Direction.RIGHT
+
+
+def test_frontier_progress_counter_retargets_after_stall() -> None:
+    worker_id = str(UUID(int=0x6000))
+    target = (10, 0)
+    blocked = frozenset()
+    tactic._explore_progress[worker_id] = tactic.ExploreProgress(
+        target=target,
+        position=(1, 0),
+        distance=9,
+        frontier_gain=tactic._frontier_gain(target, blocked),
+        stalled_ticks=tactic._EXPLORE_STALL_TICKS - 1,
+    )
+
+    assert tactic._explore_target_has_stalled(worker_id, (1, 0), target, blocked)
 
 
 def test_unchanged_visible_hint_does_not_dirty_full_persistent_map() -> None:
@@ -2467,7 +2520,20 @@ def _state_with_workers(
     ]
     # Place Workers on cells around the Core, none on the Core cell (so the
     # cell has room for a spawn).
-    worker_offsets = [(1, 0), (-1, 0), (0, 1), (0, -1), (2, 0), (-2, 0), (0, 2), (0, -2)]
+    worker_offsets = [
+        (1, 0),
+        (-1, 0),
+        (0, 1),
+        (0, -1),
+        (2, 0),
+        (-2, 0),
+        (0, 2),
+        (0, -2),
+        *(
+            (10 + i % 10, 10 + i // 10)
+            for i in range(20)
+        ),
+    ]
     for i in range(n_workers):
         ox, oy = worker_offsets[i]
         objects.append(
@@ -2621,6 +2687,52 @@ def test_visible_enemy_triggers_attack_spawn_with_one_worker() -> None:
     assert act.unit_type.value == "VANGUARD"
 
 
+def test_population_19_can_spawn_the_twentieth_unit() -> None:
+    # v0.14 keeps the base Vanguard price for the twentieth Unit. The old
+    # population >= 19 guard incorrectly suppressed this defensive spawn.
+    state = _state_with_workers(
+        n_workers=18, n_vanguards=1, resources=10, threat=True
+    )
+    assert state.population == 19
+    turn = _turn(state)
+
+    decide(turn)
+
+    act = _core_action(turn.plan)
+    assert act is not None
+    assert act.type == "SPAWN"
+    assert act.unit_type.value == "VANGUARD"
+
+
+@pytest.mark.parametrize(
+    ("resources", "spawns"),
+    [(12, False), (13, True)],
+)
+def test_population_20_uses_first_dynamic_price_for_combat_spawn(
+    resources: int, spawns: bool
+) -> None:
+    # At population 20 the next Vanguard costs round(10 * 1.3) = 13. A
+    # population gate must not hide the dynamic-price decision or block a
+    # needed replacement when the bank can afford it.
+    state = _state_with_workers(
+        n_workers=18,
+        n_vanguards=1,
+        n_rangers=1,
+        resources=resources,
+        threat=True,
+    )
+    assert state.population == 20
+    turn = _turn(state)
+
+    decide(turn)
+
+    act = _core_action(turn.plan)
+    assert (act is not None) is spawns
+    if spawns:
+        assert act.type == "SPAWN"
+        assert act.unit_type.value == "VANGUARD"
+
+
 def test_cold_start_workers_before_army() -> None:
     # Below the economy floor (2 Workers), plenty of resources, no threat:
     # build the economy first — spawn a Worker, not a combat Unit.
@@ -2636,26 +2748,24 @@ def test_cold_start_workers_before_army() -> None:
 def test_standing_army_scales_with_worker_fleet() -> None:
     # User requirement: the standing army grows with the Worker economy, so a
     # raid meets more return fire the larger the fleet. 8 Workers -> V1 R1;
-    # 16 Workers -> V2 R1 (fits the free-upkeep pop budget 16+2+1=19, favoring
-    # the cheap Vanguard body-block over the pricier Ranger when the budget
-    # must shrink).
+    # 16 Workers -> V2 R2 (population 20 is still allowed; the next production
+    # is the first dynamic-price unit).
     #
     # 10th review (rank 1): a HARD floor of V>=1,R>=1 prevents the ratchet
     # where a raid that kills combat units never triggers a rebuild because
     # the worker count is unchanged and the target matches the current count.
-    # When the budget would overflow (e.g. W=18 gives V=1,R=1=20 total), the
-    # soft target is overridden — the pop gate in _control_core prevents
-    # actual over-spawn. The army is rebuilt as soon as pop drops below 19.
+    # When the budget would overflow, the hard V/R floor remains while Worker
+    # growth is held at the population target. Combat replacements are still
+    # allowed above that target when the standing reserve is short.
     assert tactic._standing_army_targets(4) == (1, 1)
     assert tactic._standing_army_targets(8) == (1, 1)
     assert tactic._standing_army_targets(12) == (1, 1)
-    assert tactic._standing_army_targets(16) == (2, 1)
-    assert tactic._standing_army_targets(17) == (1, 1)
-    # W=18: hard floor forces (1,1) even though total 20 exceeds budget 19;
-    # _control_core's pop gate prevents actual over-spawn
+    assert tactic._standing_army_targets(16) == (2, 2)
+    assert tactic._standing_army_targets(17) == (2, 1)
+    # W=18: hard floor forces (1,1) after fitting the population target.
     assert tactic._standing_army_targets(18) == (1, 1)
-    # W=19: hard floor keeps V=1,R=1; pop gate stops all spawns at pop>=19,
-    # army rebuilds when population drops
+    # W=19: hard floor keeps V=1,R=1 even though the floor itself makes the
+    # combined count one above the soft target.
     assert tactic._standing_army_targets(19) == (1, 1)
     for w in range(4, tactic.FREE_UPKEEP_CAP):
         v, r = tactic._standing_army_targets(w)
@@ -2667,8 +2777,8 @@ def test_standing_army_scales_with_worker_fleet() -> None:
 
 
 def test_pop_over_budget_does_not_destroy_units_or_capacity() -> None:
-    # A manual expansion above 19 pays upkeep, but the Agent must not destroy
-    # units and shrink capacity before upkeep merely to save 1 resource/tick.
+    # A manual expansion above the soft target must not destroy units or shrink
+    # capacity merely to avoid a dynamic production price.
     objects = [
         {
             "kind": "CORE",

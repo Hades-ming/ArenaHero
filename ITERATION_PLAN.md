@@ -163,8 +163,9 @@
 
 - `PERF-001`：只对 Worker 的前 K 个 Manhattan 候选计算/缓存 A*，再用
   `confidence * yield / (outbound + harvest + return + deposit_wait)` 排序。
-- 人口 20+：没有自动 upkeep；生产价格按人口阶梯上涨。仍以人口 19 作为保守软上限，直到
-  边际 Worker 的实测增量入核率覆盖动态生产成本和防御风险。
+- 人口 20+：没有自动 upkeep；生产价格按人口阶梯上涨。当前把人口 20 作为 Worker 的保守软目标，
+  允许人口 19 生产第 20 个基础价 Unit；敌情或军备缺口下可继续补战斗单位。超过 20 的纯 Worker
+  扩张仍需等边际 Worker 的实测增量入核率覆盖动态生产成本和防御风险。
 - Core 满仓缓冲队列：先取得“距 Core 两格到入核”的 P50/P95，再决定是否实现。
 
 ## `RESOURCE-DISPATCH-002` 可见资源机会成本修复
