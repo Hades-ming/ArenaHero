@@ -2916,6 +2916,61 @@ def test_resource_memory_pool_remembers_and_confirms() -> None:
     assert (8, 0) in tactic._known_resources
 
 
+def test_resource_hidden_behind_persistent_obstacle_is_not_forgotten() -> None:
+    # A Worker can lose line of sight while stepping beside a wall that was
+    # observed on an earlier Tick.  The persistent obstacle must still block
+    # the empty-cell confirmation, otherwise the dispatcher drops the resource
+    # and sends the Worker back and forth between historical targets.
+    cell = (383, 126)
+    obstacle = (383, 125)
+    core_worker = [
+        {
+            "kind": "CORE",
+            "id": str(CORE_ID),
+            "controlled": True,
+            "owner_username": "arena_hero",
+            "position": [347, 124],
+            "hp": 5,
+            "shield": 5,
+            "state": "NORMAL",
+        },
+        {
+            "kind": "UNIT",
+            "id": str(WORKER_ID),
+            "controlled": True,
+            "position": [381, 125],
+            "hp": 2,
+            "unit_type": "WORKER",
+            "cargo": 0,
+        },
+    ]
+    visible = _state(
+        core_pos=(347, 124),
+        population=1,
+        objects=core_worker + [{"kind": "RESOURCE", "positions": [list(cell)]}],
+    )
+    tactic._observe_resources(_turn(visible, tick=1))
+    assert cell in tactic._known_resources
+
+    # The next authoritative state omits the resource and the currently
+    # visible obstacle, but the worker's line to the cell crosses the persisted
+    # obstacle at (383,125).
+    tactic._known_obstacles.add(obstacle)
+    hidden = _state(
+        core_pos=(347, 124),
+        population=1,
+        objects=[
+            core_worker[0],
+            {**core_worker[1], "position": [382, 125]},
+        ],
+    )
+    tactic._observe_resources(_turn(hidden, tick=2))
+    assert cell in tactic._known_resources
+    assert tactic._worker_resource_assignments(_turn(hidden, tick=2)) == {
+        str(WORKER_ID): cell
+    }
+
+
 def test_current_resource_state_overrides_previous_harvest_event() -> None:
     state = _state(
         objects=[

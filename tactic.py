@@ -2754,7 +2754,11 @@ def _observe_resources(turn: "Turn") -> None:
     # Remove cells that a friendly vision source can see and are confirmed
     # not to hold a resource (visible but not in turn.resource_cells).
     sources = _vision_sources(turn)
-    obstacles = turn.obstacle_cells
+    # The current state may omit a wall that was outside this Tick's view, but
+    # the wall is still real terrain.  Keep it in the line-of-sight test or a
+    # resource behind that remembered wall is incorrectly declared empty and
+    # the next Tick sends its Worker toward a different historical target.
+    obstacles = frozenset(turn.obstacle_cells) | _known_obstacles
     for cell in list(_known_resources):
         if cell in turn.resource_cells:
             continue  # still a resource, keep it
