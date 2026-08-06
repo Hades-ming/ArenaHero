@@ -633,8 +633,8 @@ def _resource_telemetry_summary() -> str:
 def _resource_age(cell: tuple[int, int], tick: int) -> int:
     """返回历史资源提示的逻辑 Tick 年龄。"""
     hint = _resource_hints.get(cell)
-    if hint is None or hint.source == "legacy":
-        return 0
+    if hint is None:
+        return max(0, tick)
     return max(0, tick - hint.last_confirmed_tick)
 
 
@@ -698,14 +698,18 @@ def _worker_resource_assignments(
             "cooled": len(cooled_resources),
         }
     )
-    # 空闲 Worker 达到一定规模且当前没有可见资源时，保留一个 Worker 做前沿
-    # 扫描。这样大量旧地图提示不会把所有 Worker 都停在陈旧路线，同时仍让
-    # 前两个 Worker 立即处理已知历史资源。
+    # 只要候选里混有历史提示，就保留一个没有站在可见资源上的 Worker 做前沿
+    # 扫描。这样历史点不能在可见资源出现时把全队锁死，同时站在可见资源格的
+    # Worker 仍会优先采集。
     dispatch_workers = workers
-    if not visible_resources and len(workers) >= 3:
+    history_resources = set(resources) - visible_resources
+    explorer_candidates = [
+        worker for worker in workers if tuple(worker.position) not in visible_resources
+    ]
+    if history_resources and len(workers) >= 2 and explorer_candidates:
         core_pos = turn.core.position if turn.core is not None else (0, 0)
         explorer = max(
-            workers,
+            explorer_candidates,
             key=lambda worker: (_manhattan(worker.position, core_pos), str(worker.id)),
         )
         dispatch_workers = [worker for worker in workers if worker is not explorer]
@@ -830,6 +834,7 @@ def _frontier_candidates(
                 (cx - radius // 2, cy - radius // 2),
             }
             - blocked
+            - _explored_cells
         )
     return sorted(candidates)
 

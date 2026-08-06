@@ -259,10 +259,54 @@ def test_history_dispatch_reserves_a_worker_for_exploration() -> None:
     assert tactic._resource_telemetry["explore_reserved"] == 1
 
 
+def test_history_dispatch_keeps_exploration_slot_when_visible_resource_exists() -> None:
+    """历史提示不能占满 Worker，当前可见资源仍必须优先。"""
+    visible = (10, 0)
+    remembered = (100, 0)
+    tactic._known_resources.add(remembered)
+    tactic._resource_hints[remembered] = tactic.ResourceHint(19, "history")
+    turn = _turn(
+        _workers_state([(0, 1), (0, 2)], resources=[visible]),
+        tick=20,
+    )
+    tactic._observe_resources(turn)
+
+    assignments = tactic._worker_resource_assignments(turn)
+
+    assert set(assignments.values()) == {visible}
+    assert tactic._resource_telemetry["explore_reserved"] == 1
+
+
+def test_legacy_history_hint_also_reserves_exploration_before_expiry() -> None:
+    visible = (10, 0)
+    remembered = (100, 0)
+    tactic._known_resources.add(remembered)
+    tactic._resource_hints[remembered] = tactic.ResourceHint(0, "legacy")
+    turn = _turn(
+        _workers_state([(0, 1), (0, 2)], resources=[visible]),
+        tick=20,
+    )
+
+    assignments = tactic._worker_resource_assignments(turn)
+
+    assert set(assignments.values()) == {visible}
+    assert tactic._resource_telemetry["explore_reserved"] == 1
+
+
 def test_very_old_history_hint_is_not_an_active_resource_target() -> None:
     cell = (100, 0)
     tactic._known_resources.add(cell)
     tactic._resource_hints[cell] = tactic.ResourceHint(1, "history")
+    turn = _turn(_workers_state([(0, 0)]), tick=300)
+
+    assert tactic._worker_resource_assignments(turn) == {}
+    assert tactic._resource_telemetry["stale"] == 1
+
+
+def test_legacy_resource_hint_ages_out_after_restart() -> None:
+    cell = (100, 0)
+    tactic._known_resources.add(cell)
+    tactic._resource_hints[cell] = tactic.ResourceHint(0, "legacy")
     turn = _turn(_workers_state([(0, 0)]), tick=300)
 
     assert tactic._worker_resource_assignments(turn) == {}
@@ -295,7 +339,7 @@ def test_global_resource_matching_beats_worker_order_greedy() -> None:
     # A->(0,100), B->(1,0), total 101.
     resources = {(1, 0), (0, 100)}
     tactic._known_resources.update(resources)
-    turn = _turn(_workers_state([(0, 0), (2, 0)]))
+    turn = _turn(_workers_state([(0, 0), (2, 0)], resources=list(resources)))
 
     assignments = tactic._worker_resource_assignments(turn)
 
@@ -307,7 +351,7 @@ def test_global_resource_matching_beats_worker_order_greedy() -> None:
 
 def test_global_resource_matching_ignores_unit_input_order() -> None:
     tactic._known_resources.update({(1, 0), (0, 100)})
-    state = _workers_state([(0, 0), (2, 0)])
+    state = _workers_state([(0, 0), (2, 0)], resources=[(1, 0), (0, 100)])
     turn = _turn(state)
     expected = tactic._worker_resource_assignments(turn)
 
@@ -319,7 +363,13 @@ def test_global_resource_matching_ignores_unit_input_order() -> None:
 
 def test_global_resource_matching_excludes_laden_workers_and_is_unique() -> None:
     tactic._known_resources.update({(1, 0), (2, 0)})
-    turn = _turn(_workers_state([(0, 0), (0, 1), (0, 2)], cargo=[1, 0, 0]))
+    turn = _turn(
+        _workers_state(
+            [(0, 0), (0, 1), (0, 2)],
+            cargo=[1, 0, 0],
+            resources=[(1, 0), (2, 0)],
+        )
+    )
 
     assignments = tactic._worker_resource_assignments(turn)
 
@@ -782,6 +832,19 @@ def test_unknown_cells_behind_obstacle_remain_exploration_frontier() -> None:
 
     assert targets[str(UUID(int=0x6000))] != (1, 0)
     assert targets[str(UUID(int=0x6000))] not in tactic._explored_cells
+
+
+def test_frontier_fallback_does_not_reuse_fully_explored_cells() -> None:
+    tactic._explored_cells.update(
+        (x, y)
+        for x in range(-tactic.MAX_SWEEP_RADIUS, tactic.MAX_SWEEP_RADIUS + 1)
+        for y in range(-tactic.MAX_SWEEP_RADIUS, tactic.MAX_SWEEP_RADIUS + 1)
+        if abs(x) + abs(y) <= tactic.MAX_SWEEP_RADIUS
+    )
+
+    candidates = tactic._frontier_candidates((0, 0), frozenset())
+
+    assert candidates == []
 
 
 def test_frontier_targets_stay_near_current_core_after_migration() -> None:
