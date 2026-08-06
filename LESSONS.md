@@ -359,3 +359,13 @@
   才把 `visible_assignments`、采集到交付延迟和入核资源/Tick 纳入收益判断。
 - **复用规则**：探索保留应按机会成本选择，不能只看 Core 距离；任何“看见资源但 `a0/av0`”都必须
   先核对运行版本、Worker cargo 和派单排除原因。
+
+## L22 — Live 协议漂移必须停止验收，不能在客户端猜字段
+- **现象**：重启后的单连接在首个 `state` 解析失败；原始 WebSocket 明确缺少
+  `population_tier` 与 `upkeep_next_tick`，而 SDK `0.2.8` 将这两个字段定义为必填。
+- **确认**：本地规则包与 SDK 版本为 `v0.13 / 0.2.8`，`uv pip install --upgrade --dry-run arena-hero`
+  显示无可升级版本；同一原始消息可读但无法通过官方严格模型验证。
+- **处置**：停止 LaunchAgent，保留 `ProtocolError` 证据；不修改 site-packages、不放宽 Pydantic
+  校验、不凭默认值继续提交计划。服务端、公开 schema 和 SDK 必须先恢复同一协议版本。
+- **复用规则**：任何 live 规则相关改动先做原始握手与版本核对；协议错误窗口不得混入资源 KPI，
+  也不能把“进程在重启”误报成策略失败。

@@ -182,6 +182,13 @@
 - **回滚**：连续两个 100-Tick 窗口入核率下降 10%、采集到入核 P95 上升 25%、资源失败率
   上升 5 个百分点，或出现 Core/窗口/协议故障，恢复上一提交。
 
+### 当前验收阻断（2026-08-06）
+
+- 单连接原始 WebSocket 的 `state` 消息缺少 SDK 0.2.8 必填字段
+  `population_tier`、`upkeep_next_tick`，官方客户端因此抛出 `ProtocolError`。
+- 已停止 LaunchAgent，未将协议错误 Tick 纳入 canary；等待服务端/公开 schema/SDK 对齐后，
+  从新窗口重新执行 20 Tick canary。当前提交只完成静态调度修复，不宣称 live 收益已验证。
+
 ## 本轮完成定义
 
 1. 所有批准任务由用户安排的外部执行 Agent 交付、主代理验收；主代理不派发或代写实现，
