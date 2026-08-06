@@ -38,8 +38,11 @@ ENEMY_UNIT_ID = UUID("00000000-0000-4000-8000-000000000098")
 
 
 @pytest.fixture(autouse=True)
-def _reset_explore_state() -> None:
-    """Each test sees a clean per-Worker exploration memory."""
+def _reset_explore_state(tmp_path, monkeypatch) -> None:
+    """Each test is isolated, including the persistent map file."""
+    # ``decide`` flushes dirty map state at the end of a Tick. Point tests at a
+    # temporary file so the suite can never overwrite the live tactic's map.
+    monkeypatch.setattr(tactic, "_STATE_PATH", tmp_path / "tactic_state.json")
     tactic._explore_state.clear()
     tactic._explore_targets.clear()
     tactic._explore_target_cooldown_until.clear()
@@ -353,6 +356,52 @@ def test_very_old_history_hint_is_not_an_active_resource_target() -> None:
 
     assert tactic._worker_resource_assignments(turn) == {}
     assert tactic._resource_telemetry["stale"] == 1
+
+
+def test_harvest_failure_invalidates_history_hint_immediately() -> None:
+    cell = (10, 0)
+    tactic._known_resources.add(cell)
+    tactic._resource_hints[cell] = tactic.ResourceHint(19, "history")
+    state = _state(
+        objects=[
+            {
+                "kind": "CORE",
+                "id": str(CORE_ID),
+                "controlled": True,
+                "owner_username": "arena_hero",
+                "position": [0, 0],
+                "hp": 5,
+                "shield": 5,
+                "state": "NORMAL",
+            },
+            {
+                "kind": "UNIT",
+                "id": str(WORKER_ID),
+                "controlled": True,
+                "position": list(cell),
+                "hp": 2,
+                "unit_type": "WORKER",
+                "cargo": 0,
+            },
+        ],
+        events=[
+            {
+                "event_id": "00000000-0000-4000-8000-0000000000ac",
+                "tick": 19,
+                "event_type": "HARVEST_FAILED",
+                "actor_id": str(WORKER_ID),
+                "position": list(cell),
+                "reason_code": "NOT_RESOURCE_CELL",
+            }
+        ],
+    )
+    turn = _turn(state, tick=20)
+
+    decide(turn)
+
+    assert cell not in tactic._known_resources
+    assert cell not in tactic._resource_hints
+    assert tactic._resource_telemetry["resource_failures"] == 1
 
 
 def test_legacy_resource_hint_ages_out_after_restart() -> None:
@@ -2650,6 +2699,23 @@ def test_partial_army_allows_one_economy_bridge_worker() -> None:
     )
     turn = _turn(state)
     decide(turn)
+    act = _core_action(turn.plan)
+    assert act is not None
+    assert act.type == "SPAWN"
+    assert act.unit_type.value == "WORKER"
+
+
+def test_peacetime_bridge_reaches_second_extra_worker() -> None:
+    # A mature W5/V2 economy should not freeze while it banks for its first
+    # Ranger. The bounded bridge allows two further scouts, then the Ranger
+    # remains the next combat priority once resources reach its price.
+    state = _state_with_workers(
+        n_workers=5, resources=8, n_vanguards=2, n_rangers=0
+    )
+    turn = _turn(state)
+
+    decide(turn)
+
     act = _core_action(turn.plan)
     assert act is not None
     assert act.type == "SPAWN"

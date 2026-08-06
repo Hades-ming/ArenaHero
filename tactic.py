@@ -107,11 +107,11 @@ WORKER_SPAWN_RESERVE = 3
 # and BEFORE growing Workers past that floor — combat readiness outranks a
 # larger Worker fleet once the economy can sustain the smallest army.
 MIN_WORKERS_BEFORE_ARMY = 4
-# If a combat Unit already exists, permit one extra Worker to bridge a
-# temporary Ranger/Vanguard shortfall while the Core is not under immediate
-# threat.  This keeps the economy from freezing at the four-Worker floor while
-# still reserving the bank for combat as soon as a nearby enemy is present.
-ECONOMY_BRIDGE_MAX_WORKERS = MIN_WORKERS_BEFORE_ARMY + 1
+# If a combat Unit already exists, permit a bounded Worker bridge while the
+# Core is not under immediate threat.  The old one-Worker bridge still left a
+# healthy Core at W5/V2/R0 waiting for a Ranger; two additional scouts raise
+# discovery without allowing an unbounded peaceful army deficit.
+ECONOMY_BRIDGE_MAX_WORKERS = MIN_WORKERS_BEFORE_ARMY + 3
 # Peacetime standing reserve now SCALES with the Worker fleet via
 # _standing_army_targets (a floor of V1/R1, growing ~one combat pair per 8
 # Workers up to the first-price-step population budget). These legacy constants document
@@ -711,7 +711,12 @@ def _worker_resource_assignments(
         }
     )
     fixed: dict[str, tuple[int, int]] = {}
-    for resource in sorted(eligible_resources & blocked_resources):
+    # A Worker already standing on a currently visible resource is the highest
+    # confidence assignment. Pin it before the global matcher so history
+    # targets, stale age penalties, or dynamic blockers can never pull that
+    # Worker away and waste the harvest window.
+    fixed_resources = eligible_resources & (visible_resources | blocked_resources)
+    for resource in sorted(fixed_resources):
         occupant = next(
             (worker for worker in workers if tuple(worker.position) == resource),
             None,
@@ -815,7 +820,12 @@ def _worker_resource_assignments(
         costs = [
             [
                 _manhattan(resource, worker.position)
-                + _resource_age(resource, turn.tick) * _HISTORY_RESOURCE_AGE_WEIGHT
+                + (
+                    0
+                    if resource in visible_resources
+                    else history_penalty
+                    + _resource_age(resource, turn.tick) * _HISTORY_RESOURCE_AGE_WEIGHT
+                )
                 for worker in dispatch_workers
             ]
             for resource in resources
@@ -925,6 +935,23 @@ def _frontier_candidates(
     return sorted(candidates)
 
 
+def _explore_sector(
+    cell: tuple[int, int], core_pos: tuple[int, int]
+) -> tuple[int, int]:
+    """Return the signed compass sector of a frontier cell.
+
+    Eight sectors (including the cardinal axes) are enough to prevent several
+    idle Workers from selecting the same side of the frontier while keeping
+    the assignment deterministic and independent of map iteration order.
+    """
+    dx = cell[0] - core_pos[0]
+    dy = cell[1] - core_pos[1]
+    return (
+        1 if dx > 0 else -1 if dx < 0 else 0,
+        1 if dy > 0 else -1 if dy < 0 else 0,
+    )
+
+
 def _assign_explore_targets(
     workers: list[tuple[str, tuple[int, int]]],
     core_pos: tuple[int, int],
@@ -948,6 +975,9 @@ def _assign_explore_targets(
 
     candidates = _frontier_candidates(core_pos, blocked, tick=tick)
     selected = list(_explore_targets.values())
+    sector_counts: Counter[tuple[int, int]] = Counter(
+        _explore_sector(target, core_pos) for target in selected
+    )
     result: dict[str, tuple[int, int]] = {}
     for worker_id, position in sorted(workers):
         existing = _explore_targets.get(worker_id)
@@ -958,13 +988,19 @@ def _assign_explore_targets(
         if not available:
             break
 
-        def score(candidate: tuple[int, int]) -> tuple[int, int, int, int, int]:
+        def score(candidate: tuple[int, int]) -> tuple[int, int, int, int, int, int]:
             separation = (
                 min(_manhattan(candidate, other) for other in selected)
                 if selected
                 else _manhattan(candidate, core_pos)
             )
+            # Prefer an unexplored direction before taking another target on a
+            # saturated side.  The old score only maximized local frontier gain,
+            # so a dense east edge could claim every idle Worker and recreate
+            # the user's observed southeast cluster.
+            sector = _explore_sector(candidate, core_pos)
             return (
+                -sector_counts.get(sector, 0),
                 _frontier_gain(candidate, blocked),
                 separation,
                 -_manhattan(position, candidate),
@@ -976,6 +1012,7 @@ def _assign_explore_targets(
         _explore_targets[worker_id] = target
         result[worker_id] = target
         selected.append(target)
+        sector_counts[_explore_sector(target, core_pos)] += 1
     return result
 
 
@@ -2574,19 +2611,31 @@ def _control_core(
         len(turn.vanguards) < target_vanguards
         or len(turn.rangers) < target_rangers
     )
-    # Above the economy floor (and whenever an enemy is present), if the combat
-    # reserve is still short, bank toward the next combat Unit.  One guarded
-    # exception prevents a temporary Ranger gap from freezing a mature enough
-    # economy: with at least one combat Unit already alive, no nearby threat,
-    # and only four Workers, a single Worker may bridge the gap.  The following
-    # Tick is gated again, so this cannot turn into unbounded Worker spending.
+    # Under a visible enemy, if the combat reserve is still short, bank toward
+    # the next combat Unit.  In peaceful play a bounded economy bridge is
+    # allowed whenever at least one combat Unit already exists: the extra
+    # Workers increase discovery and Core capacity while the bridge cap keeps
+    # a missing Ranger from turning into unbounded Worker spending.
     bridge_worker_allowed = (
         not threatened
         and len(turn.workers) < ECONOMY_BRIDGE_MAX_WORKERS
         and (len(turn.vanguards) + len(turn.rangers)) > 0
     )
-    if (economy_floor_met or enemy_present) and army_short and not bridge_worker_allowed:
-        return
+    combat_count = len(turn.vanguards) + len(turn.rangers)
+    if army_short and not bridge_worker_allowed:
+        # A cold start still builds its first combat pair before growing past
+        # the economy floor. Once a combat Unit exists, stop the bridge at its
+        # cap and bank for the missing Ranger/Vanguard; a visible enemy always
+        # takes that combat-first path regardless of the bridge state.
+        if (
+            enemy_present
+            or (combat_count == 0 and economy_floor_met)
+            or (
+                combat_count > 0
+                and len(turn.workers) >= ECONOMY_BRIDGE_MAX_WORKERS
+            )
+        ):
+            return
     # Bank reserve: only spawn a Worker if the Core keeps at least
     # WORKER_SPAWN_RESERVE resources afterward, so the economy never drains to
     # zero and the standing-army bank is not reset each spawn.
@@ -2714,6 +2763,16 @@ def _observe_resources(turn: "Turn") -> None:
     """
     global _known_resources, _resource_telemetry
     _resource_telemetry = {
+        "resource_failures": sum(
+            1
+            for event in turn.events
+            if event.event_type == "HARVEST_FAILED"
+            and event.reason_code in {
+                "RESOURCE_DEPLETED",
+                "NOT_RESOURCE_CELL",
+                "RESOURCE_NOT_FOUND",
+            }
+        ),
         "harvested": sum(
             event.resource_amount or 0
             for event in turn.events
@@ -2878,13 +2937,31 @@ def _process_events(turn: "Turn") -> None:
     run observer (see play.py) and to surface notable outcomes; they do not
     change the queued plan.
     """
+    resource_invalidated = False
     for event in turn.events:
+        if (
+            event.event_type == "HARVEST_FAILED"
+            and event.position is not None
+            and event.reason_code
+            in {"RESOURCE_DEPLETED", "NOT_RESOURCE_CELL", "RESOURCE_NOT_FOUND"}
+        ):
+            # A failed harvest is stronger evidence than a remembered hint. It
+            # confirms that the node is gone at resolution; if the next state
+            # still shows a cargo pile or a refill at that coordinate,
+            # _observe_resources will add it back as fresh current truth.
+            cell = tuple(event.position)
+            if cell in _known_resources or cell in _resource_hints:
+                _known_resources.discard(cell)
+                _resource_hints.pop(cell, None)
+                resource_invalidated = True
         if event.event_type == "WORKER_CARGO_DROPPED":
             continue
         if event.harvest_source is HarvestSource.DROPPED_CARGO:
             continue
         if event.event_type == "CORE_DAMAGED":
             continue
+    if resource_invalidated:
+        _mark_persistent_state_dirty()
 
 
 def _clear_exploration_state() -> None:
