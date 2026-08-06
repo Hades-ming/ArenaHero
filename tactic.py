@@ -1277,13 +1277,21 @@ def _explore_step(
     # loss AND the worker never returns — observed workers stranded 60-88 cells
     # out (x 30-44, y 276-297) while north resources near the Core sat
     # uncollected. Steer back toward the Core until back in range.
-    # 9th review rank 3: use A* (same laden-return pattern) + clear anti-
-    # backtrack history so the avoid-set cannot re-enter the obstacle corner trap
-    # (67512f oscillated 70+ ticks at d=67-71 around the enemy Core at (38,278)).
+    # 9th review rank 3: use A* (same laden-return pattern). Keep the
+    # anti-backtrack history while returning: when a visible enemy or obstacle
+    # changes the locally preferred A* branch, clearing history every Tick can
+    # make the Worker oscillate between the same two cells outside the scan
+    # radius.
     if _manhattan(pos, core_pos) > MAX_SWEEP_RADIUS:
-        _pos_history.pop(worker_id, None)
-        _prev_pos.pop(worker_id, None)
         step = _astar_step(pos, core_pos, blocked, blocked)
+        avoid = _avoid_set(worker_id)
+        if step is not None and avoid is not None:
+            ddx, ddy = step.delta
+            next_cell = (pos[0] + ddx, pos[1] + ddy)
+            if next_cell in avoid:
+                step = _step_toward(pos, core_pos, blocked, avoid=avoid)
+        if step is None:
+            step = _step_toward(pos, core_pos, blocked, avoid=avoid)
         if step is None:
             step = _step_toward(pos, core_pos, blocked)
         if step is not None:

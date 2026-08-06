@@ -1728,6 +1728,23 @@ def test_worker_avoids_obstacle_when_moving() -> None:
     assert action.direction != Direction.RIGHT
 
 
+def test_out_of_radius_return_does_not_backtrack_into_recent_cell() -> None:
+    worker_id = str(WORKER_ID)
+    tactic._pos_history[worker_id] = [(0, 1)]
+    blocked = frozenset({(1, 0), (0, -1)})
+
+    step = tactic._explore_step(
+        0,
+        worker_id,
+        (0, 0),
+        (50, 0),
+        blocked,
+    )
+
+    assert step is not None
+    assert step != Direction.DOWN
+
+
 # ---------------------------------------------------------------------------
 # Core actions: repair and spawn
 # ---------------------------------------------------------------------------
