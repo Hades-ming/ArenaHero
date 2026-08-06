@@ -363,3 +363,24 @@
 - **接受/回滚**：Core 必须存活且无协议/提交/窗口错误；若连续两个 `100` Tick 窗口入核率比
   `RESOURCE-DISPATCH-009` 低 `10%`、采集延迟 P95 上升 `25%`、`far` 过滤后出现连续 `24`
   Tick 无采集，或出现第二个客户端，恢复上一提交并保留运行备份。
+
+## `RESOURCE-DISPATCH-011` 和平期军备库存闸门与空载 Core 格保护（当前 STATIC_VERIFIED）
+
+- **当前证据**：单进程窗口 `t64097..t64165` 共 69 个唯一 Tick，7 次采集、9 次交付；和平期
+  Ranger 生产把库存从 `13` 降到 `1`，窗口末仅回升到 `5`。同窗另有 1 次
+  `CORE_SPAWN_FAILED.CELL_UNIT_LIMIT`，对应空载 Worker 误入 Core 格。
+- **可证伪假设**：已有 Vanguard 防线且无敌人时，Ranger 生产后的库存下限可以减少净资源
+  断崖，而不会影响敌情下的即时攻击生产；空载 Worker 的最终兜底阻塞 Core 后，生产失败应为零。
+- **实现范围**：只修改 `tactic.py` 与 `tests/test_tactic.py`。和平期补齐 Ranger 前至少保留
+  5 点库存；可见敌人时保留为 0。空载 Worker 的探索/脱困兜底一律把 Core 格视为阻塞，带货
+  Worker 的交付路径不变。
+- **静态验收**：`150 passed`；`compileall`、`uv pip check`、`git diff --check`、敏感信息
+  扫描通过。
+- **Canary 门槛**：重启前备份 `game.log` 与 `tactic_state.json`，只允许一个 `play.py`；先看
+  20 个唯一 Tick，要求无协议、认证、提交、窗口错误且 Core 存活；随后累计至少 100 个唯一
+  Tick 和 20 条采集入核链路，再比较库存净增。
+- **主指标**：和平窗口入核资源/Tick、库存净增和 Ranger 生产后的最低库存。
+- **安全护栏**：敌情出现后下一可生产 Tick 不得因库存闸门跳过攻击单位；`CELL_UNIT_LIMIT`、
+  Core 受损、移动/资源失败率不得上升；决策 P95 仍低于 1000ms。
+- **回滚**：连续两个 100-Tick 窗口入核资源/Tick 低于当前基线 10%，敌情下攻击生产延迟，
+  出现 Core/协议/窗口故障，或新增 Core 格生产失败，即恢复上一策略提交；不删除地图备份。

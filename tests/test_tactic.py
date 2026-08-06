@@ -2835,10 +2835,33 @@ def test_standing_army_spawns_vanguard_above_economy_floor() -> None:
     assert act.unit_type.value == "VANGUARD"
 
 
-def test_standing_army_spawns_ranger_after_vanguard() -> None:
-    # Vanguard reserve exists, 4 Workers, 12 resources: build the standing
-    # Ranger (range-3 return fire) next.
-    state = _state_with_workers(n_workers=4, resources=12, n_vanguards=1)
+def test_standing_army_banks_for_peacetime_ranger_reserve() -> None:
+    # 已有 Vanguard 防线，但 12 点资源会被 Ranger 全部消耗。和平期保留库存，
+    # 等待额外 5 点资源到账后再补齐 Ranger。
+    state = _state_with_workers(n_workers=12, resources=12, n_vanguards=2)
+    turn = _turn(state)
+    decide(turn)
+    assert _core_action(turn.plan) is None
+
+
+def test_standing_army_spawns_ranger_after_peacetime_reserve() -> None:
+    state = _state_with_workers(n_workers=12, resources=17, n_vanguards=2)
+    turn = _turn(state)
+    decide(turn)
+    act = _core_action(turn.plan)
+    assert act is not None
+    assert act.type == "SPAWN"
+    assert act.unit_type.value == "RANGER"
+
+
+def test_visible_threat_overrides_peacetime_ranger_reserve() -> None:
+    # 可见敌人时即使未达到和平库存下限，也必须立即生产战斗单位。
+    state = _state_with_workers(
+        n_workers=4,
+        resources=12,
+        n_vanguards=2,
+        threat=True,
+    )
     turn = _turn(state)
     decide(turn)
     act = _core_action(turn.plan)
@@ -3464,6 +3487,46 @@ def test_empty_worker_yields_core_cell_to_laden_queue() -> None:
     action = _action(turn.plan, WORKER_ID)
     assert action is not None
     assert action.type == "MOVE"
+
+
+def test_empty_worker_fallback_never_steps_into_core(monkeypatch) -> None:
+    # 当前沿 A* 和扫描暂时都无法给出下一步时，最终脱困兜底仍必须遵守空载
+    # Worker 不进 Core 的不变量。修复前第二次兜底会把 Core 当目标，导致同
+    # Tick 生产因 CELL_UNIT_LIMIT 失败。
+    objects = [
+        {
+            "kind": "CORE",
+            "id": str(CORE_ID),
+            "controlled": True,
+            "owner_username": "arena_hero",
+            "position": [0, 0],
+            "hp": 5,
+            "shield": 5,
+            "state": "NORMAL",
+        },
+        {
+            "kind": "UNIT",
+            "id": str(WORKER_ID),
+            "controlled": True,
+            "position": [1, 0],
+            "hp": 2,
+            "unit_type": "WORKER",
+            "cargo": 0,
+        },
+        {"kind": "OBSTACLE", "positions": [[1, -1], [1, 1], [2, 0]]},
+    ]
+    state = _state(resources=0, population=1, objects=objects)
+    turn = _turn(state)
+    monkeypatch.setattr(
+        tactic,
+        "_astar_step_result",
+        lambda *args, **kwargs: (None, False),
+    )
+    monkeypatch.setattr(tactic, "_explore_step", lambda *args, **kwargs: None)
+
+    decide(turn)
+
+    assert _action(turn.plan, WORKER_ID) is None
 
 
 def test_laden_worker_backs_off_when_ring_would_wall_in_core() -> None:

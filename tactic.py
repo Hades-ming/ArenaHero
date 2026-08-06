@@ -96,6 +96,10 @@ MAX_WORKERS = FREE_UPKEEP_CAP + 1
 # prior "spend every r5 on a Worker" policy left Core storage oscillating
 # 0->5->0 forever — the single largest economy drain.
 WORKER_SPAWN_RESERVE = 3
+# 和平期补齐额外战斗单位时保留一小笔库存。第一支 Vanguard 仍按基础价
+# 立即建立最低护核能力；已有近战防线后，昂贵的 Ranger 不应把刚入核的资源
+# 一次性清空。看到敌人时取消该保留，及时生产仍优先于库存增长。
+PEACETIME_COMBAT_SPAWN_RESERVE = 5
 # Standing-army policy (defends against the raid that destroyed the Core on
 # 2026-08-02). The prior tactic spawned combat Units ONLY when a threat was
 # already visible, so a surprise raid met an economy at r0 that could not bank
@@ -2175,12 +2179,12 @@ def _control_workers(turn: "Turn", core_pos: tuple[int, int]) -> None:
             # resets the explore state every 4 ticks but the pocket still has no
             # column-reachable step (observed: ce6788 waited-then-moved between
             # (12,215)/(12,216)/(13,216) for 20+ ticks). Force a step toward any
-            # open adjacent cell using base_blocked (not blocked_empty), so the
-            # Core cell is reachable as a last-resort exit — moving beats a
-            # permanent stall.
-            step = _step_away_from(pos, core_pos, reserved_away, avoid=None)
+            # open adjacent cell, but keep the Core cell blocked for an empty
+            # Worker. Only a laden Worker may enter the Core to deposit.
+            empty_fallback_blocked = reserved_away | {core_pos}
+            step = _step_away_from(pos, core_pos, empty_fallback_blocked, avoid=None)
             if step is None:
-                step = _step_toward(pos, core_pos, reserved_away, avoid=None)
+                step = _step_toward(pos, core_pos, empty_fallback_blocked, avoid=None)
             if step is not None:
                 _prev_pos[wid] = pos
                 _record_pos(wid, pos)
@@ -2802,7 +2806,10 @@ def _control_core(
         if wants_vanguard and effective_resources >= vanguard_price:
             core.spawn(UnitType.VANGUARD)
             return
-        if wants_ranger and effective_resources >= ranger_price:
+        ranger_reserve = (
+            0 if enemy_present else PEACETIME_COMBAT_SPAWN_RESERVE
+        )
+        if wants_ranger and effective_resources >= ranger_price + ranger_reserve:
             core.spawn(UnitType.RANGER)
             return
 
