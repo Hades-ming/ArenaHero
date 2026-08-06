@@ -241,6 +241,34 @@ def test_distant_known_resource_is_retained_and_assigned() -> None:
     }
 
 
+def test_history_dispatch_reserves_a_worker_for_exploration() -> None:
+    """没有可见资源时，陈旧地图提示不能占用所有空闲 Worker。"""
+    tactic._known_resources.update({(10, 0), (20, 0)})
+    tactic._resource_hints.update(
+        {
+            (10, 0): tactic.ResourceHint(19, "history"),
+            (20, 0): tactic.ResourceHint(19, "history"),
+        }
+    )
+    turn = _turn(_workers_state([(0, 1), (0, 2), (0, 3)]), tick=20)
+
+    assignments = tactic._worker_resource_assignments(turn)
+
+    assert len(assignments) == 2
+    assert len(set(assignments.values())) == 2
+    assert tactic._resource_telemetry["explore_reserved"] == 1
+
+
+def test_very_old_history_hint_is_not_an_active_resource_target() -> None:
+    cell = (100, 0)
+    tactic._known_resources.add(cell)
+    tactic._resource_hints[cell] = tactic.ResourceHint(1, "history")
+    turn = _turn(_workers_state([(0, 0)]), tick=300)
+
+    assert tactic._worker_resource_assignments(turn) == {}
+    assert tactic._resource_telemetry["stale"] == 1
+
+
 def test_visible_resource_priority_over_nearer_history_hint() -> None:
     remembered = (1, 0)
     visible = (10, 0)
@@ -667,7 +695,7 @@ def test_resource_telemetry_log_is_monitorable_and_never_contains_api_key(
     # Legacy callers may still omit the optional timing/status arguments.
     line = play._log_line(turn, accepted=None)
 
-    assert "eco[a1,av1,ah0,blk0,cool0,unr0,harv0,dep0]" in line
+    assert "eco[a1,av1,ah0,stale0,exp0,blk0,cool0,unr0,harv0,dep0]" in line
     assert fake_key not in line
     record = monitor._parse_line(line)
     assert record is not None
@@ -675,6 +703,8 @@ def test_resource_telemetry_log_is_monitorable_and_never_contains_api_key(
         "a": 1,
         "av": 1,
         "ah": 0,
+        "stale": 0,
+        "exp": 0,
         "blk": 0,
         "cool": 0,
         "unr": 0,
@@ -3121,6 +3151,35 @@ def test_failed_ticks_are_separate_from_successful_kpis(tmp_path) -> None:
     assert any("DECISION_ERRORS" in alert for alert in alerts)
 
 
+def test_monitor_detects_tick_gaps_and_counts_core_spawns(tmp_path) -> None:
+    from meta import monitor
+
+    def line(tick: int, resources: int, events: str) -> str:
+        return (
+            f"t{tick} r{resources}/10 pop2(W2 V0 R0) core@0,0 hp5/sh5/NORMAL "
+            "W[-] O[-] vis0[-] res0[] obs0 beacon0,0 "
+            "eco[a0,av0,ah0,blk0,cool0,unr0,harv0,dep0] "
+            "TM[1,2,3] ST[ACCEPTED] ev["
+            f"{events}] plan[-]\n"
+        )
+
+    log_path = tmp_path / "game.log"
+    log_path.write_text(
+        line(10, 8, "")
+        + line(13, 0, "CORE_SPAWN_SUCCEEDED"),
+        encoding="utf-8",
+    )
+
+    kpi = monitor.analyze(log_path)
+
+    assert kpi.ticks == 2
+    assert kpi.tick_gaps == 1
+    assert kpi.missing_ticks == 2
+    assert kpi.spawn == 1
+    assert kpi.resource_drops == 0
+    assert any("TICK_GAP" in alert for alert in monitor.detect_bottlenecks(kpi))
+
+
 @pytest.mark.parametrize(
     ("limit", "label"),
     [(250, "P50"), (1000, "P95"), (2000, "P99")],
@@ -3238,6 +3297,7 @@ def test_play_logs_decision_and_submit_failures_without_exception_text(
                         error="TICK_MISMATCH\nsecret-response",
                     ),
                 ),
+                FakeTurn(3, RuntimeError("unstructured secret-response")),
             ]
 
         def __enter__(self):
@@ -3264,4 +3324,5 @@ def test_play_logs_decision_and_submit_failures_without_exception_text(
 
     assert lines[0].startswith("t1 ST[DECISION_FAILED] ER[DECISION_ERROR]")
     assert lines[1].startswith("t2 ST[SUBMIT_FAILED] ER[API_ERROR]")
+    assert lines[2].startswith("t3 ST[SUBMIT_FAILED] ER[UNKNOWN_ERROR]")
     assert all("secret" not in line.lower() for line in lines)

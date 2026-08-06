@@ -118,6 +118,19 @@
 - **纪律（用户要求）**：程序（tactic.py）更新后**及时重启 play.py 进程**，否则改动不生效。
 - **原因**：`play.py` 是长驻进程、不热加载（L8）。本地持久化地图 `tactic_state.json` 会在
   重启后自动重载，故重启安全、状态连续；服务器侧也保留对局状态，重连即可续上。
+
+## L12 — 断线缺口与陈旧资源提示必须分开统计
+- **现象**：`game.log` 中 `t60450→t60455`、`t60688→t60693` 各缺 4 个 Tick；同一窗口还出现
+  `CORE_SPAWN_SUCCEEDED`，旧监控却显示 `spawn=0`。资源分配中历史提示长期占据绝大多数空闲 Worker。
+- **根因**：监控只按已写入行聚合，没有检查相邻 Tick 缺口；生产事件名称以 `CORE_` 为前缀；历史
+  资源提示没有年龄门槛，也没有给探索保留名额。
+- **修复（已落地）**：`meta/monitor.py` 统计 `tick_gaps/missing_ticks`、失败提交耗时并统一识别
+  `SPAWN_SUCCEEDED` 与 `CORE_SPAWN_SUCCEEDED`；`tactic.py` 对时间戳历史提示设置 256 Tick 有效期，
+  当前无可见资源且空闲 Worker 达 3 个时保留 1 个做前沿探索，并记录 `stale/exp` 遥测。
+- **验收**：109 个离线测试通过；旧日志重新分析为 843 个唯一 Tick、8 个缺口、1 次 Core 生产，
+  且没有把该生产造成的资源下降误报成 `RESOURCE_LOSS`。新策略仍需重启后做唯一进程 canary，不能
+  用旧进程日志宣称收益已提升。
+- **状态**：🟡 代码已修；等待 live canary 与至少 200 个唯一 Tick 的资源链路样本。
 - **安全重启命令**（括号技巧 `[p]lay\.py` 避免 pkill 误杀自身；`nohup ... & disown` 完全脱离）：
   `cd /Users/hx/myself/ArenaHero && pkill -f "[p]lay\.py"; sleep 2; nohup .venv/bin/python3 play.py > play.out 2>&1 < /dev/null & disown`
   验证：`game.log` 的 tick 继续推进、且 `play.out` 无 error。

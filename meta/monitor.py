@@ -102,6 +102,8 @@ class KPI:
     history_resource_assignments: int = 0
     blocked_resource_candidates: int = 0
     cooled_resource_candidates: int = 0
+    stale_resource_candidates: int = 0
+    explore_reservations: int = 0
     unreachable_resource_targets: int = 0
     harvested_resources: int = 0
     deposited_resources: int = 0
@@ -127,6 +129,13 @@ class KPI:
     window_errors: int = 0
     submit_errors: int = 0
     decision_errors: int = 0
+    # 缺口按所有已观测 Tick（包括失败记录）计算，避免把失败提交误判成日志缺失。
+    tick_gaps: int = 0
+    missing_ticks: int = 0
+    # 失败提交的耗时与成功计划门禁分开，避免失败较多时证据静默消失。
+    failed_decide_ms_list: list[int] = field(default_factory=list)
+    failed_submit_ms_list: list[int] = field(default_factory=list)
+    failed_total_ms_list: list[int] = field(default_factory=list)
 
 
 _ERROR_CODE_ALIASES = {
@@ -145,6 +154,11 @@ def _normalize_error_code(value: object) -> str:
         if RE_ERROR.fullmatch(f"ER[{candidate}]"):
             return _ERROR_CODE_ALIASES.get(candidate, candidate)
     return "UNKNOWN_ERROR"
+
+
+def _is_spawn_event(event_name: str) -> bool:
+    """同时识别当前和旧版的成功生产事件名。"""
+    return event_name in {"SPAWN_SUCCEEDED", "CORE_SPAWN_SUCCEEDED"}
 
 
 def _parse_line(line: str) -> dict | None:
@@ -211,6 +225,7 @@ def analyze(path: str | Path) -> KPI:
         return kpi
     prev_res = None
     last_success_tick: int | None = None
+    last_observed_tick: int | None = None
     with p.open("r", encoding="utf-8", errors="replace") as fh:
         for raw in fh:
             rec = _parse_line(raw)
@@ -218,6 +233,11 @@ def analyze(path: str | Path) -> KPI:
                 continue
             kpi.records += 1
             tick = rec["tick"]
+            if last_observed_tick is not None and tick > last_observed_tick + 1:
+                kpi.tick_gaps += 1
+                kpi.missing_ticks += tick - last_observed_tick - 1
+            if last_observed_tick is None or tick > last_observed_tick:
+                last_observed_tick = tick
             if rec.get("status") != "ACCEPTED":
                 kpi.failed_ticks += 1
                 error_code = rec.get("error_code", "UNKNOWN_ERROR")
@@ -228,6 +248,12 @@ def analyze(path: str | Path) -> KPI:
                     kpi.submit_errors += 1
                 elif rec["status"] == "DECISION_FAILED":
                     kpi.decision_errors += 1
+                if "decide_ms" in rec:
+                    kpi.failed_decide_ms_list.append(rec["decide_ms"])
+                if "submit_ms" in rec:
+                    kpi.failed_submit_ms_list.append(rec["submit_ms"])
+                if "total_ms" in rec:
+                    kpi.failed_total_ms_list.append(rec["total_ms"])
                 continue
 
             # Logs are append-only and ticks are monotonic. This bounded-state
@@ -260,10 +286,7 @@ def analyze(path: str | Path) -> KPI:
                 else:
                     kpi.idle_gold_streak = 0
                 # Unexplained resource loss: a big drop with no spawn that tick.
-                spawned = any(
-                    e.split("[")[0] == "SPAWN_SUCCEEDED"
-                    for e in rec.get("events", [])
-                )
+                spawned = any(_is_spawn_event(e.split("[")[0]) for e in rec.get("events", []))
                 if prev_res is not None and not spawned and prev_res - res > RESOURCE_DROP_THRESHOLD:
                     kpi.resource_drops += 1
                     kpi.largest_drop = max(kpi.largest_drop, prev_res - res)
@@ -286,6 +309,8 @@ def analyze(path: str | Path) -> KPI:
             kpi.history_resource_assignments += eco.get("ah", 0)
             kpi.blocked_resource_candidates += eco.get("blk", 0)
             kpi.cooled_resource_candidates += eco.get("cool", 0)
+            kpi.stale_resource_candidates += eco.get("stale", 0)
+            kpi.explore_reservations += eco.get("exp", 0)
             kpi.unreachable_resource_targets += eco.get("unr", 0)
             kpi.harvested_resources += eco.get("harv", 0)
             kpi.deposited_resources += eco.get("dep", 0)
@@ -297,7 +322,7 @@ def analyze(path: str | Path) -> KPI:
                     kpi.harvest += 1
                 elif base == "DEPOSIT_SUCCEEDED":
                     kpi.deposit += 1
-                elif base == "SPAWN_SUCCEEDED":
+                elif _is_spawn_event(base):
                     kpi.spawn += 1
                 elif base.startswith("UNIT_MOVE_FAILED."):
                     kpi.move_failed += 1
@@ -394,6 +419,11 @@ def detect_bottlenecks(kpi: KPI) -> list[str]:
         alerts.append(f"SUBMIT_ERRORS: {kpi.submit_errors} submissions failed")
     if kpi.decision_errors:
         alerts.append(f"DECISION_ERRORS: {kpi.decision_errors} decisions failed")
+    if kpi.missing_ticks:
+        alerts.append(
+            f"TICK_GAP: {kpi.missing_ticks} Tick records missing across "
+            f"{kpi.tick_gaps} gaps — inspect reconnects or multiple clients"
+        )
     # OBS-001 gates algorithmic plan time. Submit and total timings remain in
     # the report because they include server/network latency outside decide().
     if kpi.decide_ms_list:
@@ -439,6 +469,9 @@ def report(kpi: KPI, alerts: list[str]) -> str:
         f"submit {kpi.submit_errors}, decision {kpi.decision_errors})"
     )
     lines.append(
+        f"Tick gaps      : {kpi.missing_ticks} missing across {kpi.tick_gaps} gaps"
+    )
+    lines.append(
         f"Resources      : last {kpi.resources_last}/{kpi.capacity_last} "
         f"(min {kpi.resources_min}, max {kpi.resources_max})"
     )
@@ -459,7 +492,9 @@ def report(kpi: KPI, alerts: list[str]) -> str:
         f"(visible {kpi.visible_resource_assignments}, history "
         f"{kpi.history_resource_assignments}), blocked "
         f"{kpi.blocked_resource_candidates}, cooled "
-        f"{kpi.cooled_resource_candidates}, unreachable "
+        f"{kpi.cooled_resource_candidates}, stale "
+        f"{kpi.stale_resource_candidates}, explore-reserved "
+        f"{kpi.explore_reservations}, unreachable "
         f"{kpi.unreachable_resource_targets}"
     )
     lines.append(
@@ -498,6 +533,11 @@ def report(kpi: KPI, alerts: list[str]) -> str:
             f"(P50/P95/P99)  submit {p50_s:g}/{p95_s:g}/{p99_s:g}ms  "
             f"total {p50_t:g}/{p95_t:g}/{p99_t:g}ms"
         )
+    if kpi.failed_total_ms_list:
+        lines.append(
+            f"Failed timing  : {len(kpi.failed_total_ms_list)} samples "
+            f"(decide/submit/total recorded separately)"
+        )
     lines.append(
         f"Tick quality   : {kpi.unique_ticks} unique + {kpi.duplicate_ticks} duplicate"
     )
@@ -534,6 +574,7 @@ def _watch_loop(path: str | Path, interval: int, as_json: bool) -> None:
             f"sh{kpi.core_shield_last} harv{kpi.harvest} dep{kpi.deposit} "
             f"evis{kpi.ticks_with_enemy_visible} "
             f"u{kpi.unique_ticks}d{kpi.duplicate_ticks} "
+            f"g{kpi.tick_gaps}/{kpi.missing_ticks} "
             f"{'ALERTS(' + str(len(alerts)) + ')' if alerts else 'ok'}"
         )
         print(status, flush=True)

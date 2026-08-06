@@ -284,6 +284,10 @@ _RESOURCE_COOLDOWN_BASE = 4
 _RESOURCE_COOLDOWN_CAP = 64
 _RESOURCE_FAILURE_CAP = 5
 _RESOURCE_CONFIRM_SAVE_STEP = 64
+# 记忆节点只是提示而非静态地形。超过该逻辑 Tick 数未被确认后，停止把
+# Worker 派往该点，交给前沿扫描重新确认它是否仍然存在。
+_MAX_HISTORY_RESOURCE_AGE = 256
+_HISTORY_RESOURCE_AGE_WEIGHT = 1
 _PERSISTED_TICK_CAP = 2**63 - 1
 _persistent_state_dirty = False
 # Persistent obstacle-terrain memory. turn.obstacle_cells only exposes obstacles
@@ -613,6 +617,8 @@ def _resource_telemetry_summary() -> str:
         ("assignments", "a"),
         ("visible_assignments", "av"),
         ("history_assignments", "ah"),
+        ("stale", "stale"),
+        ("explore_reserved", "exp"),
         ("blocked", "blk"),
         ("cooled", "cool"),
         ("unreachable", "unr"),
@@ -622,6 +628,14 @@ def _resource_telemetry_summary() -> str:
     return ",".join(
         f"{short}{_resource_telemetry.get(name, 0)}" for name, short in keys
     )
+
+
+def _resource_age(cell: tuple[int, int], tick: int) -> int:
+    """返回历史资源提示的逻辑 Tick 年龄。"""
+    hint = _resource_hints.get(cell)
+    if hint is None or hint.source == "legacy":
+        return 0
+    return max(0, tick - hint.last_confirmed_tick)
 
 
 def _worker_resource_assignments(
@@ -655,7 +669,18 @@ def _worker_resource_assignments(
         if _resource_hints.setdefault(resource, ResourceHint(0, "legacy")).cooldown_until
         > turn.tick
     }
-    eligible_resources = all_resources - cooled_resources
+    stale_resources = {
+        resource
+        for resource in all_resources - visible_resources - cooled_resources
+        if _resource_age(resource, turn.tick) > _MAX_HISTORY_RESOURCE_AGE
+    }
+    eligible_resources = all_resources - cooled_resources - stale_resources
+    _resource_telemetry.update(
+        {
+            "stale": len(stale_resources),
+            "explore_reserved": 0,
+        }
+    )
     fixed: dict[str, tuple[int, int]] = {}
     for resource in sorted(eligible_resources & blocked_resources):
         occupant = next(
@@ -673,7 +698,20 @@ def _worker_resource_assignments(
             "cooled": len(cooled_resources),
         }
     )
-    if not workers or not resources:
+    # 空闲 Worker 达到一定规模且当前没有可见资源时，保留一个 Worker 做前沿
+    # 扫描。这样大量旧地图提示不会把所有 Worker 都停在陈旧路线，同时仍让
+    # 前两个 Worker 立即处理已知历史资源。
+    dispatch_workers = workers
+    if not visible_resources and len(workers) >= 3 and resources:
+        core_pos = turn.core.position if turn.core is not None else (0, 0)
+        explorer = max(
+            workers,
+            key=lambda worker: (_manhattan(worker.position, core_pos), str(worker.id)),
+        )
+        dispatch_workers = [worker for worker in workers if worker is not explorer]
+        _resource_telemetry["explore_reserved"] = 1
+
+    if not dispatch_workers or not resources:
         assignments = fixed
         _resource_telemetry.update(
             {
@@ -690,38 +728,47 @@ def _worker_resource_assignments(
 
     max_distance = max(
         _manhattan(worker.position, resource)
-        for worker in workers
+        for worker in dispatch_workers
         for resource in resources
     )
-    matched_count = min(len(workers), len(resources))
+    matched_count = min(len(dispatch_workers), len(resources))
     # One non-visible assignment must cost more than every possible total
     # distance difference, making visible-resource coverage a strict priority.
     history_penalty = max_distance * matched_count + 1
 
-    if len(workers) <= len(resources):
+    if len(dispatch_workers) <= len(resources):
         costs = [
             [
                 _manhattan(worker.position, resource)
-                + (0 if resource in visible_resources else history_penalty)
+                + (
+                    0
+                    if resource in visible_resources
+                    else history_penalty
+                    + _resource_age(resource, turn.tick) * _HISTORY_RESOURCE_AGE_WEIGHT
+                )
                 for resource in resources
             ]
-            for worker in workers
+            for worker in dispatch_workers
         ]
         columns = _minimum_assignment(costs)
         assignments = fixed | {
             str(worker.id): resources[column]
-            for worker, column in zip(workers, columns, strict=True)
+            for worker, column in zip(dispatch_workers, columns, strict=True)
         }
     else:
         # Worker 多于资源时，每个资源都能分配；可见资源已全部覆盖，
         # 此时只需继续最小化总路程。
         costs = [
-            [_manhattan(resource, worker.position) for worker in workers]
+            [
+                _manhattan(resource, worker.position)
+                + _resource_age(resource, turn.tick) * _HISTORY_RESOURCE_AGE_WEIGHT
+                for worker in dispatch_workers
+            ]
             for resource in resources
         ]
         columns = _minimum_assignment(costs)
         assignments = fixed | {
-            str(workers[column].id): resource
+            str(dispatch_workers[column].id): resource
             for resource, column in zip(resources, columns, strict=True)
         }
     _resource_telemetry.update(

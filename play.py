@@ -249,14 +249,7 @@ def play(api_key: str, base_url: str, websocket_url: str | None) -> int:
                 t1 = time.monotonic()
                 try:
                     accepted = turn.submit()
-                except (
-                    TurnClosedError,
-                    APIError,
-                    ProtocolError,
-                    TransportError,
-                    AuthenticationError,
-                    PolicyViolationError,
-                ) as exc:
+                except Exception as exc:
                     t2 = time.monotonic()
                     decide_ms = int((t1 - t0) * 1000)
                     submit_ms = int((t2 - t1) * 1000)
