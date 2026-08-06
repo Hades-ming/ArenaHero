@@ -108,10 +108,12 @@ WORKER_SPAWN_RESERVE = 3
 # larger Worker fleet once the economy can sustain the smallest army.
 MIN_WORKERS_BEFORE_ARMY = 4
 # If a combat Unit already exists, permit a bounded Worker bridge while the
-# Core is not under immediate threat.  The old one-Worker bridge still left a
-# healthy Core at W5/V2/R0 waiting for a Ranger; two additional scouts raise
-# discovery without allowing an unbounded peaceful army deficit.
-ECONOMY_BRIDGE_MAX_WORKERS = MIN_WORKERS_BEFORE_ARMY + 3
+# Core is not under immediate threat.  The old bridge stopped at W7/V2/R0;
+# live logs showed the binding constraint was still node discovery, not the
+# first dynamic-price tier.  One more scout (W8) raises discovery and storage
+# while remaining below population 20 and the bridge is still disabled by any
+# visible enemy signal.
+ECONOMY_BRIDGE_MAX_WORKERS = MIN_WORKERS_BEFORE_ARMY + 4
 # Peacetime standing reserve now SCALES with the Worker fleet via
 # _standing_army_targets (a floor of V1/R1, growing ~one combat pair per 8
 # Workers up to the first-price-step population budget). These legacy constants document
@@ -2654,7 +2656,7 @@ def _control_core(
     # Workers increase discovery and Core capacity while the bridge cap keeps
     # a missing Ranger from turning into unbounded Worker spending.
     bridge_worker_allowed = (
-        not threatened
+        not enemy_present
         and len(turn.workers) < ECONOMY_BRIDGE_MAX_WORKERS
         and (len(turn.vanguards) + len(turn.rangers)) > 0
     )

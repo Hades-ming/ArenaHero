@@ -2753,6 +2753,55 @@ def test_peacetime_bridge_reaches_second_extra_worker() -> None:
     assert act.unit_type.value == "WORKER"
 
 
+def test_peacetime_bridge_reaches_third_extra_worker() -> None:
+    # With no visible threat, keep one additional scout active while the
+    # missing Ranger is being funded.  W7 -> W8 is still below the first
+    # dynamic-price boundary and raises discovery capacity by another worker.
+    state = _state_with_workers(
+        n_workers=7, resources=8, n_vanguards=2, n_rangers=0
+    )
+    turn = _turn(state)
+
+    decide(turn)
+
+    act = _core_action(turn.plan)
+    assert act is not None
+    assert act.type == "SPAWN"
+    assert act.unit_type.value == "WORKER"
+
+
+def test_visible_enemy_core_disables_worker_bridge() -> None:
+    # A visible Core is an attack signal even when it is outside the local
+    # threat radius.  Do not spend the bank on a Worker while the strike force
+    # is still short.
+    state = _state_with_workers(
+        n_workers=6, resources=8, n_vanguards=2, n_rangers=0
+    )
+    objects = [obj.model_dump(mode="json") for obj in state.objects]
+    objects.append(
+        {
+            "kind": "CORE",
+            "id": str(ENEMY_CORE_ID),
+            "controlled": False,
+            "owner_username": "rival",
+            "position": [0, 20],
+            "hp": 5,
+            "shield": 5,
+            "state": "NORMAL",
+        }
+    )
+    state = _state(
+        resources=8,
+        population=8,
+        objects=objects,
+    )
+    turn = _turn(state)
+
+    decide(turn)
+
+    assert _core_action(turn.plan) is None
+
+
 def test_partial_army_bridge_is_disabled_under_threat() -> None:
     # A nearby enemy keeps the combat-first gate: the bridge Worker must not
     # consume the bank that should fund the next defender.
