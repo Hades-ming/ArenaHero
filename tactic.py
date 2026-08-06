@@ -2866,13 +2866,13 @@ def _observe_resources(turn: "Turn") -> None:
             _known_resources.discard(cell)
             _resource_hints.pop(cell, None)
             changed = True
-    active_hints = any(
-        _resource_age(cell, turn.tick) <= _MAX_HISTORY_RESOURCE_AGE
-        and _resource_hints.get(cell, ResourceHint(0, "legacy")).cooldown_until
-        <= turn.tick
-        for cell in _known_resources
-    )
-    if turn.resource_cells or active_hints:
+    # Drought is about *current visibility*, not the existence of a remembered
+    # hint.  A historical node is only a stale coordinate promise: it may have
+    # been harvested outside our view, and keeping it active must not suppress
+    # the wider-frontier recovery path.  The previous ``or active_hints`` made
+    # a single old hint hold the radius at 40 forever, which is exactly what
+    # the live log showed during 21 consecutive resource-free Ticks.
+    if turn.resource_cells:
         _resource_absence_streak = 0
     else:
         _resource_absence_streak += 1

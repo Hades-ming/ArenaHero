@@ -1043,6 +1043,22 @@ def test_visible_resource_resets_drought_expansion() -> None:
     assert tactic._exploration_radius() == tactic.MAX_SWEEP_RADIUS
 
 
+def test_historical_resource_hint_does_not_mask_drought_expansion() -> None:
+    # A remembered node is not current visibility.  When it remains unseen,
+    # the empty frontier must still expand instead of staying inside the
+    # 40-cell economic radius forever.
+    cell = (20, 0)
+    tactic._known_resources.add(cell)
+    tactic._resource_hints[cell] = tactic.ResourceHint(1, "history")
+    turn = _turn(_workers_state([(0, 1)]), tick=20)
+
+    tactic._observe_resources(turn)
+
+    assert tactic._resource_absence_streak == 1
+    tactic._resource_absence_streak = tactic.DROUGHT_EXPAND_EVERY + 1
+    assert tactic._exploration_radius() > tactic.MAX_SWEEP_RADIUS
+
+
 def test_astar_rejects_blocked_goal_unless_explicitly_allowed() -> None:
     start = (0, 0)
     goal = (1, 0)
