@@ -293,6 +293,22 @@ def test_legacy_history_hint_also_reserves_exploration_before_expiry() -> None:
     assert tactic._resource_telemetry["explore_reserved"] == 1
 
 
+def test_visible_resources_cover_workers_before_history_reservation() -> None:
+    visible = {(10, 0), (20, 0)}
+    remembered = (100, 0)
+    tactic._known_resources.add(remembered)
+    tactic._resource_hints[remembered] = tactic.ResourceHint(0, "history")
+    turn = _turn(
+        _workers_state([(0, 1), (0, 2)], resources=list(visible)),
+        tick=20,
+    )
+
+    assignments = tactic._worker_resource_assignments(turn)
+
+    assert set(assignments.values()) == visible
+    assert tactic._resource_telemetry["explore_reserved"] == 0
+
+
 def test_very_old_history_hint_is_not_an_active_resource_target() -> None:
     cell = (100, 0)
     tactic._known_resources.add(cell)

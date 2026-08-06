@@ -706,7 +706,12 @@ def _worker_resource_assignments(
     explorer_candidates = [
         worker for worker in workers if tuple(worker.position) not in visible_resources
     ]
-    if history_resources and len(workers) >= 2 and explorer_candidates:
+    if (
+        history_resources
+        and len(workers) >= 2
+        and len(visible_resources) < len(workers)
+        and explorer_candidates
+    ):
         core_pos = turn.core.position if turn.core is not None else (0, 0)
         explorer = max(
             explorer_candidates,
