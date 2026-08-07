@@ -24,6 +24,8 @@ from collections import Counter
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 
+from arena_hero import UnitType, unit_cost
+
 LOG_PATH = Path(__file__).resolve().parent.parent / "game.log"
 
 # --- Regexes for the per-tick line -----------------------------------------
@@ -38,7 +40,8 @@ RE_ECO = re.compile(r"eco\[([^\]]*)\]")
 # ``ev[HARVEST_SUCCEEDED[1];CORE_SPAWN_SUCCEEDED]``. Match the outer event
 # field by its following ``plan[`` delimiter instead of stopping at the first
 # inner closing bracket.
-RE_EV = re.compile(r"ev\[(.*?)\]\s+plan\[")
+RE_EV = re.compile(r"ev\[(.*?)\](?:\s+dt\[(.*?)\])?\s+plan\[")
+RE_RECEIPT = re.compile(r"^t(\d+)\s+rcv\[([A-Z_]{1,16})\]\s+actions\[(\d+)\]")
 RE_TM = re.compile(r"TM\[(\d+),(\d+),(\d+)\]")
 RE_STATUS = re.compile(r"ST\[([A-Z_]+)\]")
 RE_ERROR = re.compile(r"ER\[([A-Z0-9_.-]{1,64})\]")
@@ -54,6 +57,7 @@ RESOURCE_DROP_THRESHOLD = 10  # single-tick resource drop > this with no spawn =
 PLAN_P50_MAX = 250
 PLAN_P95_MAX = 1000
 PLAN_P99_MAX = 2000
+RAID_REBUILD_RESERVE = 3
 
 
 def _percentile(values: list[int], pct: float) -> float:
@@ -142,6 +146,26 @@ class KPI:
     failed_decide_ms_list: list[int] = field(default_factory=list)
     failed_submit_ms_list: list[int] = field(default_factory=list)
     failed_total_ms_list: list[int] = field(default_factory=list)
+    # 规范 receipt 归属。含 MANUAL receipt 的 Tick 不进入下面的可比业务指标，
+    # 但仍在此处单独呈现。
+    receipt_records: int = 0
+    agent_receipts: int = 0
+    manual_receipts: int = 0
+    manual_ticks: int = 0
+    comparable_ticks: int = 0
+    unclassified_ticks: int = 0
+    manual_event_hist: Counter = field(default_factory=Counter)
+    unclassified_event_hist: Counter = field(default_factory=Counter)
+    # 基于 v0.14 事件值的资源流量核算。
+    deposit_amount: int = 0
+    captured_amount: int = 0
+    spawn_cost: int = 0
+    repair_cost: int = 0
+    unit_heal_cost: int = 0
+    core_heal_cost: int = 0
+    overflow_loss: int = 0
+    net_resources: int = 0
+    ticks_with_raid_budget: int = 0
 
 
 _ERROR_CODE_ALIASES = {
@@ -173,6 +197,14 @@ def _parse_line(line: str) -> dict | None:
     m = RE_TICK.search(line)
     if not m:
         return None
+    receipt_match = RE_RECEIPT.match(line.rstrip("\n"))
+    if receipt_match:
+        return {
+            "record_kind": "RECEIPT",
+            "tick": int(receipt_match.group(1)),
+            "source": receipt_match.group(2),
+            "actions": int(receipt_match.group(3)),
+        }
     legacy_skip = RE_LEGACY_SKIP.match(line.rstrip("\n"))
     rec: dict = {
         "tick": int(m.group(1)),
@@ -215,6 +247,22 @@ def _parse_line(line: str) -> dict | None:
     m = RE_EV.search(line)
     if m:
         rec["events"] = [e for e in m.group(1).split(";") if e]
+        details: list[dict[str, str | int]] = []
+        for raw_detail in (m.group(2) or "").split(";"):
+            fields = raw_detail.split("|")
+            if not fields or not fields[0]:
+                continue
+            detail: dict[str, str | int] = {"event_type": fields[0]}
+            for field in fields[1:]:
+                key, separator, value = field.partition("=")
+                if not separator or not key or not value:
+                    continue
+                if re.fullmatch(r"-?\d+", value):
+                    detail[key] = int(value)
+                else:
+                    detail[key] = value
+            details.append(detail)
+        rec["event_details"] = details
     m = RE_TM.search(line)
     if m:
         rec["decide_ms"], rec["submit_ms"], rec["total_ms"] = (
@@ -229,6 +277,21 @@ def analyze(path: str | Path) -> KPI:
     p = Path(path)
     if not p.exists():
         return kpi
+    # receipt 可能晚于 Turn 日志到达，先扫描归属，避免后到的 MANUAL
+    # receipt 污染可比 Tick 集合。
+    manual_ticks: set[int] = set()
+    agent_ticks: set[int] = set()
+    for raw in p.open("r", encoding="utf-8", errors="replace"):
+        rec = _parse_line(raw)
+        if rec and rec.get("record_kind") == "RECEIPT":
+            kpi.receipt_records += 1
+            source = rec.get("source")
+            if source == "MANUAL":
+                kpi.manual_receipts += 1
+                manual_ticks.add(rec["tick"])
+            elif source == "AGENT":
+                kpi.agent_receipts += 1
+                agent_ticks.add(rec["tick"])
     prev_res = None
     last_success_tick: int | None = None
     last_observed_tick: int | None = None
@@ -236,6 +299,8 @@ def analyze(path: str | Path) -> KPI:
         for raw in fh:
             rec = _parse_line(raw)
             if not rec:
+                continue
+            if rec.get("record_kind") == "RECEIPT":
                 continue
             kpi.records += 1
             tick = rec["tick"]
@@ -271,6 +336,16 @@ def analyze(path: str | Path) -> KPI:
             last_success_tick = tick
             kpi.ticks += 1
             kpi.unique_ticks += 1
+            receipt_tracking = kpi.receipt_records > 0
+            is_manual = tick in manual_ticks
+            is_unclassified = receipt_tracking and tick not in manual_ticks and tick not in agent_ticks
+            excluded_from_agent = is_manual or is_unclassified
+            if is_manual:
+                kpi.manual_ticks += 1
+            elif is_unclassified:
+                kpi.unclassified_ticks += 1
+            else:
+                kpi.comparable_ticks += 1
             kpi.end_tick = tick
             if kpi.unique_ticks == 1:
                 kpi.start_tick = tick
@@ -293,10 +368,16 @@ def analyze(path: str | Path) -> KPI:
                     kpi.idle_gold_streak = 0
                 # Unexplained resource loss: a big drop with no spawn that tick.
                 spawned = any(_is_spawn_event(e.split("[")[0]) for e in rec.get("events", []))
-                if prev_res is not None and not spawned and prev_res - res > RESOURCE_DROP_THRESHOLD:
+                if (
+                    not excluded_from_agent
+                    and tick - 1 not in manual_ticks
+                    and prev_res is not None
+                    and not spawned
+                    and prev_res - res > RESOURCE_DROP_THRESHOLD
+                ):
                     kpi.resource_drops += 1
                     kpi.largest_drop = max(kpi.largest_drop, prev_res - res)
-                prev_res = res
+                prev_res = None if excluded_from_agent else res
             if "pop" in rec:
                 kpi.pop_last, kpi.workers_last = rec["pop"], rec["w"]
                 kpi.vanguards_last, kpi.rangers_last = rec["v"], rec["r"]
@@ -309,51 +390,135 @@ def analyze(path: str | Path) -> KPI:
                 kpi.ticks_with_enemy_visible += 1
                 if rec.get("vis_core"):
                     kpi.ticks_with_enemy_core_visible += 1
-            eco = rec.get("eco", {})
-            kpi.resource_assignments += eco.get("a", 0)
-            kpi.visible_resource_assignments += eco.get("av", 0)
-            kpi.history_resource_assignments += eco.get("ah", 0)
-            kpi.blocked_resource_candidates += eco.get("blk", 0)
-            kpi.cooled_resource_candidates += eco.get("cool", 0)
-            kpi.far_resource_candidates += eco.get("far", 0)
-            kpi.stale_resource_candidates += eco.get("stale", 0)
-            kpi.explore_reservations += eco.get("exp", 0)
-            kpi.refresh_reservations += eco.get("ref", 0)
-            kpi.unreachable_resource_targets += eco.get("unr", 0)
-            kpi.harvested_resources += eco.get("harv", 0)
-            kpi.deposited_resources += eco.get("dep", 0)
-            for ev in rec.get("events", []):
-                # strip trailing [n] payload
-                base = ev.split("[")[0]
+                    population = rec.get("pop")
+                    raid_threshold = (
+                        unit_cost(UnitType.RANGER, population) + RAID_REBUILD_RESERVE
+                        if isinstance(population, int)
+                        else 60
+                    )
+                    if rec.get("res", 0) >= raid_threshold:
+                        kpi.ticks_with_raid_budget += 1
+            if not excluded_from_agent:
+                eco = rec.get("eco", {})
+                kpi.resource_assignments += eco.get("a", 0)
+                kpi.visible_resource_assignments += eco.get("av", 0)
+                kpi.history_resource_assignments += eco.get("ah", 0)
+                kpi.blocked_resource_candidates += eco.get("blk", 0)
+                kpi.cooled_resource_candidates += eco.get("cool", 0)
+                kpi.far_resource_candidates += eco.get("far", 0)
+                kpi.stale_resource_candidates += eco.get("stale", 0)
+                kpi.explore_reservations += eco.get("exp", 0)
+                kpi.refresh_reservations += eco.get("ref", 0)
+                kpi.unreachable_resource_targets += eco.get("unr", 0)
+                kpi.harvested_resources += eco.get("harv", 0)
+                kpi.deposited_resources += eco.get("dep", 0)
+            for index, ev in enumerate(rec.get("events", [])):
+                detail = (
+                    rec.get("event_details", [])[index]
+                    if index < len(rec.get("event_details", []))
+                    else {}
+                )
+                event_tick = detail.get("tick", tick)
+                event_is_manual = type(event_tick) is int and event_tick in manual_ticks
+                # 去除末尾的 [n] 数量载荷。
+                base = _event_base(ev)
+                name = _event_name(ev)
+                if excluded_from_agent or event_is_manual:
+                    if is_unclassified and not event_is_manual:
+                        kpi.unclassified_event_hist[base] += 1
+                    elif is_manual or event_is_manual:
+                        kpi.manual_event_hist[base] += 1
+                    continue
                 kpi.event_hist[base] += 1
-                if base == "HARVEST_SUCCEEDED":
+                if name == "HARVEST_SUCCEEDED":
                     kpi.harvest += 1
-                elif base == "DEPOSIT_SUCCEEDED":
+                    kpi.deposit_amount += 0
+                elif name == "DEPOSIT_SUCCEEDED":
                     kpi.deposit += 1
-                elif _is_spawn_event(base):
+                    kpi.deposit_amount += _event_amount(ev)
+                elif _is_spawn_event(name):
                     kpi.spawn += 1
-                elif base.startswith("UNIT_MOVE_FAILED."):
+                elif name == "UNIT_MOVE_FAILED":
                     kpi.move_failed += 1
                     reason = base.partition(".")[2]
                     if reason == "CELL_UNIT_LIMIT":
                         kpi.move_failed_cell += 1
                     elif reason == "MOVE_CONTESTED":
                         kpi.move_failed_contested += 1
-                elif base == "UNIT_MOVE_SUCCEEDED":
+                elif name == "UNIT_MOVE_SUCCEEDED":
                     kpi.move_succeeded += 1
-                elif base == "UNIT_DIED":
+                elif name == "UNIT_DIED" or (
+                    name == "UNIT_DAMAGED"
+                    and type(detail.get("hp")) is int
+                    and detail.get("hp") == 0
+                ):
                     kpi.unit_died += 1
-                elif base == "CORE_UNDER_ATTACK":
+                elif name in {"CORE_UNDER_ATTACK", "CORE_DAMAGED"}:
                     kpi.core_under_attack += 1
-                elif base == "CORE_DIED":
+                elif name in {"CORE_DIED", "CORE_DESTROYED"}:
                     kpi.core_died += 1
-                elif base == "ENEMY_CORE_DESTROYED":
+                elif name == "ENEMY_CORE_DESTROYED" or (
+                    name == "DESTRUCTION_PARTICIPATION"
+                    and _event_reason(ev) == "CORE"
+                ):
                     kpi.enemy_core_destroyed += 1
-                elif base == "CORE_MOVE_FAILED":
+                elif name == "CORE_MOVE_FAILED":
                     kpi.core_move_failed += 1
-                elif base == "RESOURCE_NOT_FOUND":
+                elif name in {"RESOURCE_NOT_FOUND", "HARVEST_FAILED"}:
                     kpi.resource_not_found += 1
+                if name == "CORE_RESOURCES_CAPTURED":
+                    kpi.captured_amount += _event_amount(ev)
+                elif name == "CORE_RESOURCE_OVERFLOW_DESTROYED":
+                    kpi.overflow_loss += _event_amount(ev)
+            for detail in rec.get("event_details", []):
+                detail_tick = detail.get("tick", tick)
+                if excluded_from_agent or (
+                    type(detail_tick) is int and detail_tick in manual_ticks
+                ):
+                    continue
+                event_type = detail.get("event_type")
+                cost = detail.get("cost")
+                if type(cost) is not int:
+                    continue
+                if _is_spawn_event(str(event_type)):
+                    kpi.spawn_cost += cost
+                elif event_type == "CORE_REPAIR_SUCCEEDED":
+                    kpi.repair_cost += cost
+                elif event_type == "UNIT_HEAL_SUCCEEDED":
+                    kpi.unit_heal_cost += cost
+                elif event_type == "CORE_HEAL_SUCCEEDED":
+                    kpi.core_heal_cost += cost
+            kpi.net_resources = (
+                kpi.deposit_amount
+                + kpi.captured_amount
+                - kpi.spawn_cost
+                - kpi.repair_cost
+                - kpi.unit_heal_cost
+                - kpi.core_heal_cost
+                - kpi.overflow_loss
+            )
     return kpi
+
+
+def _event_base(event: str) -> str:
+    """返回不含数量或详情载荷的事件名称。"""
+    return event.split("[", 1)[0].split("{", 1)[0]
+
+
+def _event_name(event: str) -> str:
+    """返回不含原因码的 v0.14 事件类型。"""
+    return _event_base(event).partition(".")[0]
+
+
+def _event_reason(event: str) -> str:
+    base = _event_base(event)
+    _name, separator, reason = base.partition(".")
+    return reason if separator else ""
+
+
+def _event_amount(event: str) -> int:
+    match = re.search(r"\[(\d+)\]", event)
+    return int(match.group(1)) if match else 0
 
 
 def detect_bottlenecks(kpi: KPI) -> list[str]:
@@ -401,11 +566,13 @@ def detect_bottlenecks(kpi: KPI) -> list[str]:
             f"CORE_DEFENSE: core hp dipped to {kpi.core_hp_min} "
             f"(died {kpi.core_died}x) — defense failed, stored resources lost"
         )
-    if kpi.enemy_core_destroyed == 0 and kpi.ticks_with_enemy_core_visible > 0:
+    if kpi.enemy_core_destroyed == 0 and kpi.ticks_with_raid_budget > 0:
         alerts.append(
             f"NO_RAID: enemy Cores were visible for "
-            f"{kpi.ticks_with_enemy_core_visible} ticks "
-            f"but 0 enemy Cores destroyed — a raid was available but not taken "
+            f"{kpi.ticks_with_enemy_core_visible} ticks and resources met the "
+            f"dynamic Ranger replacement budget for {kpi.ticks_with_raid_budget} ticks, "
+            f"but 0 enemy Cores were destroyed — verify attack-unit count and "
+            f"line of fire before changing the tactic "
             f"(note: enemy-core loot is variable via CORE_RESOURCES_CAPTURED, not a "
             f"flat +6; see LESSONS L10)"
         )
@@ -470,8 +637,15 @@ def report(kpi: KPI, alerts: list[str]) -> str:
     lines.append("=" * 60)
     lines.append(
         f"Ticks analyzed : {kpi.ticks} successful unique / {kpi.records} records "
-        f"(t{kpi.start_tick}..t{kpi.end_tick})"
+        f"(comparable {kpi.comparable_ticks}, manual {kpi.manual_ticks}, "
+        f"unclassified {kpi.unclassified_ticks}; "
+        f"t{kpi.start_tick}..t{kpi.end_tick})"
     )
+    if kpi.receipt_records:
+        lines.append(
+            f"Receipts       : {kpi.receipt_records} total "
+            f"(Agent {kpi.agent_receipts}, Manual {kpi.manual_receipts})"
+        )
     lines.append(
         f"Failures       : {kpi.failed_ticks} (window {kpi.window_errors}, "
         f"submit {kpi.submit_errors}, decision {kpi.decision_errors})"
@@ -508,7 +682,15 @@ def report(kpi: KPI, alerts: list[str]) -> str:
     )
     lines.append(
         f"Resource flow  : harvested {kpi.harvested_resources}, "
-        f"deposited {kpi.deposited_resources}"
+        f"deposited {kpi.deposited_resources}; event amounts in/out "
+        f"{kpi.deposit_amount}/{kpi.captured_amount}; "
+        f"cost spawn/heal/repair/overflow "
+        f"{kpi.spawn_cost}/{kpi.unit_heal_cost + kpi.core_heal_cost}/"
+        f"{kpi.repair_cost}/{kpi.overflow_loss}; "
+        f"net {kpi.net_resources} "
+        f"({kpi.net_resources / kpi.comparable_ticks:.3f}/comparable tick)"
+        if kpi.comparable_ticks
+        else "Resource flow  : no comparable ticks"
     )
     lines.append(
         f"Combat         : {kpi.unit_died} unit deaths, "
@@ -524,7 +706,8 @@ def report(kpi: KPI, alerts: list[str]) -> str:
     )
     lines.append(
         f"Enemy visible  : {kpi.ticks_with_enemy_visible} ticks "
-        f"(enemy Core {kpi.ticks_with_enemy_core_visible})"
+        f"(enemy Core {kpi.ticks_with_enemy_core_visible}, "
+        f"raid budget {kpi.ticks_with_raid_budget})"
     )
     if kpi.decide_ms_list:
         n = len(kpi.total_ms_list)
@@ -627,6 +810,8 @@ def main(argv: list[str]) -> int:
         # convert to list.
         # Counter -> plain dict; timing lists are already lists.
         out["event_hist"] = dict(kpi.event_hist)
+        out["manual_event_hist"] = dict(kpi.manual_event_hist)
+        out["unclassified_event_hist"] = dict(kpi.unclassified_event_hist)
         out["error_hist"] = dict(kpi.error_hist)
         out["bottlenecks"] = alerts
         print(json.dumps(out, indent=2, default=str))

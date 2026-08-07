@@ -6,8 +6,8 @@
 
 | 字段 | 当前值 |
 |---|---|
-| 轮次 | `2026-08-06-R1` |
-| 基线提交 | `fd8506fa6ae26b4dc9ce7873985e152756abb21b` |
+| 轮次 | `2026-08-07-R2` |
+| 基线提交 | `e45cec0` |
 | 规则 / SDK | gameplay `v0.14` / Python SDK `0.2.9` |
 | 官方版本复核 | 2026-08-06，官方 source/version 与本地 bundle 一致 |
 | 最终目标 | 长期得到最多资源 |
@@ -35,6 +35,8 @@
 | P1 | `RULE-001` 修复 `4ed9c8d` 规则与策略缺陷 | `STATIC_VERIFIED -> LIVE_CANARY` | 防止错误目标优先、资源争用和不可达军备目标 | 2 |
 | P1 | `EXP-001` 历史资源与探索名额竞争 | `DISCOVERED` | 避免所有 Worker 被陈旧历史点占满 | 3 |
 | P2 | `PERF-001` 前 K 候选 A* / EV | `DISCOVERED` | 降低全量搜索，升级往返收益估计 | 4 |
+| P0 | `RULE-002` 战斗执行链与 Core 生存 | `IN_PROGRESS` | 让可逆突袭真正抵达并开火，合法攻击优先于治疗，Core HP 自动恢复 | 5 |
+| P1 | `OBS-002` Manual 归因与资源成本遥测 | `STATIC_VERIFIED` | 将 Manual Tick 从 Agent KPI 剥离，并记录 v0.14 成本/收益 | 6 |
 
 ## 已批准任务：`OBS-001`
 
@@ -183,10 +185,10 @@
 - **回滚**：连续两个 100-Tick 窗口入核率下降 10%、采集到入核 P95 上升 25%、资源失败率
   上升 5 个百分点，或出现 Core/窗口/协议故障，恢复上一提交。
 
-### 当前验收阻断（2026-08-06，协议阻断已解除）
+### 历史验收阻断（2026-08-06，协议阻断已解除）
 
 - 原阻断是服务端已切换 v0.14 状态，而本地仍使用 SDK 0.2.8；`population_tier`、`upkeep_next_tick`
-  已从新契约删除，旧客户端因此抛出 `ProtocolError`。
+  已从新契约删除，旧客户端因此抛出 `ProtocolError`。这是历史取证，不是当前版本声明。
 - 已同步官方 skill `a63222e` 与 SDK 0.2.9，严格模型字段和动态价格 helper 对齐。LaunchAgent
   仍保持停止，待新 SDK 下完成原始握手和 20 Tick canary；静态对齐不等于 live 收益已验证。
 
@@ -425,3 +427,32 @@
   不低于基线，采集到入核 P95 不恶化 25%，`ref` 在无可见资源窗口保持约 2 且无额外移动失败。
   若入核率连续两个窗口低于基线 10%、采集 P95 上升 25%、出现 Core/窗口故障或第二个客户端，
   恢复上一提交，保留地图备份。
+
+## `RULE-002` 战斗执行链与 Core 生存（当前 IN_PROGRESS）
+
+- **问题证据**：此前约 110 个 Tick 看见敌 Core，但固定 `resources >= 60` 门槛和
+  `CHASE_MAX_TICKS=8` 使远程 Ranger 从未进入射程；同时新增 V4/R4 军备消耗约 58 点资源，
+  没有 `SHOOT/SWEEP`、敌核摧毁或捕获收益。低血 Unit 还会先 HEAL，放弃当 Tick 的合法攻击；
+  Core 受伤也不会自动恢复 HP。
+- **可证伪假设**：动态 Ranger 重建成本加 3 点储备、按合法射击位 ETA 的有界追击预算、UUID
+  稳定的守卫/突袭角色，能让可逆突袭在资源可承受时实际抵达；攻击优先与 Core HEAL 能降低
+  资源损失而不破坏同 Tick 账本。
+- **实现边界**：仅调整 `tactic.py` 与 `tests/test_tactic.py` 的战斗、Core 动作和掉落货堆记忆；
+  不改变用户手动迁核、不伪造资源数量、不让历史敌核坐标触发无限扩军。
+- **静态验收**：`pytest -q tests/test_tactic.py` 通过 158 项；已覆盖低血 Ranger 攻击优先、
+  远程敌核动态门槛/ETA、Core HP 治疗、视野外掉落货堆提示和此前资源调度回归。
+- **LIVE_CANARY**：重启后先观察 20 个唯一 Tick，随后累计 200 个唯一 Tick；必须记录敌核可见
+  到首次合法攻击延迟、`CORE_RESOURCES_CAPTURED`、增量军备/治疗成本、Core HP 和资源净收益。
+- **接受/回滚**：Core 存活且无协议/认证/提交/窗口错误；若敌核可执行预算出现但连续 50 Tick
+  没有合法攻击，或两个 100-Tick 窗口的净收益低于 `e45cec0` 10%，恢复本任务反向提交，保留
+  `tactic_state.json.archive-*` 运行备份。
+
+## `OBS-002` Manual 归因与 v0.14 成本遥测（当前 STATIC_VERIFIED）
+
+- **实现**：`play.py` 使用 SDK `events()` 记录 canonical `AGENT/MANUAL` receipt；每个 Tick
+  记录受限事件详情（生产、修盾、Unit/Core HEAL、捕获、溢出成本），不写入密钥或服务端错误正文。
+  `meta/monitor.py` 预扫描 receipt，把 Manual Tick 从 Agent 主 KPI 排除并保留 Manual 事件直方图。
+- **静态验收**：兼容旧 `turns()` 假客户端；监控仍支持旧日志字段；全量 pytest、compileall、
+  `uv pip check`、`git diff --check` 和敏感信息扫描通过后才允许提交。
+- **剩余限制**：日志只有事件级成本，尚未有 Worker 级“首次分配 -> 采集 -> 入核”关联；因此
+  `Manual` 归因已可用，但资源发现/兑现瓶颈仍需 50 条完整链路样本后再调整 Worker 数量。

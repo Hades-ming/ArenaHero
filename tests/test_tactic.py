@@ -62,6 +62,9 @@ def _reset_explore_state(tmp_path, monkeypatch) -> None:
     tactic._prev_pos.clear()
     tactic._last_pos.clear()
     tactic._stuck_ticks.clear()
+    tactic._chase_start.clear()
+    tactic._chase_budget.clear()
+    tactic._chase_cooldown_until.clear()
     yield
     tactic._explore_state.clear()
     tactic._explore_targets.clear()
@@ -82,6 +85,9 @@ def _reset_explore_state(tmp_path, monkeypatch) -> None:
     tactic._prev_pos.clear()
     tactic._last_pos.clear()
     tactic._stuck_ticks.clear()
+    tactic._chase_start.clear()
+    tactic._chase_budget.clear()
+    tactic._chase_cooldown_until.clear()
 
 
 def _state(
@@ -562,6 +568,39 @@ def test_control_workers_reserves_two_refresh_patrols_without_visible_resources(
     assert len(captured[0]) == 4
     assert tactic._resource_telemetry["refresh_reservations"] == 2
     assert len(turn.plan.unit_actions) == 6
+
+
+def test_frontier_reassignment_keeps_refresh_patrols_reserved(monkeypatch) -> None:
+    """前沿停滞重派不能抢走两个 Chunk 回扫 Worker。"""
+    turn = _turn(
+        _workers_state(
+            [(0, 1), (0, 2), (0, 3), (0, 4), (0, 5), (0, 6)]
+        ),
+        tick=20,
+    )
+    worker_ids = [str(UUID(int=0x6000 + index)) for index in range(6)]
+    calls: list[list[str]] = []
+
+    def fake_assign(workers, *args, **kwargs):
+        calls.append([worker_id for worker_id, _ in workers])
+        return {
+            worker_id: (1, 1)
+            for worker_id, _ in workers
+            if worker_id == worker_ids[2]
+        }
+
+    monkeypatch.setattr(tactic, "_assign_explore_targets", fake_assign)
+    monkeypatch.setattr(
+        tactic,
+        "_explore_target_has_stalled",
+        lambda worker_id, *args, **kwargs: worker_id == worker_ids[2],
+    )
+    tactic._explore_targets[worker_ids[2]] = (1, 1)
+
+    tactic._control_workers(turn, turn.core.position)
+
+    assert calls
+    assert all(worker_ids[index] not in call for call in calls for index in (0, 1))
 
 
 def test_worker_destination_is_reserved_within_one_tick(monkeypatch) -> None:
@@ -1643,6 +1682,47 @@ def test_dropped_cargo_pile_is_treated_as_resource_cell() -> None:
     assert _action(turn.plan, WORKER_ID).type == "HARVEST"
 
 
+def test_out_of_sight_dropped_cargo_is_persisted_as_resource_hint() -> None:
+    state = _state(
+        population=1,
+        objects=[
+            {
+                "kind": "CORE",
+                "id": str(CORE_ID),
+                "controlled": True,
+                "owner_username": "arena_hero",
+                "position": [0, 0],
+                "hp": 5,
+                "shield": 5,
+                "state": "NORMAL",
+            },
+            {
+                "kind": "UNIT",
+                "id": str(WORKER_ID),
+                "controlled": True,
+                "position": [1, 0],
+                "hp": 2,
+                "unit_type": "WORKER",
+                "cargo": 0,
+            },
+        ],
+        events=[
+            {
+                "event_id": "00000000-0000-4000-8000-0000000000bc",
+                "tick": 9,
+                "event_type": "WORKER_CARGO_DROPPED",
+                "actor_id": str(WORKER2_ID),
+                "position": [20, 20],
+                "values": {"amount": 2},
+            }
+        ],
+    )
+    turn = _turn(state)
+    decide(turn)
+    assert (20, 20) in tactic._known_resources
+    assert tactic._resource_hints[(20, 20)].source == "dropped"
+
+
 # ---------------------------------------------------------------------------
 # Combat
 # ---------------------------------------------------------------------------
@@ -1688,6 +1768,101 @@ def test_ranger_shoots_visible_legal_target() -> None:
     assert action.type == "SHOOT"
     assert action.target_id == ENEMY_UNIT_ID
     assert tuple(action.expected_cell) == (0, 2)
+
+
+def test_low_hp_ranger_shoots_before_heal_when_target_is_legal() -> None:
+    state = _state(
+        resources=1,
+        population=2,
+        objects=[
+            {
+                "kind": "CORE",
+                "id": str(CORE_ID),
+                "controlled": True,
+                "owner_username": "arena_hero",
+                "position": [0, 0],
+                "hp": 5,
+                "shield": 5,
+                "state": "NORMAL",
+            },
+            {
+                "kind": "UNIT",
+                "id": str(RANGER_ID),
+                "controlled": True,
+                "position": [0, 0],
+                "hp": 1,
+                "unit_type": "RANGER",
+                "cargo": None,
+            },
+            {
+                "kind": "UNIT",
+                "id": str(ENEMY_UNIT_ID),
+                "controlled": False,
+                "position": [0, 2],
+                "hp": 2,
+                "unit_type": "RANGER",
+                "cargo": None,
+            },
+        ],
+    )
+    turn = _turn(state)
+    decide(turn)
+    action = _action(turn.plan, RANGER_ID)
+    assert action.type == "SHOOT"
+    assert _core_action(turn.plan) is None
+
+
+def test_distant_enemy_core_raid_uses_dynamic_reserve_and_eta_budget() -> None:
+    second_ranger_id = UUID("00000000-0000-4000-8000-000000000006")
+    state = _state(
+        resources=15,
+        population=3,
+        objects=[
+            {
+                "kind": "CORE",
+                "id": str(CORE_ID),
+                "controlled": True,
+                "owner_username": "arena_hero",
+                "position": [0, 0],
+                "hp": 5,
+                "shield": 5,
+                "state": "NORMAL",
+            },
+            {
+                "kind": "UNIT",
+                "id": str(RANGER_ID),
+                "controlled": True,
+                "position": [0, 0],
+                "hp": 2,
+                "unit_type": "RANGER",
+                "cargo": None,
+            },
+            {
+                "kind": "UNIT",
+                "id": str(second_ranger_id),
+                "controlled": True,
+                "position": [0, 0],
+                "hp": 2,
+                "unit_type": "RANGER",
+                "cargo": None,
+            },
+            {
+                "kind": "CORE",
+                "id": str(ENEMY_CORE_ID),
+                "controlled": False,
+                "owner_username": "rival",
+                "position": [0, 34],
+                "hp": 5,
+                "shield": 5,
+                "state": "NORMAL",
+            },
+        ],
+    )
+    turn = _turn(state)
+    decide(turn)
+    action = _action(turn.plan, second_ranger_id)
+    assert action.type == "MOVE"
+    assert tactic._chase_budget[str(second_ranger_id)] >= 31
 
 
 def test_ranger_prioritizes_near_core_raider_over_distant_enemy_core() -> None:
@@ -2241,7 +2416,7 @@ def test_laden_worker_return_does_not_backtrack_into_recent_cell() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_core_repairs_shield_when_threatened_and_damaged() -> None:
+def test_core_heals_hp_before_repairing_shield_when_threatened() -> None:
     state = _state(
         core_hp=4,
         core_shield=2,
@@ -2280,7 +2455,7 @@ def test_core_repairs_shield_when_threatened_and_damaged() -> None:
     )
     turn = _turn(state)
     decide(turn)
-    assert _core_action(turn.plan).type == "REPAIR_SHIELD"
+    assert _core_action(turn.plan).type == "HEAL"
 
 
 def test_core_does_not_repair_when_shield_full() -> None:
@@ -3843,7 +4018,7 @@ def test_monitor_classifies_move_failures_and_enemy_core_visibility(tmp_path) ->
     from meta import monitor
 
     line = (
-        "t100 r5/10 pop2(W2 V0 R0) core@0,0 hp5/sh5/NORMAL "
+        "t100 r15/20 pop2(W2 V0 R0) core@0,0 hp5/sh5/NORMAL "
         "W[-] O[-] vis2[4,4C,5,5WORKER] res0[] obs0 beacon0,0 "
         "eco[a0,av0,ah0,blk0,cool0,unr0,harv0,dep0] "
         "TM[1,2,3] ST[ACCEPTED] "
@@ -4070,6 +4245,50 @@ def test_monitor_parses_compound_events_with_amount_payloads(tmp_path) -> None:
     assert kpi.harvest == 1
     assert kpi.deposit == 1
     assert kpi.spawn == 1
+
+
+def test_monitor_excludes_manual_ticks_and_accounts_v014_costs(tmp_path) -> None:
+    from meta import monitor
+
+    def state_line(tick: int, events: str, details: str) -> str:
+        return (
+            f"t{tick} r7/20 pop2(W2 V0 R0) core@0,0 hp5/sh5/NORMAL "
+            "W[-] O[-] vis0[-] res0[] obs0 beacon0,0 "
+            "eco[a0,av0,ah0,blk0,cool0,unr0,harv0,dep0] "
+            "TM[1,2,3] ST[ACCEPTED] "
+            f"ev[{events}] dt[{details}] plan[-]\n"
+        )
+
+    log_path = tmp_path / "game.log"
+    log_path.write_text(
+        state_line(
+            10,
+            "DEPOSIT_SUCCEEDED[2];CORE_SPAWN_SUCCEEDED",
+            "DEPOSIT_SUCCEEDED|tick=10|amount=2;CORE_SPAWN_SUCCEEDED|tick=10|cost=5",
+        )
+        + "t10 rcv[MANUAL] actions[1] plan[C:spawn:worker]\n"
+        + state_line(
+            11,
+            "DEPOSIT_SUCCEEDED[3];CORE_RESOURCES_CAPTURED[4];CORE_RESOURCE_OVERFLOW_DESTROYED[1]",
+            "DEPOSIT_SUCCEEDED|tick=11|amount=3;CORE_RESOURCES_CAPTURED|tick=11|amount=4;"
+            "CORE_RESOURCE_OVERFLOW_DESTROYED|tick=11|amount=1;CORE_REPAIR_SUCCEEDED|tick=11|cost=1",
+        )
+        + "t11 rcv[AGENT] actions[0] plan[-]\n",
+        encoding="utf-8",
+    )
+
+    kpi = monitor.analyze(log_path)
+
+    assert kpi.manual_ticks == 1
+    assert kpi.comparable_ticks == 1
+    assert kpi.manual_receipts == 1
+    assert kpi.agent_receipts == 1
+    assert kpi.deposit_amount == 3
+    assert kpi.captured_amount == 4
+    assert kpi.overflow_loss == 1
+    assert kpi.repair_cost == 1
+    assert kpi.spawn_cost == 0
+    assert kpi.net_resources == 5
 
 
 @pytest.mark.parametrize(

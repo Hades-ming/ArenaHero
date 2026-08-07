@@ -11,8 +11,8 @@
 
 1. **运行正确性**：只有一个 Agent 客户端；计划按时提交；无认证、协议和窗口错误。
 2. **资源生存性**：不丢 Core、不发生库存溢出销毁、不让带货 Worker 无谓死亡。
-3. **资源净收益**：提高每个唯一 Tick 的入核资源与敌核实际捕获资源，同时扣除 upkeep、
-   生产、治疗、修盾及可归因的失败开销。
+3. **资源净收益**：提高每个唯一 Tick 的入核资源与敌核实际捕获资源，同时扣除生产、
+   Unit/Core 治疗、修盾、溢出及可归因的失败开销。v0.14 没有 per-Tick upkeep。
 4. **长期吞吐**：提高 `发现 -> 分配 -> 采集 -> 入核` 完整链路的成功率，降低 P50/P95
    时延，而不是只提高某一个中间计数。
 5. **防御与攻击**：只有能够降低资源损失或带来可验证的敌核资源捕获时，军备开销才成立。
@@ -116,7 +116,8 @@ DISCOVERED -> PROPOSED -> APPROVED -> IN_PROGRESS -> STATIC_VERIFIED
 ### 核心指标
 
 - 主指标：`(DEPOSIT amount + CORE_RESOURCES_CAPTURED amount) / unique_tick`。
-- 净收益：主指标减去 Agent 可归因的 upkeep、生产、治疗、修盾和溢出损失。
+- 净收益：主指标减去 Agent 可归因的生产、Unit/Core 治疗、修盾和溢出损失；Manual Tick
+  单独统计，不进入 Agent 主比较。
 - 链路：分配到采集、采集到入核、进入 Core 两格到入核的 P50/P95。
 - 探索：每 Tick 新增探索格、当前可见/历史资源分配、历史提示失败/冷却/不可达。
 - 性能：`decide_ms`、`submit_ms`、本地总耗时 P50/P95/P99 和窗口关闭次数。
@@ -149,5 +150,23 @@ DISCOVERED -> PROPOSED -> APPROVED -> IN_PROGRESS -> STATIC_VERIFIED
 ## 8. 规则与 SDK 复核
 
 每轮开始记录：规则版本、SDK 本地版本、PyPI 最新版本、官方 source/version 页面和复核日期。
-当前基线是 gameplay v0.13、SDK 0.2.8。若 live 合同更新或不兼容，立即冻结规则相关改动，
-先更新文档与 SDK；不得从旧经验猜测新规则。
+当前基线是 gameplay v0.14、Python SDK 0.2.9（复核日期 2026-08-07）。若 live 合同更新或
+不兼容，立即冻结规则相关改动，先更新文档与 SDK；不得从旧经验猜测新规则。
+
+## 9. 2026-08-07 复审基线与新增护栏
+
+- **基线证据**：`main@e45cec0`，规则 gameplay `v0.14`，SDK `0.2.9`，本地唯一
+  `play.py` 进程；此前约 1332 个唯一 Tick 无协议、认证、提交窗口错误，但仅有 89 次采集、
+  87 次入核，库存峰值约 30。资源瓶颈在“发现/分配 -> 采集 -> 入核”，不是决策耗时。
+- **敌核突袭**：不得用固定 `60` 资源门槛。当前策略以 `unit_cost(RANGER, population)` 加
+  3 点重建储备作为可逆突袭门槛，并按到合法射击位的 ETA 计算追击预算，最高 48 Tick；
+  看到敌核仍会扩军，但只有能实际抵达并开火时才把它计为可执行突袭。
+- **战斗结算**：合法 `SHOOT/SWEEP` 优先于 Unit `HEAL`；低血战斗单位不再因治疗放弃当 Tick
+  攻击。Core HP 低于 5 且有可用资源时优先 `HEAL`，再考虑修盾或生产。
+- **资源完整性**：`WORKER_CARGO_DROPPED` 即使发生在视野外也写入持久资源提示，随后以
+  authoritative state 确认或清除；不伪造货堆数量。
+- **人工归因**：`play.py` 记录 canonical `AGENT/MANUAL` receipt 和 v0.14 事件成本详情；
+  `meta/monitor.py` 预扫描 Manual Tick，从 Agent 主 KPI 排除，同时保留 Manual 事件直方图。
+- **验收门槛**：离线 `pytest`、`compileall`、依赖检查和敏感信息扫描通过；重启后先观察至少
+  20 个唯一 Tick，再累计 200 个唯一 Tick与 50 条完整 `HARVEST_SUCCEEDED -> DEPOSIT_SUCCEEDED`
+  链路。达到门槛前只能报告“运行稳定/假设待验证”，不能宣称资源收益已优化。

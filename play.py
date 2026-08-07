@@ -32,9 +32,12 @@ from arena_hero import (
     APIError,
     ArenaHeroClient,
     AuthenticationError,
+    Received,
     HarvestSource,
     PolicyViolationError,
     ProtocolError,
+    Tick,
+    Turn,
     TransportError,
     TurnClosedError,
 )
@@ -86,7 +89,7 @@ def load_api_key(api_key_file: Path | None = None) -> str:
     return key
 
 
-def _summarize_plan(plan) -> str:
+def _summarize_plan(plan, *, full_ids: bool = False) -> str:
     parts: list[str] = []
     for _uid, action in plan.unit_actions.items():
         name = type(action).__name__.replace("Action", "").lower()
@@ -95,8 +98,8 @@ def _summarize_plan(plan) -> str:
         direction = getattr(action, "direction", None)
         if direction is not None:
             extra = f":{direction.value}"
-        uid_short = str(_uid)[-6:]
-        parts.append(f"U{uid_short}:{name}{extra}")
+        uid = str(_uid) if full_ids else str(_uid)[-6:]
+        parts.append(f"U{uid}:{name}{extra}")
     if plan.core_action is not None:
         cname = type(plan.core_action).__name__.replace("Action", "").lower()
         unit_type = getattr(plan.core_action, "unit_type", None)
@@ -124,6 +127,36 @@ def _summarize_events(events) -> str:
         if e.event_type == "HARVEST_SUCCEEDED" and e.harvest_source is HarvestSource.DROPPED_CARGO:
             tag += "(pile)"
         out.append(tag)
+    return ";".join(out)
+
+
+def _summarize_event_details(events) -> str:
+    """序列化有界事件详情，避免把服务端错误文本写入日志。"""
+    out: list[str] = []
+    for event in events:
+        fields = [event.event_type]
+        fields.append(f"tick={event.tick}")
+        if event.reason_code:
+            fields.append(f"reason={event.reason_code}")
+        if event.event_id:
+            fields.append(f"event={event.event_id}")
+        if event.actor_id:
+            fields.append(f"actor={event.actor_id}")
+        if event.target_id:
+            fields.append(f"target={event.target_id}")
+        if event.position is not None:
+            fields.append(f"pos={event.position[0]},{event.position[1]}")
+        values = event.values or {}
+        # 只保留 v0.14 KPI 解析所需的数值与枚举样式字段。
+        for key in ("amount", "available", "destroyed", "capacity", "cost", "required", "hp"):
+            value = values.get(key)
+            if type(value) is int:
+                fields.append(f"{key}={value}")
+        source = values.get("source")
+        if isinstance(source, str) and re.fullmatch(r"[A-Z_]{1,32}", source):
+            fields.append(f"source={source}")
+        # 分号分隔事件、竖线分隔字段；上面的值均为受限 ASCII 标记，无需转义。
+        out.append("|".join(fields))
     return ";".join(out)
 
 
@@ -224,14 +257,57 @@ def _log_line(
         f"TM[{decide_ms},{submit_ms},{total_local_ms}] ST[{status}]"
         f"{f' ER[{safe_error_code}]' if error_code else ''}{dup_flag} "
         f"ev[{_summarize_events(turn.events)}] "
+        f"dt[{_summarize_event_details(turn.events)}] "
         f"plan[{_summarize_plan(turn.plan)}]"
+    )
+
+
+def _receipt_log_line(receipt: Received) -> str:
+    """记录 receipt Tick 的 Agent/Manual 规范计划归属。"""
+    source = receipt.source.value
+    action_count = len(receipt.plan.unit_actions) + (
+        1 if receipt.plan.core_action is not None else 0
+    )
+    return (
+        f"t{receipt.tick} rcv[{source}] actions[{action_count}] "
+        f"plan[{_summarize_plan(receipt.plan, full_ids=True)}]"
     )
 
 
 def play(api_key: str, base_url: str, websocket_url: str | None) -> int:
     try:
         with ArenaHeroClient(api_key=api_key, base_url=base_url, websocket_url=websocket_url) as game:
-            for turn in game.turns():
+            last_turn_tick: int | None = None
+            logged_receipts: set[tuple[int, str, str]] = set()
+            event_stream = game.events() if hasattr(game, "events") else game.turns()
+            for stream_event in event_stream:
+                if isinstance(stream_event, Received):
+                    receipt_plan = _summarize_plan(stream_event.plan, full_ids=True)
+                    receipt_key = (
+                        stream_event.tick,
+                        stream_event.source.value,
+                        receipt_plan,
+                    )
+                    if receipt_key in logged_receipts:
+                        continue
+                    logged_receipts.add(receipt_key)
+                    # 重连或重放时限制集合大小，同时抑制当前 Tick 的重复 receipt。
+                    if len(logged_receipts) > 256:
+                        floor = stream_event.tick - 8
+                        logged_receipts = {key for key in logged_receipts if key[0] >= floor}
+                    receipt_line = _receipt_log_line(stream_event)
+                    print(receipt_line, file=sys.stderr)
+                    _append_log_line(receipt_line)
+                    continue
+                if isinstance(stream_event, Tick):
+                    continue
+                # 兼容离线失败路径测试中的简化 Turn 适配器。
+                if not isinstance(stream_event, Turn) and not hasattr(stream_event, "tick"):
+                    continue
+                turn = stream_event
+                if turn.tick == last_turn_tick:
+                    continue
+                last_turn_tick = turn.tick
                 t0 = time.monotonic()
                 try:
                     decide(turn)

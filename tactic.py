@@ -324,11 +324,18 @@ AVOID_HISTORY = 4
 # or the home Vanguard off defense.
 _last_enemy_pos: dict[str, tuple[tuple[int, int], int]] = {}  # enemy id -> (pos, tick)
 _chase_start: dict[str, int] = {}  # ranger id -> tick the chase began
+_chase_budget: dict[str, int] = {}  # ranger id -> bounded ETA budget
 _chase_cooldown_until: dict[str, int] = {}  # ranger id -> tick it may chase again
 CHASE_RADIUS = 15         # drive off enemies within this many cells of the Core
-CHASE_MAX_TICKS = 8       # give up after chasing this many ticks
+# A distant Core can be more than thirty cells from a Ranger.  Eight ticks
+# never reached it, so the old raid branch spent army resources without ever
+# firing.  The actual budget is derived from the current ETA and capped here.
+CHASE_MAX_TICKS = 48
+CHASE_MIN_TICKS = 12
 CHASE_COOLDOWN_TICKS = 12
 ENEMY_MEMORY_TICKS = 6    # forget a last-seen enemy position after this many ticks
+RAID_REBUILD_RESERVE = 3  # keep a small bank in case the raiding Ranger dies
+CORE_MAX_HP = 5
 
 # Local resource memory pool: remember resource cells even after they leave
 # vision, so Workers don't re-sweep bare ground they already confirmed empty.
@@ -1921,7 +1928,9 @@ def _control_workers(turn: "Turn", core_pos: tuple[int, int]) -> None:
     explore_targets = _assign_explore_targets(
         frontier_workers, core_pos, dynamically_blocked, tick=turn.tick
     )
-    fallback_workers = list(idle_workers)
+    # 回扫 Worker 已从 frontier_workers 中排除；后续资源/前沿重派也必须
+    # 复用同一队列，否则一次停滞重算会把回扫名额重新派去远端前沿。
+    fallback_workers = list(frontier_workers)
     # 逐 Tick 预约下一格，避免先提交的空载 Worker 抢走带货 Worker 的通道。
     # 仍按 UUID 给探索列编号，保证输入顺序和历史路线稳定；执行顺序则让
     # 带货 Worker 先规划回 Core，随后空载 Worker 避开已经预约的目的地。
@@ -2193,7 +2202,7 @@ def _control_workers(turn: "Turn", core_pos: tuple[int, int]) -> None:
                 _explore_targets.pop(wid, None)
                 _explore_progress.pop(wid, None)
                 explore_targets = _assign_explore_targets(
-                    idle_workers,
+                    frontier_workers,
                     core_pos,
                     dynamically_blocked,
                     tick=turn.tick,
@@ -2220,7 +2229,7 @@ def _control_workers(turn: "Turn", core_pos: tuple[int, int]) -> None:
                     _explore_targets.pop(wid, None)
                     _explore_progress.pop(wid, None)
                     explore_targets = _assign_explore_targets(
-                        idle_workers,
+                        frontier_workers,
                         core_pos,
                         dynamically_blocked,
                         tick=turn.tick,
@@ -2348,9 +2357,23 @@ def _reserve_unit_heals(
     if core is None or core.view.state != "NORMAL":
         return frozenset(), available_resources
 
+    enemies = turn.visible_enemies
+    obstacles = frozenset(turn.obstacle_cells) | _known_obstacles
     candidates: list[tuple[str, int]] = []
     for unit in sorted(turn.units, key=lambda item: str(item.id)):
         if unit.position != core_pos:
+            continue
+        # Combat has higher value than recovery in a contested Tick.  A legal
+        # attack is resolved before Unit HEAL, so do not reserve resources for
+        # a heal that the controller will deliberately replace with SHOOT or
+        # SWEEP.
+        if unit.unit_type == "RANGER" and _select_ranger_target(
+            unit.position, enemies, obstacles, core_pos
+        ) is not None:
+            continue
+        if unit.unit_type == "VANGUARD" and _vanguard_sweep_target(
+            unit.position, enemies
+        ) is not None:
             continue
         if unit.unit_type == "VANGUARD" and unit.hp <= 1:
             missing = 4 - unit.hp
@@ -2387,8 +2410,15 @@ def _control_vanguards(
     resources = turn.resources
     core_normal = turn.core is not None and turn.core.view.state == "NORMAL"
     for vanguard in sorted(turn.vanguards, key=lambda unit: str(unit.id)):
+        # Resolve a legal combat action before considering recovery.  HEAL is
+        # valuable, but giving up a guaranteed hit lets the enemy live for an
+        # extra Tick and can cost the Core or the entire resource stockpile.
+        sweep_dir = _vanguard_sweep_target(vanguard.position, enemies)
+        if sweep_dir is not None:
+            vanguard.sweep(sweep_dir)
+            continue
         # HEAL at the Core: post-combat HP recovery costs 1 resource per HP
-        # (SDK arena-hero 0.2.8, v0.8 rules). A 1-HP Vanguard (max 4) recovers
+        # (v0.14 rules). A 1-HP Vanguard (max 4) recovers
         # 3 HP for 3 resources vs 10 to rebuild — 3.3x ROI.
         should_heal = (
             str(vanguard.id) in heal_ids
@@ -2402,10 +2432,6 @@ def _control_vanguards(
         )
         if should_heal:
             vanguard.heal()
-            continue
-        sweep_dir = _vanguard_sweep_target(vanguard.position, enemies)
-        if sweep_dir is not None:
-            vanguard.sweep(sweep_dir)
             continue
         target = targets.get(str(vanguard.id))
         # A Vanguard at full HP (4) can absorb one more hit before dying; a 1-HP
@@ -2627,9 +2653,20 @@ def _control_rangers(
     enemies = turn.visible_enemies
     resources = turn.resources
     core_normal = turn.core is not None and turn.core.view.state == "NORMAL"
-    for index, ranger in enumerate(turn.rangers):
+    rangers = sorted(turn.rangers, key=lambda unit: str(unit.id))
+    guard_id = str(rangers[0].id) if rangers else None
+    patrol_id = str(rangers[1].id) if len(rangers) > 1 else None
+    for index, ranger in enumerate(rangers):
+        rid = str(ranger.id)
+        target = _select_ranger_target(ranger.position, enemies, obstacles, core_pos)
+        # Resolve a legal shot before considering recovery.  This is especially
+        # important for a 1-HP Ranger at the Core: one resource for HEAL is not
+        # worth surrendering a guaranteed hit on an adjacent raider/Core.
+        if target is not None:
+            ranger.shoot(target)
+            continue
         # HEAL at the Core: post-combat HP recovery costs 1 resource per HP
-        # (SDK arena-hero 0.2.8, v0.8 rules). A 1-HP Ranger (max 2) recovers
+        # (v0.14 rules). A 1-HP Ranger (max 2) recovers
         # to full for 1 resource vs 12 to rebuild — 12x ROI.
         should_heal = (
             str(ranger.id) in heal_ids
@@ -2644,17 +2681,13 @@ def _control_rangers(
         if should_heal:
             ranger.heal()
             continue
-        target = _select_ranger_target(ranger.position, enemies, obstacles, core_pos)
-        if target is not None:
-            ranger.shoot(target)
-            continue
         # The FIRST Ranger is the dedicated Core guard: hold a choke near the
         # Core with a clear cardinal line to the Core cell, preferring cells
         # that cover visible enemies too. 8th review: old ring-orbit guard
         # scored nothing but Manhattan distance, allowed dist-4 cells that
         # cannot shoot the Core cell (range cap 3), and had no obstacle or
         # occupancy awareness — the new _guard_step is LOS/choke-aware.
-        if index == 0:
+        if rid == guard_id:
             # Friendly-full cells block the guard's ring, but the guard must
             # not block the deposit lane (leave-one-exit rule).
             friendly_full = frozenset(
@@ -2676,11 +2709,18 @@ def _control_rangers(
         # best scout): use the deterministic scan-row sweep so it covers ground
         # instead of milling near the Core.
         pos = ranger.position
-        rid = str(ranger.id)
         # Bounded drive-off (8th review, rank 2): a non-guard Ranger chases a
         # visible or recently-seen enemy near the Core, so inbound raiders are
         # intercepted instead of ignored. Guard (index 0) never chases.
-        chase = _chase_target(pos, core_pos, enemies, rid, turn.tick, turn.resources)
+        chase = _chase_target(
+            pos,
+            core_pos,
+            enemies,
+            rid,
+            turn.tick,
+            turn.resources,
+            turn.state.population,
+        )
         if chase is not None:
             enemy_cells = frozenset(e.position for e in enemies)
             # Chase to a cell that can SHOOT the target, not onto it. Moving
@@ -2719,7 +2759,7 @@ def _control_rangers(
         if step is not None:
             _record_pos(rid, pos)
             ranger.move(step)
-        elif index == 1:
+        elif rid == patrol_id:
             # The 2nd non-guard Ranger holds a home-band patrol ring so a raid
             # always has a close-in interceptor; only the OTHER roaming Ranger
             # (index >= 2) scouts far (8th review, rank 5).
@@ -2779,6 +2819,12 @@ def _control_core(
     resources = turn.resources
     if available_resources is None:
         available_resources = resources + _pending_deposit_amount(turn)
+    # Core HP is the irrecoverable loss boundary: once it reaches zero the
+    # entire stored economy is gone.  Heal damaged HP before shield repair or
+    # production, using the same post-Unit-HEAL resource budget.
+    if core.hp < CORE_MAX_HP and available_resources >= 1:
+        core.heal()
+        return
     # Repair shield first when under threat and there is space and a spare
     # resource. Holding the Beacon raises the cap to 10, so use the live cap.
     if threats and available_resources >= 1:
@@ -2941,6 +2987,11 @@ def _sync_explore_state(turn: "Turn") -> None:
     for uid in list(_explore_state):
         if uid not in live:
             del _explore_state[uid]
+    for uid in list(_chase_start):
+        if uid not in live:
+            _chase_start.pop(uid, None)
+            _chase_budget.pop(uid, None)
+            _chase_cooldown_until.pop(uid, None)
     for uid in list(_explore_targets):
         if uid not in live:
             del _explore_targets[uid]
@@ -3184,6 +3235,27 @@ def _observe_enemies(turn: "Turn") -> None:
         _mark_persistent_state_dirty()
 
 
+def _raid_chase_budget(
+    ranger_pos: tuple[int, int],
+    target: tuple[int, int],
+) -> int:
+    """根据 Ranger 到合法射击位的 ETA 计算有界突袭预算。"""
+    travel = max(0, _manhattan(ranger_pos, target) - RANGER_MAX_RANGE)
+    return min(CHASE_MAX_TICKS, max(CHASE_MIN_TICKS, travel + 6))
+
+
+def _begin_chase(
+    rid: str,
+    tick: int,
+    ranger_pos: tuple[int, int],
+    target: tuple[int, int],
+) -> None:
+    """首次进入目标追击时记录开始 Tick 和目标 ETA 预算。"""
+    if rid not in _chase_start:
+        _chase_start[rid] = tick
+        _chase_budget[rid] = _raid_chase_budget(ranger_pos, target)
+
+
 def _chase_target(
     pos: tuple[int, int],
     core_pos: tuple[int, int],
@@ -3191,6 +3263,7 @@ def _chase_target(
     rid: str,
     tick: int,
     resources: int,
+    population: int = 0,
 ) -> tuple[int, int] | None:
     """Pick an enemy cell for a non-guard Ranger to drive off or hunt, or None.
 
@@ -3198,21 +3271,28 @@ def _chase_target(
     rebuilding) — destroying it removes the enemy fleet and may capture its
     stockpiled resources (variable loot, not a flat +6); (2) any enemy
     within CHASE_RADIUS of the Core (drive off inbound raiders); (3) a
-    recently-seen enemy within the radius. Bounded: gives up after
-    CHASE_MAX_TICKS, then cools down before chasing again.
+    recently-seen enemy within the radius. Bounded: gives up after a
+    target-specific ETA budget capped by CHASE_MAX_TICKS.
     """
     if _chase_cooldown_until.get(rid, 0) > tick:
         return None
     start = _chase_start.get(rid)
-    if start is not None and tick - start > CHASE_MAX_TICKS:
+    budget = _chase_budget.get(rid, CHASE_MAX_TICKS)
+    if start is not None and tick - start > budget:
         _chase_start.pop(rid, None)
+        _chase_budget.pop(rid, None)
         _chase_cooldown_until[rid] = tick + CHASE_COOLDOWN_TICKS
         return None
     # Priority 1: hunt a visible OR remembered enemy Core near home when we
     # can afford to rebuild a Ranger if one falls. The known_enemy_cores set
     # persists across restarts so we don't forget the rival after a deploy.
     core_target = None
-    if resources >= 60:
+    # One Ranger replacement plus a small bank is enough to make a raid
+    # reversible.  The former fixed 60-resource gate was unreachable in the
+    # observed economy (peak inventory was 30), producing army cost with no
+    # legal attack ever queued.
+    raid_threshold = unit_cost(UnitType.RANGER, population) + RAID_REBUILD_RESERVE
+    if resources >= raid_threshold:
         visible_core = next(
             (e for e in enemies
              if e.kind == "CORE" and _manhattan(core_pos, e.position) < 40),
@@ -3228,7 +3308,7 @@ def _chase_target(
             if remembered:
                 core_target = min(remembered, key=lambda c: _manhattan(pos, c))
     if core_target is not None:
-        _chase_start[rid] = _chase_start.get(rid, tick)
+        _begin_chase(rid, tick, pos, core_target)
         return core_target
     # Priority 2: drive off any visible enemy within CHASE_RADIUS of the Core.
     candidates = [
@@ -3237,12 +3317,12 @@ def _chase_target(
     ]
     if candidates:
         nearest = min(candidates, key=lambda e: _manhattan(pos, e.position))
-        _chase_start[rid] = _chase_start.get(rid, tick)
+        _begin_chase(rid, tick, pos, tuple(nearest.position))
         return tuple(nearest.position)
     # Priority 3: re-acquire a recently-seen enemy within the radius + slack.
     for epos, seen in _last_enemy_pos.values():
         if _manhattan(core_pos, epos) < CHASE_RADIUS + 6:
-            _chase_start[rid] = _chase_start.get(rid, tick)
+            _begin_chase(rid, tick, pos, epos)
             return epos
     return None
 
@@ -3276,6 +3356,17 @@ def _process_events(turn: "Turn") -> None:
                         del _resource_claims[worker_id]
                 resource_invalidated = True
         if event.event_type == "WORKER_CARGO_DROPPED":
+            # The drop may occur outside every current vision cone.  Preserve
+            # the coordinate as a historical resource hint; the next
+            # authoritative visible state will confirm the pile or clear it.
+            if event.position is not None:
+                cell = tuple(event.position)
+                _known_resources.add(cell)
+                _resource_hints[cell] = ResourceHint(
+                    last_confirmed_tick=turn.tick,
+                    source="dropped",
+                )
+                _mark_persistent_state_dirty()
             continue
         if event.harvest_source is HarvestSource.DROPPED_CARGO:
             continue
