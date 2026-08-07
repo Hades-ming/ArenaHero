@@ -604,3 +604,12 @@
 - **行为边界**：窗口内可见敌人 Tick 为 `0`，因此只能接受安全 canary；远处普通敌人出现后的生产/
   留存军备预算仍只有 TDD 覆盖，状态保持 `OBSERVING`。`LOW_HARVEST` 来自短窗 `1/22` 次采集，继续
   作为经济信号观察，不归因于没有实际触发的敌情分支。
+
+## 定时复核自动化阻断（2026-08-07）
+
+- **现状**：当前 `/Users/hx/.codex/automations` 下没有 `automation.toml`；“Arena Hero 资源优化复核”
+  heartbeat 创建调用再次长期无返回，终止后仍未落盘，因此定时任务未创建。
+- **降级边界**：不使用系统 cron 冒充 Codex 线程 heartbeat。`io.arenahero.tactic` 继续负责唯一 live
+  客户端；每次人工续接先复核官方规则/SDK、唯一进程、唯一 Tick KPI 和 GitHub SHA。
+- **恢复条件**：Codex 自动化接口可正常返回时，创建每 6 小时 heartbeat，仅失败运行通知；任务内容
+  必须沿用本文件的样本、单变量、canary、提交/推送和回滚门槛，禁止无门槛自动调参。
