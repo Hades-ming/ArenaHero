@@ -3454,6 +3454,51 @@ def test_visible_enemy_triggers_attack_spawn_with_one_worker() -> None:
     assert act.unit_type.value == "VANGUARD"
 
 
+def test_distant_visible_enemy_unit_triggers_attack_spawn() -> None:
+    state = _state(
+        resources=10,
+        population=1,
+        objects=[
+            {
+                "kind": "CORE",
+                "id": str(CORE_ID),
+                "controlled": True,
+                "owner_username": "arena_hero",
+                "position": [0, 0],
+                "hp": 5,
+                "shield": 5,
+                "state": "NORMAL",
+            },
+            {
+                "kind": "UNIT",
+                "id": str(WORKER_ID),
+                "controlled": True,
+                "position": [0, 6],
+                "hp": 2,
+                "unit_type": "WORKER",
+                "cargo": 0,
+            },
+            {
+                "kind": "UNIT",
+                "id": str(ENEMY_UNIT_ID),
+                "controlled": False,
+                "position": [0, 7],
+                "hp": 2,
+                "unit_type": "RANGER",
+                "cargo": None,
+            },
+        ],
+    )
+    turn = _turn(state)
+
+    decide(turn)
+
+    act = _core_action(turn.plan)
+    assert act is not None
+    assert act.type == "SPAWN"
+    assert act.unit_type.value == "VANGUARD"
+
+
 def test_population_19_can_spawn_the_twentieth_unit() -> None:
     # v0.14 keeps the base Vanguard price for the twentieth Unit. The old
     # population >= 19 guard incorrectly suppressed this defensive spawn.

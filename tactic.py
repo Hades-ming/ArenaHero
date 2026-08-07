@@ -2852,6 +2852,7 @@ def _standing_army_targets(n_workers: int) -> tuple[int, int]:
 def _control_core(
     turn: "Turn",
     threats: list[UnitView | CoreView],
+    enemy_visible: bool = False,
     enemy_core_visible: bool = False,
     available_resources: int | None = None,
 ) -> None:
@@ -2955,7 +2956,7 @@ def _control_core(
     # army must form immediately — drop the economy floor so a Vanguard/Ranger
     # is built even with a young Worker fleet, instead of waiting for 4 Workers
     # while the enemy raids unchecked.
-    enemy_present = threatened or enemy_core_visible
+    enemy_present = enemy_visible or threatened or enemy_core_visible
     economy_floor_met = len(turn.workers) >= MIN_WORKERS_BEFORE_ARMY
     army_floor_met = enemy_present or len(turn.workers) >= MIN_WORKERS_BEFORE_ARMY
 
@@ -3511,6 +3512,7 @@ def decide(turn: "Turn") -> None:
     _control_core(
         turn,
         threats,
+        enemy_visible=bool(turn.visible_enemies),
         enemy_core_visible=enemy_core_visible,
         available_resources=available_resources,
     )
