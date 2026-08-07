@@ -1476,6 +1476,9 @@ def _astar_step_result(
     return None, False
 
 
+_EMPTY_WORKER_ASTAR_MAX_EXPANSIONS = 2000
+
+
 def _astar_step(
     start: tuple[int, int],
     goal: tuple[int, int],
@@ -2179,7 +2182,11 @@ def _control_workers(turn: "Turn", core_pos: tuple[int, int]) -> None:
         target = resource_assignments.get(wid)
         if target is not None:
             step, budget_exhausted = _astar_step_result(
-                pos, target, base_blocked, blocked_empty
+                pos,
+                target,
+                base_blocked,
+                blocked_empty,
+                max_expansions=_EMPTY_WORKER_ASTAR_MAX_EXPANSIONS,
             )
             target_sealed = all(
                 (
@@ -2236,7 +2243,11 @@ def _control_workers(turn: "Turn", core_pos: tuple[int, int]) -> None:
                 retargeted_frontier = True
             if target is not None and not retargeted_frontier:
                 step, budget_exhausted = _astar_step_result(
-                    pos, target, base_blocked, blocked_empty
+                    pos,
+                    target,
+                    base_blocked,
+                    blocked_empty,
+                    max_expansions=_EMPTY_WORKER_ASTAR_MAX_EXPANSIONS,
                 )
                 target_sealed = all(
                     (

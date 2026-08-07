@@ -1326,6 +1326,38 @@ def test_astar_telemetry_counts_calls_expansions_and_paths() -> None:
     assert tactic._resource_telemetry["astar_budget_hits"] == 1
 
 
+def test_empty_worker_resource_path_uses_bounded_astar_budget(monkeypatch) -> None:
+    budgets: list[int] = []
+
+    def fake_astar(*args, max_expansions=4000, **kwargs):
+        budgets.append(max_expansions)
+        return Direction.RIGHT, False
+
+    monkeypatch.setattr(tactic, "_astar_step_result", fake_astar)
+    turn = _turn(_workers_state([(0, 1)], resources=[(2, 1)]))
+
+    decide(turn)
+
+    assert budgets == [tactic._EMPTY_WORKER_ASTAR_MAX_EXPANSIONS]
+    assert _action(turn.plan, UUID(int=0x6000)).direction == Direction.RIGHT
+
+
+def test_empty_worker_frontier_path_uses_bounded_astar_budget(monkeypatch) -> None:
+    budgets: list[int] = []
+
+    def fake_astar(*args, max_expansions=4000, **kwargs):
+        budgets.append(max_expansions)
+        return Direction.RIGHT, False
+
+    monkeypatch.setattr(tactic, "_astar_step_result", fake_astar)
+    turn = _turn(_workers_state([(0, 1)]))
+
+    decide(turn)
+
+    assert budgets == [tactic._EMPTY_WORKER_ASTAR_MAX_EXPANSIONS]
+    assert _action(turn.plan, UUID(int=0x6000)).direction == Direction.RIGHT
+
+
 def test_ranger_chase_avoids_full_friendly_cell(monkeypatch) -> None:
     ranger2_id = UUID("00000000-0000-4000-8000-000000000006")
     state = _state(
