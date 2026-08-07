@@ -724,6 +724,19 @@ def _resource_telemetry_summary() -> str:
     )
 
 
+def _astar_telemetry_summary() -> str:
+    """Return bounded per-Tick A* counters for the performance experiment."""
+    return ",".join(
+        f"{short}{_resource_telemetry.get(name, 0)}"
+        for name, short in (
+            ("astar_calls", "c"),
+            ("astar_expansions", "e"),
+            ("astar_budget_hits", "b"),
+            ("astar_paths", "p"),
+        )
+    )
+
+
 def _resource_age(cell: tuple[int, int], tick: int) -> int:
     """返回历史资源提示的逻辑 Tick 年龄。"""
     hint = _resource_hints.get(cell)
@@ -1404,6 +1417,7 @@ def _astar_step_result(
     返回值的第二项表示搜索是否仅因展开预算耗尽而停止；这与已确认
     开放集耗尽的“不可达”不同。
     """
+    _resource_telemetry["astar_calls"] = _resource_telemetry.get("astar_calls", 0) + 1
     if start == goal:
         return None, False
     frontier: list[tuple[int, int, int, tuple[int, int]]] = [
@@ -1435,8 +1449,16 @@ def _astar_step_result(
                 frontier,
                 (new_cost + _manhattan(nxt, goal), new_cost, expansions, nxt),
             )
+    budget_exhausted = bool(frontier) and expansions >= max_expansions
+    _resource_telemetry["astar_expansions"] = (
+        _resource_telemetry.get("astar_expansions", 0) + expansions
+    )
+    if budget_exhausted:
+        _resource_telemetry["astar_budget_hits"] = (
+            _resource_telemetry.get("astar_budget_hits", 0) + 1
+        )
     if goal not in came_from:
-        return None, bool(frontier) and expansions >= max_expansions
+        return None, budget_exhausted
     cursor = goal
     while came_from.get(cursor) != start:
         parent = came_from.get(cursor)
@@ -1447,6 +1469,9 @@ def _astar_step_result(
     ddy = cursor[1] - start[1]
     for d in DIRECTIONS:
         if d.delta == (ddx, ddy):
+            _resource_telemetry["astar_paths"] = (
+                _resource_telemetry.get("astar_paths", 0) + 1
+            )
             return d, False
     return None, False
 
@@ -2656,6 +2681,10 @@ def _control_rangers(
     rangers = sorted(turn.rangers, key=lambda unit: str(unit.id))
     guard_id = str(rangers[0].id) if rangers else None
     patrol_id = str(rangers[1].id) if len(rangers) > 1 else None
+    friendly_full = frozenset(
+        cell for cell, count in Counter(tuple(u.position) for u in turn.units).items()
+        if count >= 2
+    )
     for index, ranger in enumerate(rangers):
         rid = str(ranger.id)
         target = _select_ranger_target(ranger.position, enemies, obstacles, core_pos)
@@ -2729,17 +2758,24 @@ def _control_rangers(
             # reached cell is useless (cannot attack). _step_toward supports
             # `toward_exact`; passing a "blocked" goal makes it step toward it
             # while treating the exact goal cell as allowed-only-if-reached.
-            blocked = obstacles | enemy_cells
+            # Chase routes must respect the same two-entity cell limit as the
+            # guard route.  Without this, a Ranger can repeatedly plan into a
+            # full friendly cell and spend every Tick on CELL_UNIT_LIMIT.
+            blocked = obstacles | enemy_cells | friendly_full
             goal_exact = pos == chase  # already there -> just look for a shot
             if not goal_exact:
                 step = _astar_step(pos, chase, obstacles, blocked)
                 if step is None:
-                    step = _step_toward(pos, chase, obstacles | (enemy_cells - {chase}),
-                                        avoid=_avoid_set(rid))
+                    step = _step_toward(
+                        pos,
+                        chase,
+                        blocked - {chase},
+                        avoid=_avoid_set(rid),
+                    )
             else:
                 step = None
             if step is None:
-                step = _step_toward(pos, chase, obstacles, avoid=_avoid_set(rid))
+                step = _step_toward(pos, chase, blocked, avoid=_avoid_set(rid))
             if step is not None:
                 _record_pos(rid, pos)
                 ranger.move(step)

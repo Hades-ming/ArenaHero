@@ -1307,6 +1307,98 @@ def test_astar_rejects_blocked_goal_unless_explicitly_allowed() -> None:
     )
 
 
+def test_astar_telemetry_counts_calls_expansions_and_paths() -> None:
+    start = (0, 0)
+    goal = (2, 0)
+
+    assert tactic._astar_step(start, goal, frozenset(), frozenset()) == Direction.RIGHT
+    assert tactic._resource_telemetry["astar_calls"] == 1
+    assert tactic._resource_telemetry["astar_expansions"] > 0
+    assert tactic._resource_telemetry["astar_paths"] == 1
+    assert tactic._resource_telemetry.get("astar_budget_hits", 0) == 0
+
+    step, exhausted = tactic._astar_step_result(
+        start, (20, 0), frozenset(), frozenset(), max_expansions=1
+    )
+    assert step is None
+    assert exhausted is True
+    assert tactic._resource_telemetry["astar_calls"] == 2
+    assert tactic._resource_telemetry["astar_budget_hits"] == 1
+
+
+def test_ranger_chase_avoids_full_friendly_cell(monkeypatch) -> None:
+    ranger2_id = UUID("00000000-0000-4000-8000-000000000006")
+    state = _state(
+        resources=0,
+        population=5,
+        objects=[
+            {
+                "kind": "CORE",
+                "id": str(CORE_ID),
+                "controlled": True,
+                "owner_username": "arena_hero",
+                "position": [0, 0],
+                "hp": 5,
+                "shield": 5,
+                "state": "NORMAL",
+            },
+            {
+                "kind": "UNIT",
+                "id": str(RANGER_ID),
+                "controlled": True,
+                "position": [0, 1],
+                "hp": 2,
+                "unit_type": "RANGER",
+                "cargo": None,
+            },
+            {
+                "kind": "UNIT",
+                "id": str(ranger2_id),
+                "controlled": True,
+                "position": [2, 1],
+                "hp": 2,
+                "unit_type": "RANGER",
+                "cargo": None,
+            },
+            {
+                "kind": "UNIT",
+                "id": str(WORKER_ID),
+                "controlled": True,
+                "position": [3, 1],
+                "hp": 2,
+                "unit_type": "WORKER",
+                "cargo": 0,
+            },
+            {
+                "kind": "UNIT",
+                "id": str(WORKER2_ID),
+                "controlled": True,
+                "position": [3, 1],
+                "hp": 2,
+                "unit_type": "WORKER",
+                "cargo": 0,
+            },
+            {
+                "kind": "UNIT",
+                "id": str(ENEMY_UNIT_ID),
+                "controlled": False,
+                "position": [8, 1],
+                "hp": 2,
+                "unit_type": "VANGUARD",
+            },
+        ],
+    )
+    monkeypatch.setattr(tactic, "_chase_target", lambda *args, **kwargs: (8, 1))
+    turn = _turn(state)
+
+    decide(turn)
+
+    action = _action(turn.plan, ranger2_id)
+    assert action is not None
+    assert action.type == "MOVE"
+    assert action.direction in {Direction.UP, Direction.DOWN}
+
+
 def test_complete_worker_plan_is_independent_of_object_order() -> None:
     state = _workers_state([(2, 2), (3, 2), (4, 2), (5, 2)])
     first = _turn(state)
