@@ -36,6 +36,7 @@ RE_CORE = re.compile(r"core@([^ ]+) hp(\d+)/sh(\d+)/(\w+)")
 RE_VIS = re.compile(r"vis(\d+)\[([^\]]*)\]")
 RE_VIS_CORE = re.compile(r"(?:^|,)-?\d+,-?\d+C(?:,|$)")
 RE_ECO = re.compile(r"eco\[([^\]]*)\]")
+RE_PATH = re.compile(r"path\[([^\]]*)\]")
 # Event payloads may contain their own amount brackets, e.g.
 # ``ev[HARVEST_SUCCEEDED[1];CORE_SPAWN_SUCCEEDED]``. Match the outer event
 # field by its following ``plan[`` delimiter instead of stopping at the first
@@ -132,6 +133,13 @@ class KPI:
     decide_ms_list: list[int] = field(default_factory=list)
     submit_ms_list: list[int] = field(default_factory=list)
     total_ms_list: list[int] = field(default_factory=list)
+    # A* 性能计数。保留每 Tick 序列用于与 decide_ms 对齐分析。
+    astar_calls: int = 0
+    astar_expansions: int = 0
+    astar_budget_hits: int = 0
+    astar_paths: int = 0
+    astar_calls_list: list[int] = field(default_factory=list)
+    astar_expansions_list: list[int] = field(default_factory=list)
     # Unique-tick tracking (OBS-001)
     unique_ticks: int = 0
     duplicate_ticks: int = 0
@@ -250,6 +258,14 @@ def _parse_line(line: str) -> dict | None:
             if (match := re.fullmatch(r"([a-z]+)(\d+)", token))
             for name, value in [match.groups()]
         }
+    m = RE_PATH.search(line)
+    if m:
+        rec["path"] = {
+            name: int(value)
+            for token in m.group(1).split(",")
+            if (match := re.fullmatch(r"([a-z]+)(\d+)", token))
+            for name, value in [match.groups()]
+        }
     m = RE_EV.search(line)
     if m:
         rec["events"] = [e for e in m.group(1).split(";") if e]
@@ -363,6 +379,16 @@ def analyze(path: str | Path) -> KPI:
                 kpi.submit_ms_list.append(rec["submit_ms"])
             if "total_ms" in rec:
                 kpi.total_ms_list.append(rec["total_ms"])
+            if "path" in rec:
+                path_stats = rec["path"]
+                calls = path_stats.get("c", 0)
+                expansions = path_stats.get("e", 0)
+                kpi.astar_calls += calls
+                kpi.astar_expansions += expansions
+                kpi.astar_budget_hits += path_stats.get("b", 0)
+                kpi.astar_paths += path_stats.get("p", 0)
+                kpi.astar_calls_list.append(calls)
+                kpi.astar_expansions_list.append(expansions)
             if "res" in rec:
                 res, cap = rec["res"], rec["cap"]
                 kpi.resources_min = min(kpi.resources_min, res)
@@ -767,6 +793,19 @@ def report(kpi: KPI, alerts: list[str]) -> str:
             f"Timing ({n} samples) : decide {p50_d:g}/{p95_d:g}/{p99_d:g}ms "
             f"(P50/P95/P99)  submit {p50_s:g}/{p95_s:g}/{p99_s:g}ms  "
             f"total {p50_t:g}/{p95_t:g}/{p99_t:g}ms"
+        )
+    if kpi.astar_calls_list:
+        n_path = len(kpi.astar_calls_list)
+        p50_calls = _percentile(kpi.astar_calls_list, 50)
+        p95_calls = _percentile(kpi.astar_calls_list, 95)
+        p50_expansions = _percentile(kpi.astar_expansions_list, 50)
+        p95_expansions = _percentile(kpi.astar_expansions_list, 95)
+        lines.append(
+            f"A* path ({n_path} samples) : calls {kpi.astar_calls}, "
+            f"expansions {kpi.astar_expansions}, budget hits {kpi.astar_budget_hits}, "
+            f"paths {kpi.astar_paths}; per tick calls P50/P95 "
+            f"{p50_calls:g}/{p95_calls:g}, expansions P50/P95 "
+            f"{p50_expansions:g}/{p95_expansions:g}"
         )
     if kpi.failed_total_ms_list:
         lines.append(

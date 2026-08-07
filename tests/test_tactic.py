@@ -4090,6 +4090,42 @@ def test_monitor_parses_timing_field() -> None:
     assert rec["total_ms"] == 92
 
 
+def test_monitor_aggregates_astar_path_telemetry(tmp_path) -> None:
+    from meta import monitor
+
+    lines = [
+        "t100 r50/95 pop19(W16 V2 R1) core@15,234 hp5/sh5/NORMAL "
+        "W[-] O[-] vis0[-] res0[] obs0 beacon0,0 "
+        "eco[a0,av0,ah0,blk0,cool0,unr0,harv0,dep0] "
+        "path[c12,e40267,b10,p2] TM[518,994,1513] ST[ACCEPTED] "
+        "ev[] plan[-]",
+        "t101 r50/95 pop19(W16 V2 R1) core@15,234 hp5/sh5/NORMAL "
+        "W[-] O[-] vis0[-] res0[] obs0 beacon0,0 "
+        "eco[a0,av0,ah0,blk0,cool0,unr0,harv0,dep0] "
+        "path[c1,e176,b0,p1] TM[47,979,1026] ST[ACCEPTED] "
+        "ev[] plan[-]",
+    ]
+    log_path = tmp_path / "game.log"
+    log_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    record = monitor._parse_line(lines[0])
+    assert record is not None
+    assert record["path"] == {"c": 12, "e": 40267, "b": 10, "p": 2}
+
+    kpi = monitor.analyze(log_path)
+    assert kpi.astar_calls == 13
+    assert kpi.astar_expansions == 40443
+    assert kpi.astar_budget_hits == 10
+    assert kpi.astar_paths == 3
+    assert kpi.astar_calls_list == [12, 1]
+    assert kpi.astar_expansions_list == [40267, 176]
+
+    text = monitor.report(kpi, monitor.detect_bottlenecks(kpi))
+    assert "A* path" in text
+    assert "calls 13" in text
+    assert "expansions 40443" in text
+
+
 def test_monitor_backward_compat_no_timing() -> None:
     from meta.monitor import _parse_line
 
