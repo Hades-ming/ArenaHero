@@ -20,7 +20,7 @@ from __future__ import annotations
 import json
 import re
 import sys
-from collections import Counter
+from collections import Counter, deque
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 
@@ -166,6 +166,12 @@ class KPI:
     overflow_loss: int = 0
     net_resources: int = 0
     ticks_with_raid_budget: int = 0
+    # Worker 级资源兑现链路：只保留汇总值，不把事件 ID 长期留在 KPI 中。
+    harvest_deposit_chains: int = 0
+    unmatched_harvests: int = 0
+    unmatched_deposits: int = 0
+    harvest_deposit_p50: float = 0.0
+    harvest_deposit_p95: float = 0.0
 
 
 _ERROR_CODE_ALIASES = {
@@ -295,6 +301,8 @@ def analyze(path: str | Path) -> KPI:
     prev_res = None
     last_success_tick: int | None = None
     last_observed_tick: int | None = None
+    pending_harvests: dict[str, deque[int]] = {}
+    harvest_deposit_latencies: list[int] = []
     with p.open("r", encoding="utf-8", errors="replace") as fh:
         for raw in fh:
             rec = _parse_line(raw)
@@ -472,11 +480,38 @@ def analyze(path: str | Path) -> KPI:
                     kpi.overflow_loss += _event_amount(ev)
             for detail in rec.get("event_details", []):
                 detail_tick = detail.get("tick", tick)
-                if excluded_from_agent or (
+                detail_is_manual = (
                     type(detail_tick) is int and detail_tick in manual_ticks
-                ):
+                )
+                detail_is_unclassified = (
+                    receipt_tracking
+                    and type(detail_tick) is int
+                    and detail_tick not in manual_ticks
+                    and detail_tick not in agent_ticks
+                )
+                if excluded_from_agent or detail_is_manual or detail_is_unclassified:
                     continue
                 event_type = detail.get("event_type")
+                actor = detail.get("actor")
+                if event_type == "HARVEST_SUCCEEDED":
+                    if isinstance(actor, str) and type(detail_tick) is int:
+                        pending_harvests.setdefault(actor, deque()).append(detail_tick)
+                elif event_type == "DEPOSIT_SUCCEEDED":
+                    if (
+                        isinstance(actor, str)
+                        and actor in pending_harvests
+                        and pending_harvests[actor]
+                        and type(detail_tick) is int
+                    ):
+                        harvest_tick = pending_harvests[actor].popleft()
+                        harvest_deposit_latencies.append(
+                            max(0, detail_tick - harvest_tick)
+                        )
+                        kpi.harvest_deposit_chains += 1
+                        if not pending_harvests[actor]:
+                            del pending_harvests[actor]
+                    else:
+                        kpi.unmatched_deposits += 1
                 cost = detail.get("cost")
                 if type(cost) is not int:
                     continue
@@ -497,6 +532,9 @@ def analyze(path: str | Path) -> KPI:
                 - kpi.core_heal_cost
                 - kpi.overflow_loss
             )
+    kpi.unmatched_harvests = sum(len(queue) for queue in pending_harvests.values())
+    kpi.harvest_deposit_p50 = _percentile(harvest_deposit_latencies, 50)
+    kpi.harvest_deposit_p95 = _percentile(harvest_deposit_latencies, 95)
     return kpi
 
 
@@ -691,6 +729,11 @@ def report(kpi: KPI, alerts: list[str]) -> str:
         f"({kpi.net_resources / kpi.comparable_ticks:.3f}/comparable tick)"
         if kpi.comparable_ticks
         else "Resource flow  : no comparable ticks"
+    )
+    lines.append(
+        f"Worker chain   : {kpi.harvest_deposit_chains} harvest->deposit chains, "
+        f"latency P50/P95 {kpi.harvest_deposit_p50:g}/{kpi.harvest_deposit_p95:g} ticks, "
+        f"unmatched harvest/deposit {kpi.unmatched_harvests}/{kpi.unmatched_deposits}"
     )
     lines.append(
         f"Combat         : {kpi.unit_died} unit deaths, "

@@ -451,11 +451,12 @@
 
 - **实现**：`play.py` 使用 SDK `events()` 记录 canonical `AGENT/MANUAL` receipt；每个 Tick
   记录受限事件详情（生产、修盾、Unit/Core HEAL、捕获、溢出成本），不写入密钥或服务端错误正文。
-  `meta/monitor.py` 预扫描 receipt，把 Manual Tick 从 Agent 主 KPI 排除并保留 Manual 事件直方图。
-- **静态验收**：兼容旧 `turns()` 假客户端；监控仍支持旧日志字段；全量 pytest、compileall、
+  `meta/monitor.py` 预扫描 receipt，把 Manual Tick 从 Agent 主 KPI 排除并保留 Manual 事件直方图；
+  同时按事件自身 `tick` 和 Worker `actor` 计算 `HARVEST_SUCCEEDED -> DEPOSIT_SUCCEEDED` 链路。
+- **静态验收**：兼容旧 `turns()` 假客户端；监控仍支持旧日志字段；全量 pytest `161 passed`、compileall、
   `uv pip check`、`git diff --check` 和敏感信息扫描通过后才允许提交。
-- **剩余限制**：日志只有事件级成本，尚未有 Worker 级“首次分配 -> 采集 -> 入核”关联；因此
-  `Manual` 归因已可用，但资源发现/兑现瓶颈仍需 50 条完整链路样本后再调整 Worker 数量。
+- **剩余限制**：Worker 级链路现已可观测，但当前仅有 `7` 条完整链路；窗口边界仍有 `1` 个未匹配
+  入核事件，必须累计至少 `50` 条并复核未匹配原因后，才能调整 Worker 数量或回程策略。
 
 ## 2026-08-07 `RULE-002` live canary 快照（继续观察）
 
@@ -474,3 +475,12 @@
 - **下一门槛**：继续累计至 `200` 个唯一 Tick 和至少 `50` 条
   `HARVEST_SUCCEEDED -> DEPOSIT_SUCCEEDED` 链路，再按 Agent-only 净资源/Tick、捕获抵扣军备成本、
   入核 P50/P95 和性能护栏决定是否调整 Worker 数量或路径算法。
+
+## 2026-08-07 Worker 链路遥测 checkpoint（继续观察）
+
+- **窗口**：`t65805..t65907` 共 `103` 个唯一 Agent Tick，Manual `0`，失败 Tick、Tick 缺口、窗口、
+  提交、协议和认证错误均为 `0`；Core `hp5/sh5`，单位无死亡。
+- **资源链路**：`HARVEST=7`、`DEPOSIT amount=8`、敌核捕获 `5`，Agent-only 净资源 `+13`；按
+  Worker `actor` 匹配得到 `7` 条完整采集到入核链路，延迟 P50/P95 为 `16/39.7` Tick，未匹配入核 `1`。
+- **性能**：规划耗时 P50/P95/P99 为 `318/1515.1/2388.5ms`，总耗时仍远低于 15 秒命令窗口；暂不
+  修改 A* 或突袭逻辑，继续收集同一版本样本。

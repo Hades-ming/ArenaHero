@@ -166,7 +166,8 @@ DISCOVERED -> PROPOSED -> APPROVED -> IN_PROGRESS -> STATIC_VERIFIED
 - **资源完整性**：`WORKER_CARGO_DROPPED` 即使发生在视野外也写入持久资源提示，随后以
   authoritative state 确认或清除；不伪造货堆数量。
 - **人工归因**：`play.py` 记录 canonical `AGENT/MANUAL` receipt 和 v0.14 事件成本详情；
-  `meta/monitor.py` 预扫描 Manual Tick，从 Agent 主 KPI 排除，同时保留 Manual 事件直方图。
+  `meta/monitor.py` 预扫描 Manual Tick，从 Agent 主 KPI 排除，同时保留 Manual 事件直方图；按
+  `actor` 关联采集到入核事件并输出链路 P50/P95 与未匹配计数。
 - **验收门槛**：离线 `pytest`、`compileall`、依赖检查和敏感信息扫描通过；重启后先观察至少
   20 个唯一 Tick，再累计 200 个唯一 Tick与 50 条完整 `HARVEST_SUCCEEDED -> DEPOSIT_SUCCEEDED`
   链路。达到门槛前只能报告“运行稳定/假设待验证”，不能宣称资源收益已优化。

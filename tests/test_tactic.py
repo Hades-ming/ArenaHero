@@ -4291,6 +4291,83 @@ def test_monitor_excludes_manual_ticks_and_accounts_v014_costs(tmp_path) -> None
     assert kpi.net_resources == 5
 
 
+def test_monitor_correlates_agent_harvest_to_deposit_latency(tmp_path) -> None:
+    from meta import monitor
+
+    def state_line(tick: int, resources: int, events: str, details: str) -> str:
+        return (
+            f"t{tick} r{resources}/10 pop2(W2 V0 R0) core@0,0 hp5/sh5/NORMAL "
+            "W[-] O[-] vis0[-] res0[] obs0 beacon0,0 "
+            "eco[a0,av0,ah0,blk0,cool0,unr0,harv0,dep0] "
+            "TM[1,2,3] ST[ACCEPTED] "
+            f"ev[{events}] dt[{details}] plan[-]\n"
+        )
+
+    log_path = tmp_path / "game.log"
+    log_path.write_text(
+        state_line(
+            10,
+            5,
+            "HARVEST_SUCCEEDED[1]",
+            "HARVEST_SUCCEEDED|tick=10|event=h|actor=worker-1|pos=1,1|amount=1|source=RESOURCE_NODE",
+        )
+        + "t10 rcv[AGENT] actions[1] plan[Uworker-1:harvest]\n"
+        + state_line(
+            13,
+            6,
+            "DEPOSIT_SUCCEEDED[1]",
+            "DEPOSIT_SUCCEEDED|tick=13|event=d|actor=worker-1|target=core-1|pos=0,0|amount=1|capacity=10",
+        )
+        + "t13 rcv[AGENT] actions[1] plan[Uworker-1:deposit]\n",
+        encoding="utf-8",
+    )
+
+    kpi = monitor.analyze(log_path)
+
+    assert kpi.harvest_deposit_chains == 1
+    assert kpi.unmatched_harvests == 0
+    assert kpi.unmatched_deposits == 0
+    assert kpi.harvest_deposit_p50 == 3
+    assert kpi.harvest_deposit_p95 == 3
+
+
+def test_monitor_excludes_manual_harvest_deposit_chain(tmp_path) -> None:
+    from meta import monitor
+
+    def state_line(tick: int, events: str, details: str) -> str:
+        return (
+            f"t{tick} r5/10 pop2(W2 V0 R0) core@0,0 hp5/sh5/NORMAL "
+            "W[-] O[-] vis0[-] res0[] obs0 beacon0,0 "
+            "eco[a0,av0,ah0,blk0,cool0,unr0,harv0,dep0] "
+            "TM[1,2,3] ST[ACCEPTED] "
+            f"ev[{events}] dt[{details}] plan[-]\n"
+        )
+
+    log_path = tmp_path / "game.log"
+    log_path.write_text(
+        state_line(
+            20,
+            "HARVEST_SUCCEEDED[1]",
+            "HARVEST_SUCCEEDED|tick=20|event=h|actor=worker-1|pos=1,1|amount=1|source=RESOURCE_NODE",
+        )
+        + "t20 rcv[MANUAL] actions[1] plan[Uworker-1:harvest]\n"
+        + state_line(
+            22,
+            "DEPOSIT_SUCCEEDED[1]",
+            "DEPOSIT_SUCCEEDED|tick=22|event=d|actor=worker-1|target=core-1|pos=0,0|amount=1|capacity=10",
+        )
+        + "t22 rcv[MANUAL] actions[1] plan[Uworker-1:deposit]\n",
+        encoding="utf-8",
+    )
+
+    kpi = monitor.analyze(log_path)
+
+    assert kpi.manual_ticks == 2
+    assert kpi.harvest_deposit_chains == 0
+    assert kpi.unmatched_harvests == 0
+    assert kpi.unmatched_deposits == 0
+
+
 @pytest.mark.parametrize(
     ("limit", "label"),
     [(250, "P50"), (1000, "P95"), (2000, "P99")],
