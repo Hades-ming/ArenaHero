@@ -460,8 +460,9 @@
 ## 2026-08-07 `RULE-002` live canary 快照（继续观察）
 
 - **运行窗口**：LaunchAgent `io.arenahero.tactic` 仍为唯一 PID `35285`；新代码窗口
-  `t65805..t65843` 共 `39` 个连续唯一 Tick，重复、失败、窗口、提交、协议和认证错误均为 `0`，
-  `Core hp5/sh5` 全程存活。
+  `t65805..t65843` 共 `39` 个连续唯一 Tick，重复 Tick、失败 Tick、窗口、提交、协议和认证错误均为
+  `0`，`Core hp5/sh5` 全程存活。事件层另有 `1` 次 `UNIT_MOVE_FAILED.CELL_UNIT_LIMIT`，未形成
+  失败 Tick、资源损失或伤亡。
 - **突袭兑现**：敌 Core 可见 `9` Tick、达到可执行突袭预算 `9` Tick；发生 `12` 次合法
   `SHOT_HIT`，并在 `t65832` 完成 `DESTRUCTION_PARTICIPATION.CORE` 与
   `CORE_RESOURCES_CAPTURED amount=5`。这证明动态门槛和 ETA 追击已经在 live 形成有效攻击链。
