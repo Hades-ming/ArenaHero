@@ -2611,7 +2611,10 @@ def _control_vanguards(
                 avoid=_avoid_set(str(vanguard.id)),
             )
             if step is not None:
-                _queue_combat_move(vanguard, step, reserved_destinations)
+                if _queue_combat_move(vanguard, step, reserved_destinations):
+                    # 巡逻 MOVE 已经是本单位本 Tick 的完整计划；不能再让
+                    # 后面的护核回退覆盖它。
+                    continue
             # 已经到站时等待到下一阶段，不要又被旧的 Core guard 目标拉回
             # 近核，造成巡逻队在同一侧往返。若目标因障碍不可达，则继续
             # 走护核目标，不能让失效巡逻意图让 Vanguard 长期失守。
@@ -3094,7 +3097,10 @@ def _control_rangers(
             )
             if step is not None:
                 _record_pos(rid, pos)
-                _queue_combat_move(ranger, step, reserved_destinations)
+                if _queue_combat_move(ranger, step, reserved_destinations):
+                    # 巡逻 MOVE 已成功预约；旧的 boxed/explore 回退只能在
+                    # 预约失败时运行，否则会为同一 Ranger 再排第二个动作。
+                    continue
             # 目标站点已到达时等待下一个阶段，保持近/远巡逻层级。若目标
             # 因障碍不可达，则继续执行后面的旧巡查/护核回退，不能让失效
             # 巡逻意图把 Ranger 锁死。

@@ -746,7 +746,7 @@
      回退到护核逻辑，不让错误站点锁死战斗单位。
   3. 战斗单位和 Worker 共用当前 Tick MOVE 目的地预约，避免同一目的格被排成第三个实体；巡逻单位
      的视野仍通过既有 `_observe_resources()` 写入 `known_resources/resource_hints/explored_cells`。
-- **静态验收**：全量 `pytest` `182 passed`；`compileall`、`uv pip check`、`git diff --check` 通过。
+- **静态验收**：全量 `pytest` `183 passed`；`compileall`、`uv pip check`、`git diff --check` 通过。
   在加载真实持久地图规模（6485 explored cells、1054 obstacles）的本地假状态上，100 次 `decide`
   的 P50/P95/最大耗时约 `13.8/177/281ms`，A* 预算耗尽为 `0`。
 - **上线边界**：当前 PID `50163` 仍运行旧内存策略，尚未加载本轮修改；不得把其资源或移动结果归因

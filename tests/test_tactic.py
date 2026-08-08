@@ -3576,6 +3576,34 @@ def test_decide_moves_patrol_pairs_when_no_enemy_is_visible() -> None:
         assert action.type == "MOVE"
 
 
+def test_successful_patrol_move_is_not_overwritten_by_fallback(monkeypatch) -> None:
+    state = _state_with_workers(
+        n_workers=4,
+        resources=0,
+        n_vanguards=2,
+        n_rangers=3,
+    )
+    turn = _turn(state, tick=48)
+    calls: dict[str, int] = {}
+    original_queue = tactic._queue_combat_move
+
+    def spy_queue(unit, step, reserved_destinations):
+        unit_id = str(unit.id)
+        calls[unit_id] = calls.get(unit_id, 0) + 1
+        return original_queue(unit, step, reserved_destinations)
+
+    monkeypatch.setattr(tactic, "_queue_combat_move", spy_queue)
+    decide(turn)
+
+    patrol_ids = {
+        str(UUID(int=0x3000)),
+        str(UUID(int=0x3001)),
+        str(UUID(int=0x4001)),
+        str(UUID(int=0x4002)),
+    }
+    assert all(calls.get(unit_id) == 1 for unit_id in patrol_ids)
+
+
 def test_vanguard_keeps_guard_route_when_enemy_is_visible(monkeypatch) -> None:
     state = _state_with_workers(
         n_workers=4,
