@@ -153,9 +153,9 @@ PATROL_ASTAR_MAX_EXPANSIONS = 1200
 # Worker 的分散巡查站点。所有点距 Core 的曼哈顿距离为 32，四个象限各有
 # 六个站点，覆盖当前 Worker 人口上限而不复用同一个远端目标；当持久地图
 # 已把常规前沿全部照亮时，空载 Worker 按稳定 UUID 顺序分配这些站点，避免
-# 回退到单一 chunk 扫列后重新挤在同一侧。站点保持 64 Tick，给从 Core
+# 回退到单一 chunk 扫列后重新挤在同一侧。站点保持 128 Tick，给从 Core
 # 出发的 Worker 至少 32 Tick 到站，并留出一段稳定视野窗口。
-_WORKER_SECTOR_PHASE_TICKS = 64
+_WORKER_SECTOR_PHASE_TICKS = 128
 _WORKER_SECTOR_OFFSETS = (
     (-28, -4),
     (-24, -8),
@@ -1859,7 +1859,7 @@ def _worker_sector_patrol_target(
 ) -> tuple[int, int] | None:
     """为前沿不足时的空载 Worker 选择四向分散巡查站点。
 
-    这是一个坐标意图，不是资源事实。站点每 64 Tick 顺时针轮换一次，
+    这是一个坐标意图，不是资源事实。站点每 128 Tick 顺时针轮换一次，
     站点本身若落在已知障碍、敌方或 Core 上则按固定顺序尝试相邻扇区。
     这样持久地图已基本照亮时，Worker 仍会主动覆盖南/西侧，而不会把
     ``_explore_step`` 的 chunk 扫列误当成全局分散策略。
@@ -1867,7 +1867,7 @@ def _worker_sector_patrol_target(
     global _worker_sector_patrol_start_tick
     if _worker_sector_patrol_start_tick is None:
         # 用本进程第一次看到的 authoritative Tick 对齐周期，避免重启恰逢
-        # 全局 64-Tick 边界时，Worker 刚出发就被换到下一站。
+        # 全局 128-Tick 边界时，Worker 刚出发就被换到下一站。
         _worker_sector_patrol_start_tick = tick
     phase = (
         (tick - _worker_sector_patrol_start_tick) // _WORKER_SECTOR_PHASE_TICKS

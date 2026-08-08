@@ -1250,10 +1250,11 @@ def test_worker_sector_patrol_covers_four_quadrants_when_frontier_is_exhausted()
 
 
 def test_worker_sector_patrol_has_unique_targets_and_a_stable_dwell_window() -> None:
-    """当前人口上限内不复用远端目标，且到站前不会被 64 Tick 追逐改派。"""
+    """当前人口上限内不复用远端目标，且到站前不会被 128 Tick 追逐改派。"""
+    tactic._worker_sector_patrol_start_tick = 0
     targets = [
         tactic._worker_sector_patrol_target(
-            index, (0, 0), tick=63, blocked=frozenset()
+            index, (0, 0), tick=0, blocked=frozenset()
         )
         for index in range(20)
     ]
@@ -1269,6 +1270,10 @@ def test_worker_sector_patrol_has_unique_targets_and_a_stable_dwell_window() -> 
     ] == targets
     assert (
         tactic._worker_sector_patrol_target(0, (0, 0), tick=127, blocked=frozenset())
+        == targets[0]
+    )
+    assert (
+        tactic._worker_sector_patrol_target(0, (0, 0), tick=128, blocked=frozenset())
         != targets[0]
     )
 
