@@ -1289,6 +1289,27 @@ def test_worker_sector_patrol_skips_known_obstacle() -> None:
     assert target not in blocked
 
 
+def test_worker_sector_patrol_skips_target_reserved_by_another_worker() -> None:
+    """障碍绕行后也不能让同一 Tick 的两个 Worker 复用站点。"""
+    blocked = frozenset({(8, -24)})
+    first = tactic._worker_sector_patrol_target(
+        1, (0, 0), tick=0, blocked=blocked
+    )
+    assert first == (12, -20)
+
+    second = tactic._worker_sector_patrol_target(
+        5,
+        (0, 0),
+        tick=0,
+        blocked=blocked,
+        reserved=frozenset({first}),
+    )
+
+    assert second is not None
+    assert second != first
+    assert second not in blocked
+
+
 def test_frontier_assignment_prefers_reachable_target_over_high_gain(
     monkeypatch,
 ) -> None:

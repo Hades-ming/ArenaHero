@@ -1856,11 +1856,13 @@ def _worker_sector_patrol_target(
     core_pos: tuple[int, int],
     tick: int,
     blocked: frozenset[tuple[int, int]],
+    reserved: frozenset[tuple[int, int]] = frozenset(),
 ) -> tuple[int, int] | None:
     """为前沿不足时的空载 Worker 选择四向分散巡查站点。
 
     这是一个坐标意图，不是资源事实。站点每 128 Tick 顺时针轮换一次，
-    站点本身若落在已知障碍、敌方或 Core 上则按固定顺序尝试相邻扇区。
+    站点本身若落在已知障碍、敌方、Core 或本 Tick 已被其他 Worker 预约的
+    格子上则按固定顺序尝试相邻扇区。
     这样持久地图已基本照亮时，Worker 仍会主动覆盖南/西侧，而不会把
     ``_explore_step`` 的 chunk 扫列误当成全局分散策略。
     """
@@ -1881,7 +1883,7 @@ def _worker_sector_patrol_target(
     for offset in range(len(_WORKER_SECTOR_OFFSETS)):
         dx, dy = _WORKER_SECTOR_OFFSETS[(start + offset) % len(_WORKER_SECTOR_OFFSETS)]
         candidate = (cx + dx, cy + dy)
-        if candidate == core_pos or candidate in blocked:
+        if candidate == core_pos or candidate in blocked or candidate in reserved:
             continue
         return candidate
     return None
@@ -2045,6 +2047,9 @@ def _control_workers(turn: "Turn", core_pos: tuple[int, int]) -> None:
     explore_targets = _assign_explore_targets(
         frontier_workers, core_pos, dynamically_blocked, tick=turn.tick
     )
+    # 同一 Tick 内，障碍绕行可能让不同象限的候选站点向同一可达格回退。
+    # 先占住已有前沿目标，再逐个登记新选中的巡查站点，避免重复派遣。
+    sector_patrol_reserved = set(explore_targets.values())
     # 持久地图已经照亮大部分常规半径时，前沿目标数量会骤减；这正是
     # live 日志里 13/16 个 Worker 长期落在同一象限的触发条件。只在这种
     # “前沿不足”状态启用四向站点，保留真实未知前沿的优先级，不让本轮
@@ -2404,9 +2409,14 @@ def _control_workers(turn: "Turn", core_pos: tuple[int, int]) -> None:
             and wid not in resource_assignments
         ):
             sector_target = _worker_sector_patrol_target(
-                orig_index, core_pos, turn.tick, blocked_empty
+                orig_index,
+                core_pos,
+                turn.tick,
+                blocked_empty,
+                reserved=frozenset(sector_patrol_reserved),
             )
             if sector_target is not None:
+                sector_patrol_reserved.add(sector_target)
                 step = _patrol_step(
                     pos,
                     sector_target,
