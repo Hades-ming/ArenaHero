@@ -1075,38 +1075,52 @@ def _worker_resource_assignments(
             uncertain_target = visible_targets & uncertain_visible
             if uncertain_target:
                 explorer_candidates = []
-            elif retained_worker_ids:
+            else:
                 # A retained history claim has already passed the hysteresis
-                # check above.  Prefer a non-retained Worker for exploration;
-                # this preserves the existing claim semantics while still
-                # keeping retained Workers out of the new visible-resource
-                # matcher.
-                non_retained_candidates = [
+                # check above.  Never release it merely to create an explorer;
+                # only non-retained Workers may be reserved here.  The final
+                # matcher below still sees retained claims as fixed work.
+                explorer_candidates = [
                     candidate
                     for candidate in explorer_candidates
                     if str(candidate.id) not in retained_worker_ids
                 ]
-                if non_retained_candidates:
-                    explorer_candidates = non_retained_candidates
-            else:
-                viable_workers = list(workers)
+                viable_workers = list(dispatch_workers)
 
                 def can_reach_visible(
                     worker: "Worker", target: tuple[int, int]
                 ) -> bool:
                     return (str(worker.id), target) not in unreachable_visible
 
+                def visible_matching_exists(
+                    candidates: list["Worker"],
+                ) -> bool:
+                    """Check full visible-resource coverage after reserving one Worker."""
+                    matched: dict[str, tuple[int, int]] = {}
+
+                    def augment(
+                        target: tuple[int, int], seen: set[str]
+                    ) -> bool:
+                        for worker in candidates:
+                            worker_id = str(worker.id)
+                            if worker_id in seen or not can_reach_visible(worker, target):
+                                continue
+                            seen.add(worker_id)
+                            previous = matched.get(worker_id)
+                            if previous is None or augment(previous, seen):
+                                matched[worker_id] = target
+                                return True
+                        return False
+
+                    return all(
+                        augment(target, set()) for target in sorted(visible_targets)
+                    )
+
                 explorer_candidates = [
                     candidate
                     for candidate in explorer_candidates
-                    if all(
-                        any(
-                            other is not candidate
-                            and str(other.id) not in retained_worker_ids
-                            and can_reach_visible(other, target)
-                            for other in viable_workers
-                        )
-                        for target in visible_targets
+                    if visible_matching_exists(
+                        [other for other in viable_workers if other is not candidate]
                     )
                 ]
         if explorer_candidates:
@@ -1189,6 +1203,13 @@ def _worker_resource_assignments(
             return distance
         return distance + history_penalty + _resource_age(resource, turn.tick) * _HISTORY_RESOURCE_AGE_WEIGHT
 
+    def proven_unreachable(worker: "Worker", resource: tuple[int, int]) -> bool:
+        return (
+            resource in visible_resources
+            and resource not in uncertain_visible
+            and (str(worker.id), resource) in unreachable_visible
+        )
+
     if len(dispatch_workers) <= len(resources):
         costs = [
             [
@@ -1201,6 +1222,7 @@ def _worker_resource_assignments(
         assignments = assignments | {
             str(worker.id): resources[column]
             for worker, column in zip(dispatch_workers, columns, strict=True)
+            if not proven_unreachable(worker, resources[column])
         }
     else:
         # Worker 多于资源时，每个资源都能分配；可见资源已全部覆盖，
@@ -1216,6 +1238,7 @@ def _worker_resource_assignments(
         assignments = assignments | {
             str(dispatch_workers[column].id): resource
             for resource, column in zip(resources, columns, strict=True)
+            if not proven_unreachable(dispatch_workers[column], resource)
         }
     _resource_claims.clear()
     _resource_claims.update(assignments)

@@ -386,6 +386,63 @@ def test_control_workers_sends_reachable_worker_to_visible_resource() -> None:
     assert _action(turn.plan, UUID(int=0x6001)).direction == Direction.UP
 
 
+def test_visible_matching_drops_unreachable_edge_instead_of_filling_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """可达边不足时，不应为凑满资源数把节点分给不可达 Worker。"""
+    resources = [(5, 0), (5, 1), (5, 2)]
+    history = (100, 0)
+    tactic._known_resources.add(history)
+    tactic._resource_hints[history] = tactic.ResourceHint(19, "history")
+    turn = _turn(
+        _workers_state(
+            [(0, 0), (0, 1), (10, 10), (0, 2)],
+            resources=resources,
+        ),
+        tick=20,
+    )
+    reachable = {
+        ((0, 0), (5, 0)),
+        ((0, 0), (5, 1)),
+        ((0, 1), (5, 2)),
+    }
+
+    def fake_astar(
+        start: tuple[int, int],
+        goal: tuple[int, int],
+        *_args: Any,
+        **_kwargs: Any,
+    ) -> tuple[Direction | None, bool]:
+        return (Direction.RIGHT, False) if (start, goal) in reachable else (None, False)
+
+    monkeypatch.setattr(tactic, "_astar_step_result", fake_astar)
+    assignments = tactic._worker_resource_assignments(turn)
+
+    assert set(assignments.values()) == {(5, 0), (5, 2)}
+    assert str(UUID(int=0x6002)) not in assignments
+    assert str(UUID(int=0x6003)) not in assignments
+
+
+def test_retained_history_claim_does_not_consume_visible_resource_worker() -> None:
+    """已有历史认领时，剩余空载 Worker 必须保留给可见资源。"""
+    history = (1, 0)
+    visible = (5, 0)
+    first_id = str(UUID(int=0x6000))
+    second_id = str(UUID(int=0x6001))
+    tactic._known_resources.add(history)
+    tactic._resource_hints[history] = tactic.ResourceHint(19, "history")
+    tactic._resource_claims[first_id] = history
+    turn = _turn(
+        _workers_state([(0, 0), (0, 5)], resources=[visible]),
+        tick=20,
+    )
+
+    assignments = tactic._worker_resource_assignments(turn)
+
+    assert assignments == {first_id: history, second_id: visible}
+    assert tactic._resource_telemetry["explore_reserved"] == 0
+
+
 def test_worker_on_visible_distant_resource_harvests_immediately() -> None:
     distant = (50, 0)
     turn = _turn(_workers_state([distant], resources=[distant]), tick=20)
