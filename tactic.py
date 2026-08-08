@@ -142,6 +142,47 @@ DEFENSE_RANGERS = 2
 # 1, 2, or 3 on a shared cardinal line with no obstacle between.
 RANGER_MAX_RANGE = 3
 
+# 近/远两层战斗巡逻的节拍。每个阶段沿 Core 周边环形站点走一段时间，
+# 让 Vanguard 与 Ranger 的视野稳定覆盖不同半径，而不是每 Tick 在目标点
+# 之间来回改派。两层都先处理合法攻击，只有没有敌情时才执行巡逻移动。
+PATROL_PHASE_TICKS = 24
+PATROL_CLOSE_RADIUS = 7
+PATROL_FAR_RADIUS = 15
+PATROL_ASTAR_MAX_EXPANSIONS = 1200
+
+# Worker 的分散巡查站点。所有点距 Core 的曼哈顿距离为 32，四个象限各有
+# 六个站点，覆盖当前 Worker 人口上限而不复用同一个远端目标；当持久地图
+# 已把常规前沿全部照亮时，空载 Worker 按稳定 UUID 顺序分配这些站点，避免
+# 回退到单一 chunk 扫列后重新挤在同一侧。站点保持 64 Tick，给从 Core
+# 出发的 Worker 至少 32 Tick 到站，并留出一段稳定视野窗口。
+_WORKER_SECTOR_PHASE_TICKS = 64
+_WORKER_SECTOR_OFFSETS = (
+    (-28, -4),
+    (-24, -8),
+    (-20, -12),
+    (-16, -16),
+    (-12, -20),
+    (-8, -24),
+    (8, -24),
+    (12, -20),
+    (16, -16),
+    (20, -12),
+    (24, -8),
+    (28, -4),
+    (28, 4),
+    (24, 8),
+    (20, 12),
+    (16, 16),
+    (12, 20),
+    (8, 24),
+    (-8, 24),
+    (-12, 20),
+    (-16, 16),
+    (-20, 12),
+    (-24, 8),
+    (-28, 4),
+)
+
 DIRECTIONS = (Direction.UP, Direction.DOWN, Direction.LEFT, Direction.RIGHT)
 # Clockwise turn order (kept for Vanguard/Ranger fallback movement).
 _TURN_ORDER = {
@@ -1809,6 +1850,35 @@ def _begin_outbound(worker_id: str, worker_index: int, pos: tuple[int, int], cor
     _explore_state[worker_id] = [col_off, south, None, None]
 
 
+def _worker_sector_patrol_target(
+    worker_index: int,
+    core_pos: tuple[int, int],
+    tick: int,
+    blocked: frozenset[tuple[int, int]],
+) -> tuple[int, int] | None:
+    """为前沿不足时的空载 Worker 选择四向分散巡查站点。
+
+    这是一个坐标意图，不是资源事实。站点每 64 Tick 顺时针轮换一次，
+    站点本身若落在已知障碍、敌方或 Core 上则按固定顺序尝试相邻扇区。
+    这样持久地图已基本照亮时，Worker 仍会主动覆盖南/西侧，而不会把
+    ``_explore_step`` 的 chunk 扫列误当成全局分散策略。
+    """
+    phase = (tick // _WORKER_SECTOR_PHASE_TICKS) % 6
+    # 站点按 NW/NE/SE/SW 四组各六个排列。用 Worker 序号的模 4 先锁定
+    # 象限，再在该象限内轮换站点，保证当前人口上限内的 Worker 不复用目标。
+    quadrant = worker_index % 4
+    within_quadrant = (worker_index // 4 + phase) % 6
+    start = quadrant * 6 + within_quadrant
+    cx, cy = core_pos
+    for offset in range(len(_WORKER_SECTOR_OFFSETS)):
+        dx, dy = _WORKER_SECTOR_OFFSETS[(start + offset) % len(_WORKER_SECTOR_OFFSETS)]
+        candidate = (cx + dx, cy + dy)
+        if candidate == core_pos or candidate in blocked:
+            continue
+        return candidate
+    return None
+
+
 def _select_ranger_target(
     ranger_pos: tuple[int, int],
     enemies: tuple[UnitView | CoreView, ...],
@@ -1966,6 +2036,13 @@ def _control_workers(turn: "Turn", core_pos: tuple[int, int]) -> None:
         _resource_telemetry["refresh_reservations"] = refresh_count
     explore_targets = _assign_explore_targets(
         frontier_workers, core_pos, dynamically_blocked, tick=turn.tick
+    )
+    # 持久地图已经照亮大部分常规半径时，前沿目标数量会骤减；这正是
+    # live 日志里 13/16 个 Worker 长期落在同一象限的触发条件。只在这种
+    # “前沿不足”状态启用四向站点，保留真实未知前沿的优先级，不让本轮
+    # 分散逻辑抢走仍可立即兑现的前沿目标。
+    sector_patrol_mode = bool(_explored_cells) and len(explore_targets) < max(
+        1, len(frontier_workers) // 2
     )
     # 回扫 Worker 已从 frontier_workers 中排除；后续资源/前沿重派也必须
     # 复用同一队列，否则一次停滞重算会把回扫名额重新派去远端前沿。
@@ -2312,6 +2389,23 @@ def _control_workers(turn: "Turn", core_pos: tuple[int, int]) -> None:
                     step = _step_toward(
                         pos, target, blocked_empty, avoid=_avoid_set(wid)
                     )
+        if (
+            step is None
+            and target is None
+            and sector_patrol_mode
+            and wid not in resource_assignments
+        ):
+            sector_target = _worker_sector_patrol_target(
+                orig_index, core_pos, turn.tick, blocked_empty
+            )
+            if sector_target is not None:
+                step = _patrol_step(
+                    pos,
+                    sector_target,
+                    base_blocked,
+                    blocked_empty,
+                    avoid=_avoid_set(wid),
+                )
         if step is None:
             step = _explore_step(
                 orig_index, wid, pos, core_pos, blocked_empty,
@@ -2468,6 +2562,7 @@ def _control_vanguards(
     turn: "Turn",
     core_pos: tuple[int, int],
     heal_ids: frozenset[str] | None = None,
+    patrol_goals: dict[str, tuple[int, int]] | None = None,
 ) -> None:
     enemies = turn.visible_enemies
     obstacles = frozenset(turn.obstacle_cells) | _known_obstacles
@@ -2479,6 +2574,7 @@ def _control_vanguards(
     targets = _vanguard_guard_targets(turn, core_pos)
     resources = turn.resources
     core_normal = turn.core is not None and turn.core.view.state == "NORMAL"
+    reserved_destinations = _planned_move_destinations(turn)
     for vanguard in sorted(turn.vanguards, key=lambda unit: str(unit.id)):
         # Resolve a legal combat action before considering recovery.  HEAL is
         # valuable, but giving up a guaranteed hit lets the enemy live for an
@@ -2503,11 +2599,28 @@ def _control_vanguards(
         if should_heal:
             vanguard.heal()
             continue
+        hp = getattr(vanguard, "hp", 4)
+        patrol_target = (patrol_goals or {}).get(str(vanguard.id))
+        if patrol_target is not None and hp > 1 and not enemies:
+            blocked = obstacles | enemy_positions | friendly_full | {core_pos}
+            step = _patrol_step(
+                vanguard.position,
+                patrol_target,
+                obstacles,
+                blocked,
+                avoid=_avoid_set(str(vanguard.id)),
+            )
+            if step is not None:
+                _queue_combat_move(vanguard, step, reserved_destinations)
+            # 已经到站时等待到下一阶段，不要又被旧的 Core guard 目标拉回
+            # 近核，造成巡逻队在同一侧往返。若目标因障碍不可达，则继续
+            # 走护核目标，不能让失效巡逻意图让 Vanguard 长期失守。
+            if vanguard.position == patrol_target:
+                continue
         target = targets.get(str(vanguard.id))
         # A Vanguard at full HP (4) can absorb one more hit before dying; a 1-HP
         # Vanguard is dead after one more sweep. Regroup toward the Core when
         # critically damaged so a raider cannot one-shot our body-block.
-        hp = getattr(vanguard, "hp", 4)
         if hp <= 1 and target is None:
             step = _step_toward(
                 vanguard.position, core_pos,
@@ -2515,7 +2628,7 @@ def _control_vanguards(
                 avoid=None,
             )
             if step is not None:
-                vanguard.move(step)
+                _queue_combat_move(vanguard, step, reserved_destinations)
             continue
         if target is None or target == vanguard.position:
             continue
@@ -2526,7 +2639,7 @@ def _control_vanguards(
         if step is None:
             step = _step_toward(vanguard.position, target, blocked)
         if step is not None:
-            vanguard.move(step)
+            _queue_combat_move(vanguard, step, reserved_destinations)
 
 
 def _ring_patrol_step(
@@ -2566,6 +2679,148 @@ def _ring_patrol_step(
                 best_keep = change
                 best = d
     return best
+
+
+_PATROL_ANCHOR_OFFSETS = ((0, -1), (1, 0), (0, 1), (-1, 0))
+_PATROL_TANGENT_OFFSETS = ((1, 0), (0, 1), (-1, 0), (0, -1))
+_PATROL_NEIGHBOR_OFFSETS = (
+    (0, 0),
+    (1, 0),
+    (-1, 0),
+    (0, 1),
+    (0, -1),
+    (1, 1),
+    (1, -1),
+    (-1, 1),
+    (-1, -1),
+)
+
+
+def _patrol_goal_cell(
+    desired: tuple[int, int],
+    core_pos: tuple[int, int],
+    radius: int,
+    blocked: frozenset[tuple[int, int]],
+    used: set[tuple[int, int]],
+) -> tuple[int, int] | None:
+    """在目标环附近选择一个可用、且两队不重叠的巡逻站点。"""
+    dx0, dy0 = desired
+    candidates: list[tuple[int, int, int, int]] = []
+    for offset, (dx, dy) in enumerate(_PATROL_NEIGHBOR_OFFSETS):
+        cell = (dx0 + dx, dy0 + dy)
+        distance = _manhattan(cell, core_pos)
+        if (
+            cell == core_pos
+            or cell in blocked
+            or cell in used
+            or abs(distance - radius) > 2
+        ):
+            continue
+        candidates.append((_manhattan(cell, desired), offset, cell[0], cell[1]))
+    if not candidates:
+        return None
+    _, _, x, y = min(candidates)
+    return (x, y)
+
+
+def _patrol_goals(
+    turn: "Turn", core_pos: tuple[int, int]
+) -> dict[str, tuple[int, int]]:
+    """为最多两组 Vanguard+Ranger 生成近/远环形巡逻目标。
+
+    第一名 Ranger 保留 Core 守卫职责；其后的 Ranger 与按 UUID 排序的
+    Vanguard 配对。每组每 24 Tick 换到下一个象限，Vanguard 与 Ranger
+    占用相邻但不同的站点，既共享视野又避免人为制造同格拥挤。
+    """
+    vanguards = sorted(turn.vanguards, key=lambda unit: str(unit.id))
+    rangers = sorted(turn.rangers, key=lambda unit: str(unit.id))
+    pair_count = min(2, len(vanguards), max(0, len(rangers) - 1))
+    if pair_count <= 0:
+        return {}
+
+    obstacles = frozenset(turn.obstacle_cells) | _known_obstacles
+    enemy_cells = frozenset(enemy.position for enemy in turn.visible_enemies)
+    friendly_counts = Counter(tuple(unit.position) for unit in turn.units)
+    blocked = obstacles | enemy_cells | frozenset(
+        cell for cell, count in friendly_counts.items() if count >= 2
+    )
+    phase = (turn.tick // PATROL_PHASE_TICKS) % len(_PATROL_ANCHOR_OFFSETS)
+    used: set[tuple[int, int]] = set()
+    goals: dict[str, tuple[int, int]] = {}
+    for squad_index in range(pair_count):
+        radius = (
+            PATROL_CLOSE_RADIUS if squad_index == 0 else PATROL_FAR_RADIUS
+        )
+        anchor_index = (phase + squad_index) % len(_PATROL_ANCHOR_OFFSETS)
+        ax, ay = _PATROL_ANCHOR_OFFSETS[anchor_index]
+        desired_vanguard = (core_pos[0] + ax * radius, core_pos[1] + ay * radius)
+        tx, ty = _PATROL_TANGENT_OFFSETS[anchor_index]
+        desired_ranger = (desired_vanguard[0] + tx, desired_vanguard[1] + ty)
+
+        vanguard_cell = _patrol_goal_cell(
+            desired_vanguard, core_pos, radius, blocked, used
+        )
+        if vanguard_cell is not None:
+            goals[str(vanguards[squad_index].id)] = vanguard_cell
+            used.add(vanguard_cell)
+        ranger_cell = _patrol_goal_cell(
+            desired_ranger, core_pos, radius, blocked, used
+        )
+        if ranger_cell is not None:
+            goals[str(rangers[squad_index + 1].id)] = ranger_cell
+            used.add(ranger_cell)
+    return goals
+
+
+def _planned_move_destinations(turn: "Turn") -> set[tuple[int, int]]:
+    """读取本 Tick 已排队的 MOVE 目的格，供战斗单位互相避让。"""
+    destinations: set[tuple[int, int]] = set()
+    for unit in turn.units:
+        action = turn.plan.unit_actions.get(unit.id)
+        if action is None or getattr(action, "type", None) != "MOVE":
+            continue
+        dx, dy = action.direction.delta
+        destinations.add((unit.position[0] + dx, unit.position[1] + dy))
+    return destinations
+
+
+def _queue_combat_move(
+    unit: "Unit", step: Direction, reserved_destinations: set[tuple[int, int]]
+) -> bool:
+    """以一目的格一预约的保守规则排队战斗单位移动。"""
+    dx, dy = step.delta
+    destination = (unit.position[0] + dx, unit.position[1] + dy)
+    if destination in reserved_destinations:
+        return False
+    unit.move(step)
+    reserved_destinations.add(destination)
+    return True
+
+
+def _patrol_step(
+    pos: tuple[int, int],
+    goal: tuple[int, int],
+    obstacles: frozenset[tuple[int, int]],
+    blocked: frozenset[tuple[int, int]],
+    avoid: frozenset[tuple[int, int]] | None = None,
+) -> Direction | None:
+    """沿已知地图向巡逻站点走一步，失败时退回确定性的贪心步。"""
+    if pos == goal:
+        return None
+    step = _astar_step(
+        pos,
+        goal,
+        obstacles,
+        blocked,
+        max_expansions=PATROL_ASTAR_MAX_EXPANSIONS,
+    )
+    if step is None:
+        step = _step_toward(pos, goal, blocked, avoid=avoid)
+    if step is not None and avoid is not None:
+        dx, dy = step.delta
+        if (pos[0] + dx, pos[1] + dy) in avoid:
+            step = _step_toward(pos, goal, blocked, avoid=avoid)
+    return step
 
 
 def _can_shoot(
@@ -2718,6 +2973,7 @@ def _control_rangers(
     turn: "Turn",
     core_pos: tuple[int, int],
     heal_ids: frozenset[str] | None = None,
+    patrol_goals: dict[str, tuple[int, int]] | None = None,
 ) -> None:
     obstacles = frozenset(turn.obstacle_cells) | _known_obstacles
     enemies = turn.visible_enemies
@@ -2726,6 +2982,7 @@ def _control_rangers(
     rangers = sorted(turn.rangers, key=lambda unit: str(unit.id))
     guard_id = str(rangers[0].id) if rangers else None
     patrol_id = str(rangers[1].id) if len(rangers) > 1 else None
+    reserved_destinations = _planned_move_destinations(turn)
     friendly_full = frozenset(
         cell for cell, count in Counter(tuple(u.position) for u in turn.units).items()
         if count >= 2
@@ -2777,7 +3034,7 @@ def _control_rangers(
                 avoid=_avoid_set(str(ranger.id)),
             )
             if step is not None:
-                ranger.move(step)
+                _queue_combat_move(ranger, step, reserved_destinations)
             continue
         # Otherwise explore like a Worker (a Ranger's vision radius of 5 is the
         # best scout): use the deterministic scan-row sweep so it covers ground
@@ -2823,8 +3080,26 @@ def _control_rangers(
                 step = _step_toward(pos, chase, blocked, avoid=_avoid_set(rid))
             if step is not None:
                 _record_pos(rid, pos)
-                ranger.move(step)
+                _queue_combat_move(ranger, step, reserved_destinations)
             continue
+        patrol_target = (patrol_goals or {}).get(rid)
+        if patrol_target is not None:
+            blocked = obstacles | frozenset(e.position for e in enemies) | friendly_full | {core_pos}
+            step = _patrol_step(
+                pos,
+                patrol_target,
+                obstacles,
+                blocked,
+                avoid=_avoid_set(rid),
+            )
+            if step is not None:
+                _record_pos(rid, pos)
+                _queue_combat_move(ranger, step, reserved_destinations)
+            # 目标站点已到达时等待下一个阶段，保持近/远巡逻层级。若目标
+            # 因障碍不可达，则继续执行后面的旧巡查/护核回退，不能让失效
+            # 巡逻意图把 Ranger 锁死。
+            if pos == patrol_target:
+                continue
         # Boxed-in escape (same pocket-cycle trap as workers): if the Ranger's
         # recent positions fit a tiny box, it is spinning in an obstacle pocket
         # — break out by stepping away from the Core.
@@ -2834,12 +3109,12 @@ def _control_rangers(
             step = _step_away_from(pos, core_pos, obstacles, avoid=None)
             if step is not None:
                 _record_pos(rid, pos)
-                ranger.move(step)
+                _queue_combat_move(ranger, step, reserved_destinations)
             continue
         step = _explore_step(index + 10, rid, pos, core_pos, obstacles)
         if step is not None:
             _record_pos(rid, pos)
-            ranger.move(step)
+            _queue_combat_move(ranger, step, reserved_destinations)
         elif rid == patrol_id:
             # The 2nd non-guard Ranger holds a home-band patrol ring so a raid
             # always has a close-in interceptor; only the OTHER roaming Ranger
@@ -2847,7 +3122,7 @@ def _control_rangers(
             step = _ring_patrol_step(pos, core_pos, obstacles)
             if step is not None:
                 _record_pos(rid, pos)
-                ranger.move(step)
+                _queue_combat_move(ranger, step, reserved_destinations)
 
 
 def _standing_army_targets(n_workers: int) -> tuple[int, int]:
@@ -3659,8 +3934,11 @@ def decide(turn: "Turn") -> None:
     heal_ids, available_resources = _reserve_unit_heals(
         turn, core_pos, available_resources
     )
-    _control_rangers(turn, core_pos, heal_ids=heal_ids)
-    _control_vanguards(turn, core_pos, heal_ids=heal_ids)
+    # 先生成同一份近/远巡逻编组，再交给两类控制器，保证 Vanguard 与
+    # Ranger 追踪的是同一阶段、同一环带，而不是各自独立漂移。
+    patrol_goals = _patrol_goals(turn, core_pos)
+    _control_rangers(turn, core_pos, heal_ids=heal_ids, patrol_goals=patrol_goals)
+    _control_vanguards(turn, core_pos, heal_ids=heal_ids, patrol_goals=patrol_goals)
     # Queue Worker movement/deposits first so the capacity-elevator guard can
     # inspect the actual same-Tick exit plan and avoid CELL_UNIT_LIMIT.
     _control_workers(turn, core_pos)

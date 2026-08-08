@@ -1229,6 +1229,59 @@ def test_dispersed_exploration_targets_cover_multiple_directions() -> None:
     ) >= 6
 
 
+def test_worker_sector_patrol_covers_four_quadrants_when_frontier_is_exhausted() -> None:
+    """前沿耗尽时，空载 Worker 站点仍应覆盖四向而非单一象限。"""
+    targets = [
+        tactic._worker_sector_patrol_target(
+            index, (0, 0), tick=240, blocked=frozenset()
+        )
+        for index in range(8)
+    ]
+
+    assert all(target is not None for target in targets)
+    quadrants = {
+        (1 if target[0] > 0 else -1, 1 if target[1] > 0 else -1)
+        for target in targets
+    }
+    assert len(quadrants) == 4
+    assert len(set(targets)) == len(targets)
+
+
+def test_worker_sector_patrol_has_unique_targets_and_a_stable_dwell_window() -> None:
+    """当前人口上限内不复用远端目标，且到站前不会被 24 Tick 追逐改派。"""
+    targets = [
+        tactic._worker_sector_patrol_target(
+            index, (0, 0), tick=0, blocked=frozenset()
+        )
+        for index in range(20)
+    ]
+
+    assert all(target is not None for target in targets)
+    assert len(set(targets)) == len(targets)
+    assert all(tactic._manhattan(target, (0, 0)) == 32 for target in targets)
+    assert [
+        tactic._worker_sector_patrol_target(
+            index, (0, 0), tick=24, blocked=frozenset()
+        )
+        for index in range(20)
+    ] == targets
+    assert (
+        tactic._worker_sector_patrol_target(0, (0, 0), tick=64, blocked=frozenset())
+        != targets[0]
+    )
+
+
+def test_worker_sector_patrol_skips_known_obstacle() -> None:
+    blocked = frozenset({(0, -24), (1, -24), (-1, -24)})
+
+    target = tactic._worker_sector_patrol_target(
+        0, (0, 0), tick=0, blocked=blocked
+    )
+
+    assert target is not None
+    assert target not in blocked
+
+
 def test_frontier_assignment_prefers_reachable_target_over_high_gain(
     monkeypatch,
 ) -> None:
@@ -3473,6 +3526,133 @@ def _state_with_workers(
         population=n_workers + n_vanguards + n_rangers,
         objects=objects,
     )
+
+
+def test_patrol_goals_form_close_and_far_vanguard_ranger_pairs() -> None:
+    state = _state_with_workers(
+        n_workers=4,
+        resources=10,
+        n_vanguards=2,
+        n_rangers=3,
+    )
+    turn = _turn(state, tick=48)
+
+    goals = tactic._patrol_goals(turn, (0, 0))
+
+    close_vanguard = str(UUID(int=0x3000))
+    close_ranger = str(UUID(int=0x4001))
+    far_vanguard = str(UUID(int=0x3001))
+    far_ranger = str(UUID(int=0x4002))
+    guard_ranger = str(UUID(int=0x4000))
+    assert {close_vanguard, close_ranger, far_vanguard, far_ranger} <= set(goals)
+    assert guard_ranger not in goals
+    assert tactic._manhattan(goals[close_vanguard], (0, 0)) in {7, 8}
+    assert tactic._manhattan(goals[close_ranger], (0, 0)) in {7, 8}
+    assert tactic._manhattan(goals[far_vanguard], (0, 0)) in {15, 16}
+    assert tactic._manhattan(goals[far_ranger], (0, 0)) in {15, 16}
+    assert goals[close_vanguard] != goals[close_ranger]
+    assert goals[far_vanguard] != goals[far_ranger]
+
+
+def test_decide_moves_patrol_pairs_when_no_enemy_is_visible() -> None:
+    state = _state_with_workers(
+        n_workers=4,
+        resources=0,
+        n_vanguards=2,
+        n_rangers=3,
+    )
+    turn = _turn(state, tick=48)
+
+    decide(turn)
+
+    for unit_id in (
+        UUID(int=0x3000),
+        UUID(int=0x3001),
+        UUID(int=0x4001),
+        UUID(int=0x4002),
+    ):
+        action = _action(turn.plan, unit_id)
+        assert action is not None
+        assert action.type == "MOVE"
+
+
+def test_vanguard_keeps_guard_route_when_enemy_is_visible(monkeypatch) -> None:
+    state = _state_with_workers(
+        n_workers=4,
+        resources=0,
+        n_vanguards=1,
+        n_rangers=2,
+        threat=True,
+    )
+    turn = _turn(state, tick=48)
+    vanguard_id = UUID(int=0x3000)
+    calls: list[tuple[int, int]] = []
+    original_patrol_step = tactic._patrol_step
+
+    def spy_patrol_step(*args, **kwargs):
+        calls.append(args[0])
+        return original_patrol_step(*args, **kwargs)
+
+    monkeypatch.setattr(tactic, "_patrol_step", spy_patrol_step)
+
+    decide(turn)
+
+    action = _action(turn.plan, vanguard_id)
+    assert action is not None
+    assert action.type == "MOVE"
+    assert (3, 0) not in calls
+
+
+def test_patrol_unit_vision_updates_persistent_resource_map() -> None:
+    state = _state(
+        core_pos=(0, 0),
+        resources=0,
+        population=3,
+        objects=[
+            {
+                "kind": "CORE",
+                "id": str(CORE_ID),
+                "controlled": True,
+                "owner_username": "arena_hero",
+                "position": [0, 0],
+                "hp": 5,
+                "shield": 5,
+                "state": "NORMAL",
+            },
+            {
+                "kind": "UNIT",
+                "id": str(WORKER_ID),
+                "controlled": True,
+                "position": [20, 20],
+                "hp": 2,
+                "unit_type": "WORKER",
+                "cargo": 0,
+            },
+            {
+                "kind": "UNIT",
+                "id": str(VANGUARD_ID),
+                "controlled": True,
+                "position": [0, 5],
+                "hp": 4,
+                "unit_type": "VANGUARD",
+            },
+            {
+                "kind": "UNIT",
+                "id": str(RANGER_ID),
+                "controlled": True,
+                "position": [0, 6],
+                "hp": 2,
+                "unit_type": "RANGER",
+            },
+            {"kind": "RESOURCE", "positions": [[0, 10]]},
+        ],
+    )
+    turn = _turn(state, tick=20)
+
+    tactic._observe_resources(turn)
+
+    assert (0, 10) in tactic._known_resources
+    assert tactic._resource_hints[(0, 10)].source == "visible"
 
 
 def test_standing_army_spawns_vanguard_above_economy_floor() -> None:
