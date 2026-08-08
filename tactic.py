@@ -182,6 +182,7 @@ _WORKER_SECTOR_OFFSETS = (
     (-24, 8),
     (-28, 4),
 )
+_worker_sector_patrol_start_tick: int | None = None
 
 DIRECTIONS = (Direction.UP, Direction.DOWN, Direction.LEFT, Direction.RIGHT)
 # Clockwise turn order (kept for Vanguard/Ranger fallback movement).
@@ -1863,7 +1864,14 @@ def _worker_sector_patrol_target(
     这样持久地图已基本照亮时，Worker 仍会主动覆盖南/西侧，而不会把
     ``_explore_step`` 的 chunk 扫列误当成全局分散策略。
     """
-    phase = (tick // _WORKER_SECTOR_PHASE_TICKS) % 6
+    global _worker_sector_patrol_start_tick
+    if _worker_sector_patrol_start_tick is None:
+        # 用本进程第一次看到的 authoritative Tick 对齐周期，避免重启恰逢
+        # 全局 64-Tick 边界时，Worker 刚出发就被换到下一站。
+        _worker_sector_patrol_start_tick = tick
+    phase = (
+        (tick - _worker_sector_patrol_start_tick) // _WORKER_SECTOR_PHASE_TICKS
+    ) % 6
     # 站点按 NW/NE/SE/SW 四组各六个排列。用 Worker 序号的模 4 先锁定
     # 象限，再在该象限内轮换站点，保证当前人口上限内的 Worker 不复用目标。
     quadrant = worker_index % 4
@@ -3864,7 +3872,7 @@ def _clear_exploration_state() -> None:
     the old neighborhood, but persistent resource and map facts remain valid
     until a fresh Turn explicitly disproves them.
     """
-    global _last_harvest_tick
+    global _last_harvest_tick, _worker_sector_patrol_start_tick
     _explore_state.clear()
     _explore_targets.clear()
     _explore_progress.clear()
@@ -3875,6 +3883,7 @@ def _clear_exploration_state() -> None:
     _last_pos.clear()
     _stuck_ticks.clear()
     _last_harvest_tick = None
+    _worker_sector_patrol_start_tick = None
 
 
 def decide(turn: "Turn") -> None:

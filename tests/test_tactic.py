@@ -54,6 +54,7 @@ def _reset_explore_state(tmp_path, monkeypatch) -> None:
     tactic._resource_telemetry.clear()
     tactic._resource_absence_streak = 0
     tactic._last_harvest_tick = None
+    tactic._worker_sector_patrol_start_tick = None
     tactic._persistent_state_dirty = False
     tactic._known_obstacles.clear()
     tactic._known_enemy_cores.clear()
@@ -78,6 +79,7 @@ def _reset_explore_state(tmp_path, monkeypatch) -> None:
     tactic._resource_telemetry.clear()
     tactic._resource_absence_streak = 0
     tactic._last_harvest_tick = None
+    tactic._worker_sector_patrol_start_tick = None
     tactic._persistent_state_dirty = False
     tactic._known_obstacles.clear()
     tactic._known_enemy_cores.clear()
@@ -1248,10 +1250,10 @@ def test_worker_sector_patrol_covers_four_quadrants_when_frontier_is_exhausted()
 
 
 def test_worker_sector_patrol_has_unique_targets_and_a_stable_dwell_window() -> None:
-    """当前人口上限内不复用远端目标，且到站前不会被 24 Tick 追逐改派。"""
+    """当前人口上限内不复用远端目标，且到站前不会被 64 Tick 追逐改派。"""
     targets = [
         tactic._worker_sector_patrol_target(
-            index, (0, 0), tick=0, blocked=frozenset()
+            index, (0, 0), tick=63, blocked=frozenset()
         )
         for index in range(20)
     ]
@@ -1261,12 +1263,12 @@ def test_worker_sector_patrol_has_unique_targets_and_a_stable_dwell_window() -> 
     assert all(tactic._manhattan(target, (0, 0)) == 32 for target in targets)
     assert [
         tactic._worker_sector_patrol_target(
-            index, (0, 0), tick=24, blocked=frozenset()
+            index, (0, 0), tick=64, blocked=frozenset()
         )
         for index in range(20)
     ] == targets
     assert (
-        tactic._worker_sector_patrol_target(0, (0, 0), tick=64, blocked=frozenset())
+        tactic._worker_sector_patrol_target(0, (0, 0), tick=127, blocked=frozenset())
         != targets[0]
     )
 

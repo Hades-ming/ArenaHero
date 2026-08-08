@@ -747,8 +747,9 @@
   3. 战斗单位和 Worker 共用当前 Tick MOVE 目的地预约，避免同一目的格被排成第三个实体；巡逻单位
      的视野仍通过既有 `_observe_resources()` 写入 `known_resources/resource_hints/explored_cells`。
 - **静态验收**：全量 `pytest` `183 passed`；`compileall`、`uv pip check`、`git diff --check` 通过。
-  在加载真实持久地图规模（6485 explored cells、1054 obstacles）的本地假状态上，100 次 `decide`
-  的 P50/P95/最大耗时约 `13.8/177/281ms`，A* 预算耗尽为 `0`。
+  周期锚定进程首次 authoritative Tick，避免重启边界立即换站；在加载真实持久地图规模（6485
+  explored cells、1054 obstacles）的本地假状态上，100 次 `decide` 的 P50/P95/最大耗时约
+  `13.8/177/281ms`，A* 预算耗尽为 `0`。
 - **安全 canary（2026-08-08）**：唯一 PID `80941` 重启后，严格排除重启边界的旧计划结算，
   `t73013..t73032` 共 20 个连续唯一新 Tick；无窗口/协议/提交/决策错误、无 `MOVE_FAILED`、资源
   失败、Core/Unit 死亡或 Core 伤害。库存 `100→104`，11 个 Tick 看到资源格，1 次采集、4 次入核；
