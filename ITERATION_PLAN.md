@@ -708,3 +708,21 @@
   明确移动预约覆盖所有同 Tick 目的地并验证 Core 邻格容量；在修复前不得再次放宽人口或把短窗库存
   变化当作长期资源收益。继续累计稳定版本的 100–200 Tick 与 20 条完整采集→入核链路，并按
   官方规则/SDK 版本复核后再决定下一变量。
+
+## `RULE-006` Worker 读取战斗单位同 Tick 目的地预约（IN_PROGRESS，2026-08-08）
+
+- **问题证据**：`decide()` 先排队 Ranger/Vanguard 的移动，再进入 `_control_workers()`；Worker 原先
+  只维护自己的 `reserved_destinations`。扩容窗口的 Core 邻格 `CELL_UNIT_LIMIT` 表明 Worker 可能
+  把已有战斗单位将要进入的格子再次预约成第三个实体，导致战斗单位移动失败或增加拥塞。
+- **单一修复**：在 `_control_workers()` 初始化预约集合时读取当前 Tick 已排队的非 Worker `MOVE` 目的地，
+  采用现有 Worker 预约相同的保守一格一预约策略；冲突 Worker 留待下一 Tick，不改战斗目标、A*、
+  生产、敌情信号或 Manual 优先级。
+- **离线验收**：新增“Vanguard 进入已有 Ranger 占一席的格子、Worker 同 Tick 试图进入同格”回归，
+  修复前稳定失败，修复后 Worker 不再提交冲突移动；全量测试 `175 passed`，目标测试、
+  `compileall`、`uv pip check` 与 `git diff --check` 需在提交前再次确认。
+- **live canary**：代码提交并推送后重启唯一 `io.arenahero.tactic`；从新计划完成结算后的下一 Tick
+  观察 20 个唯一 Tick，要求无新增 `CELL_UNIT_LIMIT`/`MOVE_CONTESTED`、资源失败、窗口/协议/提交
+  错误、Core/Unit 死亡。随后累计至少 100–200 Tick 与 20 条完整采集→入核链路，比较移动失败率、
+  入核率、净资源/Tick 和决策耗时；不能用短窗库存变化宣称收益。
+- **回滚**：若 Worker 等待导致采集/入核率下降 10% 以上、战斗单位仍频繁失败、或出现 Core/窗口/协议
+  故障，只反向提交本规则修复；保留测试和运行归档，不销毁现有 W16。

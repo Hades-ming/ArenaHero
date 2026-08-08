@@ -629,6 +629,69 @@ def test_worker_destination_is_reserved_within_one_tick(monkeypatch) -> None:
     assert second_action is None
 
 
+def test_worker_respects_preplanned_combat_destination(monkeypatch) -> None:
+    """Worker 不能与已排队的战斗单位争抢同一满容量目的格。"""
+    state = _state(
+        population=3,
+        objects=[
+            {
+                "kind": "CORE",
+                "id": str(CORE_ID),
+                "controlled": True,
+                "owner_username": "arena_hero",
+                "position": [0, 0],
+                "hp": 5,
+                "shield": 5,
+                "state": "NORMAL",
+            },
+            {
+                "kind": "UNIT",
+                "id": str(WORKER_ID),
+                "controlled": True,
+                "position": [1, 1],
+                "hp": 2,
+                "unit_type": "WORKER",
+                "cargo": 0,
+            },
+            {
+                "kind": "UNIT",
+                "id": str(VANGUARD_ID),
+                "controlled": True,
+                "position": [2, 0],
+                "hp": 4,
+                "unit_type": "VANGUARD",
+                "cargo": None,
+            },
+            {
+                "kind": "UNIT",
+                "id": str(RANGER_ID),
+                "controlled": True,
+                "position": [1, 0],
+                "hp": 2,
+                "unit_type": "RANGER",
+                "cargo": None,
+            },
+        ],
+    )
+    turn = _turn(state)
+
+    # Ranger 已经占据 Core 邻格 (1,0) 的一个空位；Worker 同 Tick 进入后会变成三个
+    # 实体并以 CELL_UNIT_LIMIT 失败。Worker 控制器必须看到这个已排队目的地。
+    vanguard = next(unit for unit in turn.vanguards if unit.id == VANGUARD_ID)
+    vanguard.move(Direction.LEFT)
+    monkeypatch.setattr(
+        tactic, "_assign_explore_targets", lambda *args, **kwargs: {}
+    )
+    monkeypatch.setattr(
+        tactic, "_explore_step", lambda *args, **kwargs: Direction.UP
+    )
+
+    tactic._control_workers(turn, turn.core.position)
+
+    assert _action(turn.plan, VANGUARD_ID).direction == Direction.LEFT
+    assert _action(turn.plan, WORKER_ID) is None
+
+
 def test_visible_resource_priority_over_nearer_history_hint() -> None:
     remembered = (1, 0)
     visible = (10, 0)

@@ -1971,9 +1971,20 @@ def _control_workers(turn: "Turn", core_pos: tuple[int, int]) -> None:
     # 复用同一队列，否则一次停滞重算会把回扫名额重新派去远端前沿。
     fallback_workers = list(frontier_workers)
     # 逐 Tick 预约下一格，避免先提交的空载 Worker 抢走带货 Worker 的通道。
-    # 仍按 UUID 给探索列编号，保证输入顺序和历史路线稳定；执行顺序则让
-    # 带货 Worker 先规划回 Core，随后空载 Worker 避开已经预约的目的地。
+    # 战斗控制器在本函数之前运行；它们已经排队的 MOVE 目的地也必须先占位，
+    # 否则 Worker 可能把同一个带一个现有 Unit 的格子预约成第三个实体，
+    # 让 Vanguard/Ranger 在结算时收到 CELL_UNIT_LIMIT。这里采用与 Worker
+    # 之间相同的保守“一个目的格一份预约”策略，宁可让 Worker 等一 Tick，
+    # 也不把战斗单位的移动成功寄托在解析顺序上。
     reserved_destinations: set[tuple[int, int]] = set()
+    for unit in turn.units:
+        if unit.unit_type == "WORKER":
+            continue
+        action = turn.plan.unit_actions.get(unit.id)
+        if action is None or getattr(action, "type", None) != "MOVE":
+            continue
+        dx, dy = action.direction.delta
+        reserved_destinations.add((unit.position[0] + dx, unit.position[1] + dy))
 
     def queue_worker_move(worker: "Unit", step: Direction) -> bool:
         dx, dy = step.delta
