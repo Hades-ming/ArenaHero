@@ -881,3 +881,27 @@
   `full_core_loaded=false`，形成可观测的 `IDLE_GOLD` 等待段；这证明原严格条件会延迟扩容，
   但不是永久卡死。因此本轮不放宽容忍度，先继续验收扩容后的入核链路和资源净流；扩容策略
   仍作为独立变量，不把等待段归因于可达性匹配。
+
+## `RESOURCE-DISPATCH-018` 追击回退不得解封敌方格（SAFE_CANARY_VERIFIED，长窗观察中，2026-08-08）
+
+- **问题证据**：`_control_rangers()` 的 A* 追击路径把敌方格放进 `blocked`，但 A* 失败后的贪心
+  回退使用 `blocked - {chase}`，会在目标正好相邻时提交进入敌方格。该路径与“停在可射击格”的
+  注释相矛盾，离线回归先失败后确认了这个行为。旧 live 的 `t73593` 一次 `MOVE_CONTESTED`
+  实际由 Worker 与同步移动的敌 Worker 产生，不把它错误归因给 Ranger 修复；但它暴露了同类
+  动态碰撞必须单独记录的边界。
+- **单一修复**：只把追击贪心回退恢复为使用完整 `blocked` 集合，并同步修正注释；不改变
+  `_chase_target()` 的目标记忆、动态重建储备、近核守卫、近/远巡逻编组、Worker 调度或人口门槛。
+- **静态验收**：新增“Ranger 在相邻追击目标前不得 MOVE 进入敌格”回归，先在旧实现上复现失败；
+  修复后全量 `pytest` `190 passed`，`compileall`、`uv pip check`、`git diff --check` 通过。提交
+  `4c9f643` 已推送 `origin/main`，SDK `0.2.9` 与规则 `v0.14` 未变。
+- **新版本安全 canary**：停止旧 PID `23156` 后由 LaunchAgent 自动拉起唯一 PID `33191`；严格窗口
+  `t73610..t73629` 共 20 个连续 Tick，全部 `ST[ACCEPTED]`，无窗口/提交/决策错误、`MOVE_FAILED`
+  （含 `MOVE_CONTESTED`/`CELL_UNIT_LIMIT`）、资源失败、死亡或 Core 伤害。库存 `129→130/130`，
+  `DEPOSIT_SUCCEEDED=1`、自然采集 `0`，W18/V4/R4、Core `5/5`；A* budget hits `12`，
+  `decide_ms` P50/P95/最大 `76/203/319ms`，总本地耗时 P50/P95/最大 `1006/1173/1267ms`，
+  均远低于 15 秒命令窗口。资源在第 20 Tick 后重新可见，21-Tick 延伸样本出现 1 次采集，
+  说明安全窗口的低采集量不能单独判定探索失效。
+- **后续门槛**：继续保持唯一实例，累计至少 100–200 个新 Tick 与 20–50 条采集→入核链路；
+  分开比较四象限覆盖、发现→分配、入核资源/Tick、追击 MOVE_CONTESTED 和 A* 长尾。当前只接受
+  安全结论，不放宽容量电梯或继续生产普通 Worker；若连续两个 50-Tick 窗口出现敌格 MOVE、
+  `CELL_UNIT_LIMIT`、Core/窗口/协议故障，再回滚本单变量修复。
