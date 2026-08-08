@@ -3445,8 +3445,10 @@ def _chase_target(
     Priority: (1) a VISIBLE enemy Core within HUNT range (when resources allow
     rebuilding) — destroying it removes the enemy fleet and may capture its
     stockpiled resources (variable loot, not a flat +6); (2) any enemy
-    within CHASE_RADIUS of the Core (drive off inbound raiders); (3) a
-    recently-seen enemy within the radius. Bounded: gives up after a
+    within the immediate defense band of the Core (drive off inbound raiders);
+    (3) an ordinary visible enemy Unit within ``CHASE_RADIUS`` when the Core
+    can rebuild one Ranger plus the small reserve; (4) a recently-seen enemy
+    within the same defense/active bands. Bounded: gives up after a
     target-specific ETA budget capped by CHASE_MAX_TICKS.
     """
     if _chase_cooldown_until.get(rid, 0) > tick:
@@ -3485,18 +3487,30 @@ def _chase_target(
     if core_target is not None:
         _begin_chase(rid, tick, pos, core_target)
         return core_target
-    # Priority 2: drive off any visible enemy within CHASE_RADIUS of the Core.
+    # Priority 2/3: always drive off an enemy in the immediate defense band;
+    # pursue a farther ordinary Unit only when the raid reserve makes the
+    # sortie reversible.  Enemy Cores keep their existing near-home behavior;
+    # their long-range hunt is already gated above by the same dynamic reserve.
     candidates = [
         e for e in enemies
         if _manhattan(core_pos, e.position) < CHASE_RADIUS
+        and (
+            _manhattan(core_pos, e.position) <= 6
+            or e.kind == "CORE"
+            or resources >= raid_threshold
+        )
     ]
     if candidates:
         nearest = min(candidates, key=lambda e: _manhattan(pos, e.position))
         _begin_chase(rid, tick, pos, tuple(nearest.position))
         return tuple(nearest.position)
-    # Priority 3: re-acquire a recently-seen enemy within the radius + slack.
+    # Priority 4: re-acquire a recently-seen enemy within the defense radius
+    # plus slack, or the active radius when the rebuild reserve is available.
     for epos, seen in _last_enemy_pos.values():
-        if _manhattan(core_pos, epos) < CHASE_RADIUS + 6:
+        if _manhattan(core_pos, epos) <= 6 or (
+            resources >= raid_threshold
+            and _manhattan(core_pos, epos) < CHASE_RADIUS + 6
+        ):
             _begin_chase(rid, tick, pos, epos)
             return epos
     return None

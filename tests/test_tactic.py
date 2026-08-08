@@ -65,6 +65,7 @@ def _reset_explore_state(tmp_path, monkeypatch) -> None:
     tactic._chase_start.clear()
     tactic._chase_budget.clear()
     tactic._chase_cooldown_until.clear()
+    tactic._last_enemy_pos.clear()
     yield
     tactic._explore_state.clear()
     tactic._explore_targets.clear()
@@ -88,6 +89,7 @@ def _reset_explore_state(tmp_path, monkeypatch) -> None:
     tactic._chase_start.clear()
     tactic._chase_budget.clear()
     tactic._chase_cooldown_until.clear()
+    tactic._last_enemy_pos.clear()
 
 
 def _state(
@@ -1987,6 +1989,138 @@ def test_distant_enemy_core_raid_uses_dynamic_reserve_and_eta_budget() -> None:
     action = _action(turn.plan, second_ranger_id)
     assert action.type == "MOVE"
     assert tactic._chase_budget[str(second_ranger_id)] >= 31
+
+
+def test_midrange_enemy_unit_chase_requires_rebuild_reserve() -> None:
+    # A visible ordinary Unit 10 cells from our Core is outside the immediate
+    # defense band but still inside the bounded active-attack radius.  Chasing
+    # it is reversible only when the Core can rebuild one Ranger and retain a
+    # small bank; low inventory must keep the Ranger on defense/patrol.
+    ranger2_id = UUID("00000000-0000-4000-8000-000000000006")
+    state = _state(
+        resources=0,
+        population=2,
+        objects=[
+            {
+                "kind": "CORE",
+                "id": str(CORE_ID),
+                "controlled": True,
+                "owner_username": "arena_hero",
+                "position": [0, 0],
+                "hp": 5,
+                "shield": 5,
+                "state": "NORMAL",
+            },
+            {
+                "kind": "UNIT",
+                "id": str(RANGER_ID),
+                "controlled": True,
+                "position": [0, 0],
+                "hp": 2,
+                "unit_type": "RANGER",
+                "cargo": None,
+            },
+            {
+                "kind": "UNIT",
+                "id": str(ranger2_id),
+                "controlled": True,
+                "position": [0, 5],
+                "hp": 2,
+                "unit_type": "RANGER",
+                "cargo": None,
+            },
+            {
+                "kind": "UNIT",
+                "id": str(ENEMY_UNIT_ID),
+                "controlled": False,
+                "position": [0, 10],
+                "hp": 2,
+                "unit_type": "VANGUARD",
+                "cargo": None,
+            },
+        ],
+    )
+    turn = _turn(state)
+
+    # The current tactic incorrectly chases this midrange Unit with zero
+    # resources; this assertion is the RED test for the new resource gate.
+    assert (
+        tactic._chase_target(
+            (0, 5),
+            (0, 0),
+            turn.visible_enemies,
+            str(ranger2_id),
+            tick=turn.tick,
+            resources=turn.resources,
+            population=turn.state.population,
+        )
+        is None
+    )
+
+    # At population 2 the Ranger price is 12, so 15 resources meet the
+    # dynamic rebuild-plus-bank threshold and enable the active chase.
+    tactic._chase_start.clear()
+    tactic._chase_budget.clear()
+    target = tactic._chase_target(
+        (0, 5),
+        (0, 0),
+        turn.visible_enemies,
+        str(ranger2_id),
+        tick=turn.tick,
+        resources=15,
+        population=turn.state.population,
+    )
+    assert target == (0, 10)
+
+
+def test_near_core_enemy_chase_survives_low_resource_gate() -> None:
+    # The resource gate applies only to proactive midrange pursuit.  A Unit
+    # inside the existing 15-cell defense band must still be intercepted when
+    # the Core is poor.
+    state = _state(
+        resources=0,
+        population=1,
+        objects=[
+            {
+                "kind": "CORE",
+                "id": str(CORE_ID),
+                "controlled": True,
+                "owner_username": "arena_hero",
+                "position": [0, 0],
+                "hp": 5,
+                "shield": 5,
+                "state": "NORMAL",
+            },
+            {
+                "kind": "UNIT",
+                "id": str(RANGER_ID),
+                "controlled": True,
+                "position": [0, 0],
+                "hp": 2,
+                "unit_type": "RANGER",
+                "cargo": None,
+            },
+            {
+                "kind": "UNIT",
+                "id": str(ENEMY_UNIT_ID),
+                "controlled": False,
+                "position": [0, 6],
+                "hp": 2,
+                "unit_type": "VANGUARD",
+                "cargo": None,
+            },
+        ],
+    )
+    turn = _turn(state)
+    assert tactic._chase_target(
+        (0, 0),
+        (0, 0),
+        turn.visible_enemies,
+        str(RANGER_ID),
+        tick=turn.tick,
+        resources=turn.resources,
+        population=turn.state.population,
+    ) == (0, 6)
 
 
 def test_ranger_prioritizes_near_core_raider_over_distant_enemy_core() -> None:
