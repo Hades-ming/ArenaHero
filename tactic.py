@@ -3201,9 +3201,9 @@ def _control_rangers(
             # Chase to a cell that can SHOOT the target, not onto it. Moving
             # onto an enemy cell always fails MOVE_DESTINATION_OCCUPIED; a
             # Vanguard/Ranger reached cell fights (we want distance), a Worker
-            # reached cell is useless (cannot attack). _step_toward supports
-            # `toward_exact`; passing a "blocked" goal makes it step toward it
-            # while treating the exact goal cell as allowed-only-if-reached.
+            # reached cell is useless (cannot attack). Both the A* route and
+            # the greedy fallback keep the enemy cell blocked, so a failed
+            # route can detour or wait but never turns into a collision move.
             # Chase routes must respect the same two-entity cell limit as the
             # guard route.  Without this, a Ranger can repeatedly plan into a
             # full friendly cell and spend every Tick on CELL_UNIT_LIMIT.
@@ -3215,7 +3215,7 @@ def _control_rangers(
                     step = _step_toward(
                         pos,
                         chase,
-                        blocked - {chase},
+                        blocked,
                         avoid=_avoid_set(rid),
                     )
             else:

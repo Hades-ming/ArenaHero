@@ -1711,6 +1711,65 @@ def test_ranger_chase_avoids_full_friendly_cell(monkeypatch) -> None:
     assert action.direction in {Direction.UP, Direction.DOWN}
 
 
+def test_ranger_chase_never_enters_enemy_target_cell(monkeypatch) -> None:
+    """追击记忆目标时，Ranger 应停在可射击格而不是撞进敌方格。"""
+    ranger2_id = UUID("00000000-0000-4000-8000-000000000006")
+    state = _state(
+        resources=15,
+        population=2,
+        objects=[
+            {
+                "kind": "CORE",
+                "id": str(CORE_ID),
+                "controlled": True,
+                "owner_username": "arena_hero",
+                "position": [0, 0],
+                "hp": 5,
+                "shield": 5,
+                "state": "NORMAL",
+            },
+            {
+                "kind": "UNIT",
+                "id": str(RANGER_ID),
+                "controlled": True,
+                "position": [0, 0],
+                "hp": 2,
+                "unit_type": "RANGER",
+                "cargo": None,
+            },
+            {
+                "kind": "UNIT",
+                "id": str(ranger2_id),
+                "controlled": True,
+                "position": [0, 9],
+                "hp": 2,
+                "unit_type": "RANGER",
+                "cargo": None,
+            },
+            {
+                "kind": "UNIT",
+                "id": str(ENEMY_UNIT_ID),
+                "controlled": False,
+                "position": [0, 10],
+                "hp": 2,
+                "unit_type": "WORKER",
+            },
+        ],
+    )
+    # Force the bounded chase branch while suppressing the direct-shot branch;
+    # the old fallback then tries to move from (0,9) into the enemy cell.
+    monkeypatch.setattr(tactic, "_select_ranger_target", lambda *args, **kwargs: None)
+    monkeypatch.setattr(tactic, "_chase_target", lambda *args, **kwargs: (0, 10))
+    turn = _turn(state)
+
+    decide(turn)
+
+    action = _action(turn.plan, ranger2_id)
+    if action is not None and action.type == "MOVE":
+        dx, dy = action.direction.delta
+        assert (0 + dx, 9 + dy) != (0, 10)
+
+
 def test_complete_worker_plan_is_independent_of_object_order() -> None:
     state = _workers_state([(2, 2), (3, 2), (4, 2), (5, 2)])
     first = _turn(state)
