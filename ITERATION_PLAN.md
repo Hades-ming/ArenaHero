@@ -837,7 +837,7 @@
 - **回滚**：若连续两个 50-Tick 窗口入核率下降 10%、可见资源采集 P95 上升 25%、A* 长尾逼近命令
   窗口，或出现 Core/窗口/协议故障，只反向提交本任务改动；保留持久地图、`uv.lock` 和归档状态文件。
 
-## `RESOURCE-DISPATCH-016` 可达资源覆盖必须满足全局匹配（STATIC_VERIFIED，待 canary，2026-08-08）
+## `RESOURCE-DISPATCH-016` 可达资源覆盖必须满足全局匹配（SAFE_CANARY_VERIFIED，长窗观察中，2026-08-08）
 
 - **新增边界证据**：4 个 Worker、3 个可见节点和 1 个历史提示的夹具中，A 只能到达两个节点，B
   只能到达第三个节点，C/D 均不可达。逐资源检查会误以为最远 C 可以保留探索名额；即使不保留，
@@ -848,12 +848,12 @@
 - **回归覆盖**：新增“可达边共享时不保留探索者、不可达边不为凑数分配”的测试；全量 `pytest`
   `188 passed`，`compileall`、`uv pip check`、`git diff --check` 通过。
 - **canary 边界**：上一提交 `b4bf4b7` 的新进程窗口约 `t73456..t73471` 暂无移动/资源失败，
-  但这只证明上一版本；本 follow-up 提交后必须再次重启唯一进程，从新计划完成结算后的下一 Tick
-  起重新观察 20 个唯一 Tick，再累计 100–200 Tick/至少 20 条完整采集→入核链路。
+  但这只证明上一版本；`20e5edd` 的新版本 20-Tick checkpoint 见 `RESOURCE-DISPATCH-017`
+  小节，仍需累计 100–200 Tick/至少 20 条完整采集→入核链路。
 - **回滚**：若可见资源覆盖下降、`HARVEST_FAILED/RESOURCE_DEPLETED` 增加、A* 长尾逼近命令窗口，
   或出现 Core/窗口/协议故障，只反向提交本 follow-up；保留 `b4bf4b7` 作为可回退版本，不删除地图和归档。
 
-## `RESOURCE-DISPATCH-017` 保留历史认领时不得牺牲最后的可见资源 Worker（STATIC_VERIFIED，待 canary，2026-08-08）
+## `RESOURCE-DISPATCH-017` 保留历史认领时不得牺牲最后的可见资源 Worker（SAFE_CANARY_VERIFIED，长窗观察中，2026-08-08）
 
 - **新增边界证据**：2 个 Worker 中 A 已保留历史认领，B 是唯一空载 Worker；可见资源出现时，旧
   探索分支仍会把 B 预约为 explorer，导致计划只剩 A→历史点、可见资源无人采集。
@@ -863,5 +863,18 @@
 - **回归覆盖与静态结果**：新增 retained 历史认领回归；全量 `pytest` `189 passed`，并通过
   `compileall`、`uv pip check`、`git diff --check`。本项与 `RESOURCE-DISPATCH-016` 同一资源调度
   follow-up，未改变巡逻、战斗、人口或容量电梯门槛。
-- **canary**：必须在本 follow-up 提交并重启唯一进程后重新开始 20 Tick 安全窗口，再累计
-  100–200 Tick/至少 20 条完整采集→入核链路；不得把 `b4bf4b7` 窗口的安全结果归因给本版本。
+- **canary**：`20e5edd` 提交后已重启唯一进程并完成 20 Tick 安全窗口（详见下方 checkpoint）；
+  不得把 `b4bf4b7` 窗口的安全结果归因给本版本，仍需累计 100–200 Tick/至少 20 条完整采集→入核链路。
+
+### `RESOURCE-DISPATCH-017` 新版本安全 checkpoint（2026-08-08）
+
+- 提交 `20e5edd` 后重启唯一 PID `23156`；严格排除重启边界，从 `t73494..t73513` 统计
+  20 个连续唯一 Tick。
+- 20 个 Tick 全部为 `ST[ACCEPTED]`；`TICK_MISMATCH`、窗口/提交错误、`MOVE_FAILED`、
+  `MOVE_CONTESTED`、`CELL_UNIT_LIMIT`、`HARVEST_FAILED/RESOURCE_DEPLETED`、Unit/Core 损失和
+  Core 伤害均为 `0`。A* `budget_hits=6`，未逼近命令窗口。
+- 资源保持 `125/125`，人口保持 `25 (W17/V4/R4)`；自然采集 `2`、入核 `0`。这只能证明
+  可达性匹配修复没有破坏安全性，不能证明长期资源收益提升。
+- 观察到独立的 `IDLE_GOLD` 瓶颈：满核但只有约 `11/17` 个 Worker 带货，
+  `full_core_loaded=false`，容量电梯因此不触发；当前 `worker_target=12`（20 人口预算减去
+  8 个战斗单位）。扩容策略另立单变量实验，不把它归因于本次可达性修复。
