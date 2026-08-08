@@ -2969,8 +2969,8 @@ def test_core_spawns_when_full_and_laden_worker_steps_off() -> None:
 
 def test_full_core_with_all_workers_laden_spawns_capacity_elevator() -> None:
     # Long-live evidence showed W15/V4/R4 with r==capacity and every Worker
-    # carrying cargo.  The ordinary Worker target is already capped at W12,
-    # so only the explicit saturation escape may open one extra capacity slot.
+    # carrying cargo.  The ordinary Worker target reaches W16 under the new
+    # budget, while this branch verifies the explicit saturation escape.
     state = _state_with_workers(
         n_workers=15,
         resources=115,
@@ -2995,9 +2995,11 @@ def test_full_core_with_all_workers_laden_spawns_capacity_elevator() -> None:
 
 
 def test_full_core_without_all_workers_laden_does_not_use_capacity_elevator() -> None:
+    # Use the W16 bridge boundary so an ordinary Worker spawn cannot mask the
+    # saturation-specific decision under the 24-Unit budget.
     state = _state_with_workers(
-        n_workers=15,
-        resources=115,
+        n_workers=16,
+        resources=120,
         n_vanguards=4,
         n_rangers=4,
     )
@@ -3006,7 +3008,7 @@ def test_full_core_without_all_workers_laden_does_not_use_capacity_elevator() ->
         if obj.get("kind") == "UNIT" and obj.get("unit_type") == "WORKER":
             obj["cargo"] = 1
             break
-    state = _state(resources=115, population=23, objects=objects)
+    state = _state(resources=120, population=24, objects=objects)
     turn = _turn(state)
 
     decide(turn)
@@ -3523,12 +3525,12 @@ def test_peacetime_bridge_reaches_third_extra_worker() -> None:
     assert act.unit_type.value == "WORKER"
 
 
-def test_peacetime_bridge_reaches_fifteenth_worker() -> None:
-    # A quiet W14/V2 economy may continue the bounded discovery bridge to W15.
-    # Population remains 17 before the spawn, well below the first dynamic
-    # price tier, while visible enemy signals still take the combat-first path.
+def test_peacetime_bridge_reaches_sixteenth_worker() -> None:
+    # A quiet W15/V2 economy may continue the bounded discovery bridge to W16.
+    # Population remains 17 before the spawn, and visible enemy signals still
+    # take the combat-first path.
     state = _state_with_workers(
-        n_workers=14, resources=8, n_vanguards=2, n_rangers=0
+        n_workers=15, resources=8, n_vanguards=2, n_rangers=0
     )
     turn = _turn(state)
 
@@ -3540,11 +3542,11 @@ def test_peacetime_bridge_reaches_fifteenth_worker() -> None:
     assert act.unit_type.value == "WORKER"
 
 
-def test_peacetime_bridge_stops_after_fifteenth_worker() -> None:
-    # Once W15 is reached, bank for the missing Ranger instead of growing
+def test_peacetime_bridge_stops_after_sixteenth_worker() -> None:
+    # Once W16 is reached, bank for the missing Ranger instead of growing
     # indefinitely; this preserves the bounded bridge and standing army floor.
     state = _state_with_workers(
-        n_workers=15, resources=8, n_vanguards=2, n_rangers=0
+        n_workers=16, resources=8, n_vanguards=2, n_rangers=0
     )
     turn = _turn(state)
 
@@ -3555,9 +3557,104 @@ def test_peacetime_bridge_stops_after_fifteenth_worker() -> None:
 
 def test_full_peacetime_army_does_not_grow_workers_past_bridge_cap() -> None:
     # Combat reserve complete should not reopen the larger population budget:
-    # the discovery bridge remains capped at W15 until a later policy changes it.
+    # the discovery bridge remains capped at W16 until a later policy changes it.
     state = _state_with_workers(
-        n_workers=15, resources=8, n_vanguards=1, n_rangers=1
+        n_workers=16, resources=8, n_vanguards=1, n_rangers=1
+    )
+    turn = _turn(state)
+
+    decide(turn)
+
+    assert _core_action(turn.plan) is None
+
+
+def test_population_budget_allows_worker_growth_into_dynamic_price_tier() -> None:
+    # W15/V4/R4 was the old plateau: the former 20-Unit budget subtracted the
+    # eight combat Units and made the Worker target W12.  The 24-Unit budget
+    # must allow one more Worker, priced at the v0.14 20-24 tier (7 resources).
+    state = _state_with_workers(
+        n_workers=15, resources=10, n_vanguards=4, n_rangers=4
+    )
+    assert state.population == 23
+    turn = _turn(state)
+
+    decide(turn)
+
+    action = _core_action(turn.plan)
+    assert action is not None
+    assert action.type == "SPAWN"
+    assert action.unit_type == UnitType.WORKER
+
+
+def test_population_budget_stops_normal_worker_growth_at_24() -> None:
+    # W16/V4/R4 exactly fills the experiment budget.  Even with enough
+    # resources for another Worker, normal production must stop at 24.
+    state = _state_with_workers(
+        n_workers=16, resources=20, n_vanguards=4, n_rangers=4
+    )
+    assert state.population == tactic.POPULATION_BUDGET
+    turn = _turn(state)
+
+    decide(turn)
+
+    assert _core_action(turn.plan) is None
+
+
+def test_capacity_elevator_respects_total_population_budget() -> None:
+    # The saturation escape must not use the legacy MAX_WORKERS guard to cross
+    # the total budget. At W16/V4/R4 the Core is full and every Worker is laden,
+    # but population 24 must still reject an elevator spawn.
+    state = _state_with_workers(
+        n_workers=16, resources=120, n_vanguards=4, n_rangers=4
+    )
+    objects = [obj.model_dump(mode="json") for obj in state.objects]
+    for obj in objects:
+        if obj.get("kind") == "UNIT" and obj.get("unit_type") == "WORKER":
+            obj["cargo"] = 1
+    state = _state(
+        resources=120,
+        population=tactic.POPULATION_BUDGET,
+        objects=objects,
+    )
+    turn = _turn(state)
+
+    decide(turn)
+
+    assert _core_action(turn.plan) is None
+    assert tactic._resource_telemetry["full_core_loaded"] == 1
+    assert tactic._resource_telemetry["capacity_elevator"] == 0
+
+
+def test_visible_enemy_keeps_attack_spawn_ahead_of_worker_expansion() -> None:
+    # The enlarged Worker budget must not let a visible enemy delay a missing
+    # defensive Unit. This is intentionally near the new W16 bridge boundary.
+    state = _state_with_workers(
+        n_workers=15,
+        resources=13,
+        n_vanguards=1,
+        n_rangers=1,
+        threat=True,
+    )
+    turn = _turn(state)
+
+    decide(turn)
+
+    action = _core_action(turn.plan)
+    assert action is not None
+    assert action.type == "SPAWN"
+    assert action.unit_type == UnitType.VANGUARD
+
+
+def test_visible_enemy_blocks_worker_expansion_even_when_army_is_full() -> None:
+    # Once the standing army is already sufficient, a visible enemy still
+    # closes the enlarged Worker bridge; do not turn a threat Tick into a
+    # Worker investment just because the 24-Unit budget has room.
+    state = _state_with_workers(
+        n_workers=15,
+        resources=20,
+        n_vanguards=4,
+        n_rangers=4,
+        threat=True,
     )
     turn = _turn(state)
 
@@ -3762,6 +3859,28 @@ def test_population_20_uses_first_dynamic_price_for_combat_spawn(
         assert act.unit_type.value == "VANGUARD"
 
 
+def test_population_24_still_allows_needed_dynamic_price_combat_spawn() -> None:
+    # The population budget is a Worker/elevator guard, not a combat hard
+    # stop. At N=24 a visible threat must still be able to buy the 13-resource
+    # Vanguard replacement from the current dynamic price tier.
+    state = _state_with_workers(
+        n_workers=16,
+        n_vanguards=1,
+        n_rangers=7,
+        resources=13,
+        threat=True,
+    )
+    assert state.population == tactic.POPULATION_BUDGET
+    turn = _turn(state)
+
+    decide(turn)
+
+    action = _core_action(turn.plan)
+    assert action is not None
+    assert action.type == "SPAWN"
+    assert action.unit_type == UnitType.VANGUARD
+
+
 def test_cold_start_workers_before_army() -> None:
     # Below the economy floor (2 Workers), plenty of resources, no threat:
     # build the economy first — spawn a Worker, not a combat Unit.
@@ -3777,8 +3896,8 @@ def test_cold_start_workers_before_army() -> None:
 def test_standing_army_scales_with_worker_fleet() -> None:
     # User requirement: the standing army grows with the Worker economy, so a
     # raid meets more return fire the larger the fleet. 8 Workers -> V1 R1;
-    # 16 Workers -> V2 R2 (population 20 is still allowed; the next production
-    # is the first dynamic-price unit).
+    # 16 Workers -> V2 R2; the 24-Unit budget leaves room for the same reserve
+    # while the next price tier does not begin until population 25.
     #
     # 10th review (rank 1): a HARD floor of V>=1,R>=1 prevents the ratchet
     # where a raid that kills combat units never triggers a rebuild because
@@ -3790,13 +3909,14 @@ def test_standing_army_scales_with_worker_fleet() -> None:
     assert tactic._standing_army_targets(8) == (1, 1)
     assert tactic._standing_army_targets(12) == (1, 1)
     assert tactic._standing_army_targets(16) == (2, 2)
-    assert tactic._standing_army_targets(17) == (2, 1)
-    # W=18: hard floor forces (1,1) after fitting the population target.
-    assert tactic._standing_army_targets(18) == (1, 1)
-    # W=19: hard floor keeps V=1,R=1 even though the floor itself makes the
-    # combined count one above the soft target.
-    assert tactic._standing_army_targets(19) == (1, 1)
-    for w in range(4, tactic.FREE_UPKEEP_CAP):
+    assert tactic._standing_army_targets(17) == (2, 2)
+    assert tactic._standing_army_targets(18) == (2, 2)
+    assert tactic._standing_army_targets(19) == (2, 2)
+    assert tactic._standing_army_targets(20) == (2, 2)
+    assert tactic._standing_army_targets(21) == (2, 1)
+    # W=22: the hard floors fit exactly after shrinking the pair reserve.
+    assert tactic._standing_army_targets(22) == (1, 1)
+    for w in range(4, tactic.POPULATION_BUDGET):
         v, r = tactic._standing_army_targets(w)
         # Floor guarantee: no Worker count should ever suggest zero combat
         # units. 10th review overturned the old "W=19 → V=0,R=0" edge case.
@@ -3806,8 +3926,8 @@ def test_standing_army_scales_with_worker_fleet() -> None:
 
 
 def test_pop_over_budget_does_not_destroy_units_or_capacity() -> None:
-    # A manual expansion above the soft target must not destroy units or shrink
-    # capacity merely to avoid a dynamic production price.
+    # A manual expansion above the 24-Unit experiment budget must not destroy
+    # units or shrink capacity merely to avoid a dynamic production price.
     objects = [
         {
             "kind": "CORE",
@@ -3820,7 +3940,7 @@ def test_pop_over_budget_does_not_destroy_units_or_capacity() -> None:
             "state": "NORMAL",
         }
     ]
-    for i in range(19):
+    for i in range(23):
         objects.append(
             {
                 "kind": "UNIT",
@@ -3852,7 +3972,7 @@ def test_pop_over_budget_does_not_destroy_units_or_capacity() -> None:
             "unit_type": "RANGER",
         }
     )
-    state = _state(resources=105, population=21, objects=objects)
+    state = _state(resources=105, population=25, objects=objects)
     turn = _turn(state)
     decide(turn)
     culled = [

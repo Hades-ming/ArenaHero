@@ -54,8 +54,9 @@ The tactic is continuously measured and is not claimed to be globally optimal:
 - Rangers shoot visible legal cardinal or diagonal targets (Core prioritized);
 - Vanguards sweep the adjacent cell with the most enemies, else hold near Core;
 - repair Core shield only when under visible threat;
-- maintain a Worker economy and standing combat reserve while treating population
-  20 as the first dynamic-price boundary;
+- maintain a Worker economy and standing combat reserve; population 20 is only
+  the first dynamic-price boundary, while the current measured budget is 24
+  (the next price tier starts at 25);
 - leave an object on WAIT when no legal useful action is known.
 
 Every numeric rule comes from the bundled Arena Hero v0.14 references; none is
