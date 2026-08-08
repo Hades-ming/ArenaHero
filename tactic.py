@@ -70,15 +70,10 @@ from arena_hero import (
 if TYPE_CHECKING:
     from arena_hero import Core, CoreView, Turn, Unit, UnitView
 
-# v0.14 has no per-Tick upkeep. Population 20 is only the first dynamic-price
-# boundary: the 21st Unit costs more, but populations 20-24 share that same
-# price tier. Keep a separate experimental population budget so the strategy
-# can cross the old 20-Unit plateau without entering the next price tier.
-FIRST_DYNAMIC_PRICE_POPULATION = 20
-POPULATION_BUDGET = 24
-# Compatibility name for older tests/telemetry; it means the price boundary,
-# not a server-enforced population cap.
-FREE_UPKEEP_CAP = FIRST_DYNAMIC_PRICE_POPULATION
+# v0.14 has no per-Tick upkeep. Keep the first dynamic-price boundary as a
+# conservative soft population target: population 20 is allowed, while the
+# next production (at population 20) is the first dynamically priced unit.
+FREE_UPKEEP_CAP = 20
 # Comfortable Worker count the tactic tries to maintain. The fourth review
 # found TARGET_WORKERS=16 was unreachable at the observed harvest rate AND
 # counterproductive: every deposit was immediately spent on a Worker spawn,
@@ -90,11 +85,10 @@ FREE_UPKEEP_CAP = FIRST_DYNAMIC_PRICE_POPULATION
 # throughput, and the first dynamic-price tier starts at production population 20. Raised 8 -> 12, then
 # 12 -> 15 after r hit the pop-14 capacity ceiling (70): more Workers both
 # raise discovery AND raise Core capacity (each Unit +5), letting r bank
-# past 70. The 24-Unit experiment intentionally crosses the first dynamic
-# price tier but stops before the next tier at population 25. The bank reserve
-# and army-short gate still prevent draining deposits to r0.
-TARGET_WORKERS = POPULATION_BUDGET
-MAX_WORKERS = POPULATION_BUDGET + 1
+# past 70. Still below the first price step (pop 17 < 20). The bank reserve +
+# army-short gate still prevent draining deposits to r0.
+TARGET_WORKERS = FREE_UPKEEP_CAP
+MAX_WORKERS = FREE_UPKEEP_CAP + 1
 # Bank reserve: never spend down to zero on a Worker spawn. A spawn must leave
 # the Core with at least this many resources afterward, so the economy keeps a
 # positive balance and the standing-army bank (toward the 10/12 combat Unit)
@@ -118,12 +112,14 @@ PEACETIME_COMBAT_SPAWN_RESERVE = 5
 # larger Worker fleet once the economy can sustain the smallest army.
 MIN_WORKERS_BEFORE_ARMY = 4
 # If a combat Unit already exists, permit a bounded Worker bridge while the
-# Core is not under immediate threat. The prior W15 bridge left the live
-# strategy at W12/V4/R4 (population 20) because the Worker target subtracted
-# the eight combat Units from the old 20-Unit budget. Extend the bridge to W16
-# so a mature W16/V4/R4 fleet can reach the 24-Unit experiment budget; any
-# visible enemy still disables the bridge immediately.
-ECONOMY_BRIDGE_MAX_WORKERS = MIN_WORKERS_BEFORE_ARMY + 12
+# Core is not under immediate threat.  The W8 bridge still left long quiet
+# windows with only one or two resource points found, while the next dynamic
+# price tier is not reached until population 20.  Extend the bounded bridge to
+# W15 so a mature economy can add enough discovery capacity to overlap the
+# long resource return trips observed in the live log without crossing the
+# population-20 dynamic-price boundary. With the standing V1/R1 floor this is
+# population 19; any visible enemy still disables the bridge immediately.
+ECONOMY_BRIDGE_MAX_WORKERS = MIN_WORKERS_BEFORE_ARMY + 11
 # Healthy resource income should favor short round trips. A node farther away
 # remains in the persistent map, but it is only dispatched after a drought
 # makes the wider trip preferable to waiting idle.
@@ -2850,9 +2846,9 @@ def _standing_army_targets(n_workers: int) -> tuple[int, int]:
     with it, so a raid meets more return fire the more valuable the Core is
     (the 2026-08-02 Core loss was a raid against an economy with no army).
     Roughly one combat pair (Vanguard + Ranger) per 8 Workers, a floor of 1,
-    then shrunk to fit the experimental population budget
-    (W + V + R <= POPULATION_BUDGET). The first dynamic-price boundary is
-    still population 20; this experiment deliberately measures the 20-24 tier.
+    then shrunk to fit the conservative population target (W + V + R <= 20,
+    i.e. budget = FREE_UPKEEP_CAP). Population 20 is allowed; only the next
+    production pays the first dynamic-price premium.
 
     Ratchet-proof (10th review, rank 1): a raid that kills a Vanguard/Ranger
     does NOT lower the Worker count, so the old formula returned the same
@@ -2865,7 +2861,7 @@ def _standing_army_targets(n_workers: int) -> tuple[int, int]:
     vanguards = pairs
     rangers = pairs
     floor_v, floor_r = 1, 1  # hard floor — a dead combat Unit must be rebuilt
-    budget = POPULATION_BUDGET
+    budget = FREE_UPKEEP_CAP
     while n_workers + vanguards + rangers > budget:
         if vanguards > max(rangers, floor_v):
             vanguards -= 1
@@ -3001,7 +2997,7 @@ def _control_core(
         return
 
     # Spawn Workers toward the target fleet so the economy grows and explores
-    # faster, keeping the experimental total population budget at 24. Only spawn
+    # faster, keeping the soft population target at 20. Only spawn
     # when the Core cell has room (Core + at most one colocated Unit) so it
     # does not fail with CELL_UNIT_LIMIT.
     #
@@ -3050,7 +3046,7 @@ def _control_core(
         # Peacetime standing reserve scales with the Worker economy (user
         # requirement): a bigger fleet must field a bigger army so a raid
         # meets more return fire the more valuable the Core is. Growth is
-        # capped by the experimental population budget at 24.
+        # capped by the conservative population target at 20.
         target_vanguards, target_rangers = _standing_army_targets(
             len(turn.workers)
         )
@@ -3090,13 +3086,13 @@ def _control_core(
             core.spawn(UnitType.RANGER)
             return
 
-    # Budget-aware Worker target: subtract the standing army from the explicit
-    # total population budget, then apply the bounded discovery bridge cap.
-    # Both guards are intentional: the first prevents total-population drift,
-    # while the second keeps Worker growth measurable as a single variable.
+    # Budget-aware Worker target: subtract the standing army from the soft
+    # population budget, then apply the explicit peaceful discovery bridge cap.
+    # The latter prevents a completed V/R reserve from reopening the old W18
+    # path while the live economy is still being measured.
     combat_count = len(turn.vanguards) + len(turn.rangers)
     worker_target = min(
-        max(0, POPULATION_BUDGET - combat_count),
+        FREE_UPKEEP_CAP - combat_count,
         ECONOMY_BRIDGE_MAX_WORKERS,
     )
     wants_worker = len(turn.workers) < worker_target
@@ -3139,7 +3135,6 @@ def _control_core(
         full_core_loaded
         and not enemy_present
         and not army_short
-        and population < POPULATION_BUDGET
         and len(turn.workers) < MAX_WORKERS
     ):
         worker_price = unit_cost(UnitType.WORKER, population)
@@ -3148,16 +3143,11 @@ def _control_core(
             _resource_telemetry["capacity_elevator"] = 1
             return
 
-    # Bank reserve: only spawn a Worker in a quiet Tick and if the Core keeps at
-    # least WORKER_SPAWN_RESERVE resources afterward. This prevents the economy
-    # from draining to zero and prevents the enlarged bridge from delaying a
-    # response while any enemy is visible.
+    # Bank reserve: only spawn a Worker if the Core keeps at least
+    # WORKER_SPAWN_RESERVE resources afterward, so the economy never drains to
+    # zero and the standing-army bank is not reset each spawn.
     worker_price = unit_cost(UnitType.WORKER, population)
-    if (
-        wants_worker
-        and not enemy_present
-        and effective_resources >= worker_price + WORKER_SPAWN_RESERVE
-    ):
+    if wants_worker and effective_resources >= worker_price + WORKER_SPAWN_RESERVE:
         core.spawn(UnitType.WORKER)
         return
 
