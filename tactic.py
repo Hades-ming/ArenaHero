@@ -2146,9 +2146,21 @@ def _control_workers(turn: "Turn", core_pos: tuple[int, int]) -> None:
                         if friendly_occupancy.get(nxt, 0) < 2:
                             free_adjacent += 1
                     if free_adjacent <= 1:
-                        step = _step_away_from(pos, core_pos, blocked, avoid=_avoid_set(wid))
+                        # This Worker is already the last nearby delivery
+                        # candidate.  The generic fallback in
+                        # ``_step_away_from`` may choose any open cell when no
+                        # cell increases the Core distance; keep the Core
+                        # blocked here so that fallback cannot turn a failed
+                        # retreat into a guaranteed CELL_UNIT_LIMIT move onto
+                        # the occupied Core cell.
+                        core_exit_blocked = blocked | {core_pos}
+                        step = _step_away_from(
+                            pos, core_pos, core_exit_blocked, avoid=_avoid_set(wid)
+                        )
                         if step is None:
-                            step = _step_away_from(pos, core_pos, blocked, avoid=None)
+                            step = _step_away_from(
+                                pos, core_pos, core_exit_blocked, avoid=None
+                            )
                         if step is not None:
                             _prev_pos[wid] = pos
                             _record_pos(wid, pos)

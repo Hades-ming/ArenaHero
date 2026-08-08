@@ -4099,6 +4099,67 @@ def test_laden_worker_backs_off_when_ring_would_wall_in_core() -> None:
         assert tactic._manhattan(nxt, (0, 0)) > 1
 
 
+def test_laden_worker_never_uses_core_as_last_exit_fallback() -> None:
+    # When every non-Core neighbor is already full, the generic
+    # _step_away_from fallback used to pick the only remaining open cell: the
+    # occupied Core.  That command can only fail with CELL_UNIT_LIMIT and
+    # delays the next deposit, so the delivery Worker must wait instead.
+    objects = [
+        {
+            "kind": "CORE",
+            "id": str(CORE_ID),
+            "controlled": True,
+            "owner_username": "arena_hero",
+            "position": [0, 0],
+            "hp": 5,
+            "shield": 5,
+            "state": "NORMAL",
+        },
+        {
+            "kind": "UNIT",
+            "id": str(WORKER_ID),
+            "controlled": True,
+            "position": [1, 0],
+            "hp": 2,
+            "unit_type": "WORKER",
+            "cargo": 1,
+        },
+        {
+            "kind": "UNIT",
+            "id": str(WORKER2_ID),
+            "controlled": True,
+            "position": [0, 0],
+            "hp": 2,
+            "unit_type": "WORKER",
+            "cargo": 1,
+        },
+    ]
+    # Fill the three other Core-adjacent cells and every other neighbor of the
+    # adjacent Worker, leaving the Core as the only open candidate.
+    for index, position in enumerate(
+        [(0, 1), (0, -1), (-1, 0), (2, 0), (1, 1), (1, -1)]
+    ):
+        for slot in range(2):
+            objects.append(
+                {
+                    "kind": "UNIT",
+                    "id": str(UUID(int=0x7000 + index * 2 + slot)),
+                    "controlled": True,
+                    "position": list(position),
+                    "hp": 4,
+                    "unit_type": "VANGUARD",
+                    "cargo": None,
+                }
+            )
+    state = _state(resources=5, population=14, objects=objects)
+    turn = _turn(state)
+
+    decide(turn)
+
+    action = _action(turn.plan, WORKER_ID)
+    assert action is None or action.type != "MOVE"
+
+
 def test_boxed_in_worker_escapes_pocket() -> None:
     # A Worker cycling between a few cells in an obstacle pocket (recent
     # positions all fit a tiny box) never triggers the STUCK check (which keys

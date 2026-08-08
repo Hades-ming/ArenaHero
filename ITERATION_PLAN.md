@@ -644,3 +644,21 @@
 - **回滚**：若 20 Tick 内出现容量电梯连续生产、敌情下漏造攻击单位、`CELL_UNIT_LIMIT`/资源失败、
   命令窗口/协议/提交错误，或两个干净 50-Tick 窗口的入核率较 `RULE-002` 201-Tick 基线下降 10%，
   只反向提交本任务改动；不删除运行归档，不回滚用户的 `uv.lock` 修改。
+
+## `RULE-004` Core 邻格退让不得把 Core 当作兜底目标（STATIC_VERIFIED，待 canary）
+
+- **证据**：专家复核 `t72455..t72531` 共 77 个唯一 Tick，资源仅在 10 个 Tick 可见，
+  可见资源均被分配；未见 `HARVEST_FAILED`、不可达或冷却。窗口内有 1 次普通
+  `UNIT_MOVE_FAILED/CELL_UNIT_LIMIT`：带货 Worker 从 Core 邻格退让时，Core 上另一带货 Worker
+  同 Tick 执行 `DEPOSIT`，移动先于交付，原路径的兜底选择把 Core 作为唯一开放格。
+- **单一修复**：只在“Core 已有 Unit、带货 Worker 位于 Core 邻格、可用相邻出口不超过 1 个”的
+  退让分支中，将 `core_pos` 加入局部 blocked；无合法离核步时等待，不改变满核容量电梯、A*、
+  资源半径或战斗策略。
+- **离线验收**：新增回归覆盖“唯一剩余开放格是 Core”场景；目标测试通过，随后必须执行全量
+  `pytest`、`compileall`、`uv pip check` 和 `git diff --check`。
+- **live canary**：提交并重启唯一 `io.arenahero.tactic` 后，从新计划完成结算的下一 Tick 起先观察
+  20 个连续唯一 Tick；要求无新增 `CELL_UNIT_LIMIT` 交付冲突、资源失败、窗口/协议/提交错误、
+  Core/Unit 死亡。之后继续累计至少 100 Tick/20 条完整采集→入核链路；资源可见率仍作为主瓶颈指标，
+  不把短窗库存变化当作长期收益。
+- **下一变量**：若安全 canary 通过且低资源可见率持续，再单独试验无资源时 Chunk 回扫 Worker
+  从 2 降到 1；不能与本修复同一版本混合，以便比较可见资源率、探索新格数、采集/入核率和净资源/Tick。
