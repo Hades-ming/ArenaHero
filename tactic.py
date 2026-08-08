@@ -995,6 +995,61 @@ def _worker_resource_assignments(
         worker for worker in workers if str(worker.id) not in retained_worker_ids
     ]
     assignments = fixed | retained
+
+    # A visible node is only useful when at least one empty Worker can reach
+    # it.  Manhattan matching alone can pin a node to the nearest Worker even
+    # when that Worker is sealed behind known obstacles, leaving a farther but
+    # reachable Worker idle.  Preflight only the small visible-resource set;
+    # history hints keep the existing bounded A* path in the controller so the
+    # normal Tick budget is not multiplied by the full persisted map.
+    unreachable_visible: set[tuple[str, tuple[int, int]]] = set()
+    uncertain_visible: set[tuple[int, int]] = set()
+    proven_unreachable_visible: set[tuple[int, int]] = set()
+    visible_path_resources = sorted(set(resources) & visible_resources)
+    if len(dispatch_workers) >= 2 and len(visible_path_resources) <= 4:
+        path_obstacles = frozenset(turn.obstacle_cells) | _known_obstacles
+        # Empty Workers are not allowed to enter their own Core cell.  Keep
+        # that dynamic rule in the reachability preflight as well; otherwise
+        # A* can report a path that tunnels through the Core even though the
+        # controller would block the same step during action selection.
+        path_blocked = blocked_resources | (
+            {tuple(turn.core.position)} if turn.core is not None else set()
+        )
+        for resource in visible_path_resources:
+            reachable = False
+            budget_exhausted = False
+            for worker in dispatch_workers:
+                worker_id = str(worker.id)
+                if tuple(worker.position) == resource:
+                    reachable = True
+                    continue
+                step, exhausted = _astar_step_result(
+                    tuple(worker.position),
+                    resource,
+                    path_obstacles,
+                    path_blocked,
+                    max_expansions=_EMPTY_WORKER_ASTAR_MAX_EXPANSIONS,
+                )
+                if step is not None:
+                    reachable = True
+                else:
+                    unreachable_visible.add((worker_id, resource))
+                    budget_exhausted = budget_exhausted or exhausted
+            if not reachable:
+                if budget_exhausted:
+                    uncertain_visible.add(resource)
+                else:
+                    proven_unreachable_visible.add(resource)
+        if proven_unreachable_visible:
+            resources = [
+                resource
+                for resource in resources
+                if resource not in proven_unreachable_visible
+            ]
+            _resource_telemetry["unreachable"] = (
+                _resource_telemetry.get("unreachable", 0)
+                + len(proven_unreachable_visible)
+            )
     history_resources = {
         resource
         for resource in eligible_resources - visible_resources - blocked_resources
@@ -1011,45 +1066,89 @@ def _worker_resource_assignments(
     ):
         core_pos = turn.core.position if turn.core is not None else (0, 0)
         visible_targets = visible_resources & set(resources)
-        priority_targets = visible_targets or (history_resources | retained_targets)
+        if visible_targets:
+            # Reserving an explorer is only safe when every current visible
+            # target still has another Worker that the preflight considers
+            # reachable.  Otherwise the reservation can remove the sole
+            # reachable Worker and make the later matcher fall back to a
+            # nearer but sealed Worker.
+            uncertain_target = visible_targets & uncertain_visible
+            if uncertain_target:
+                explorer_candidates = []
+            elif retained_worker_ids:
+                # A retained history claim has already passed the hysteresis
+                # check above.  Prefer a non-retained Worker for exploration;
+                # this preserves the existing claim semantics while still
+                # keeping retained Workers out of the new visible-resource
+                # matcher.
+                non_retained_candidates = [
+                    candidate
+                    for candidate in explorer_candidates
+                    if str(candidate.id) not in retained_worker_ids
+                ]
+                if non_retained_candidates:
+                    explorer_candidates = non_retained_candidates
+            else:
+                viable_workers = list(workers)
 
-        def explorer_score(worker: "Worker") -> tuple[int, int, str]:
-            # 有可见资源时保护其最近采集者；只有历史提示时，则保护离历史
-            # 资源最近的 Worker，避免把已经走到节点旁的采集者派去探索。
-            resource_distance = min(
-                (_manhattan(worker.position, resource) for resource in priority_targets),
-                default=0,
-            )
-            return (
-                resource_distance,
-                _manhattan(worker.position, core_pos),
-                str(worker.id),
-            )
+                def can_reach_visible(
+                    worker: "Worker", target: tuple[int, int]
+                ) -> bool:
+                    return (str(worker.id), target) not in unreachable_visible
 
-        explorer = max(
-            explorer_candidates,
-            key=explorer_score,
-        )
-        explorer_id = str(explorer.id)
-        # 历史目标可以让位给前沿探索；当前可见目标不能被这个保留名额抢走。
-        if explorer_id in retained and retained[explorer_id] not in visible_resources:
-            retained_targets.discard(retained.pop(explorer_id))
-            retained_worker_ids.discard(explorer_id)
-            assignments.pop(explorer_id, None)
-            far_history_resources = far_history_for(retained_targets)
-            resources = sorted(
-                eligible_resources
-                - blocked_resources
-                - set(fixed.values())
-                - retained_targets
-                - far_history_resources
+                explorer_candidates = [
+                    candidate
+                    for candidate in explorer_candidates
+                    if all(
+                        any(
+                            other is not candidate
+                            and str(other.id) not in retained_worker_ids
+                            and can_reach_visible(other, target)
+                            for other in viable_workers
+                        )
+                        for target in visible_targets
+                    )
+                ]
+        if explorer_candidates:
+            priority_targets = visible_targets or (history_resources | retained_targets)
+
+            def explorer_score(worker: "Worker") -> tuple[int, int, str]:
+                # 有可见资源时保护其最近采集者；只有历史提示时，则保护离历史
+                # 资源最近的 Worker，避免把已经走到节点旁的采集者派去探索。
+                resource_distance = min(
+                    (_manhattan(worker.position, resource) for resource in priority_targets),
+                    default=0,
+                )
+                return (
+                    resource_distance,
+                    _manhattan(worker.position, core_pos),
+                    str(worker.id),
+                )
+
+            explorer = max(
+                explorer_candidates,
+                key=explorer_score,
             )
-        dispatch_workers = [
-            worker
-            for worker in workers
-            if str(worker.id) not in retained_worker_ids and worker is not explorer
-        ]
-        _resource_telemetry["explore_reserved"] = 1
+            explorer_id = str(explorer.id)
+            # 历史目标可以让位给前沿探索；当前可见目标不能被这个保留名额抢走。
+            if explorer_id in retained and retained[explorer_id] not in visible_resources:
+                retained_targets.discard(retained.pop(explorer_id))
+                retained_worker_ids.discard(explorer_id)
+                assignments.pop(explorer_id, None)
+                far_history_resources = far_history_for(retained_targets)
+                resources = sorted(
+                    eligible_resources
+                    - blocked_resources
+                    - set(fixed.values())
+                    - retained_targets
+                    - far_history_resources
+                )
+            dispatch_workers = [
+                worker
+                for worker in workers
+                if str(worker.id) not in retained_worker_ids and worker is not explorer
+            ]
+            _resource_telemetry["explore_reserved"] = 1
 
     if not dispatch_workers or not resources:
         _resource_claims.clear()
@@ -1076,17 +1175,24 @@ def _worker_resource_assignments(
     # One non-visible assignment must cost more than every possible total
     # distance difference, making visible-resource coverage a strict priority.
     history_penalty = max_distance * matched_count + 1
+    unreachable_penalty = history_penalty + max_distance + 1
+
+    def assignment_cost(worker: "Worker", resource: tuple[int, int]) -> int:
+        distance = _manhattan(worker.position, resource)
+        if (
+            resource in visible_resources
+            and resource not in uncertain_visible
+            and (str(worker.id), resource) in unreachable_visible
+        ):
+            return unreachable_penalty
+        if resource in visible_resources:
+            return distance
+        return distance + history_penalty + _resource_age(resource, turn.tick) * _HISTORY_RESOURCE_AGE_WEIGHT
 
     if len(dispatch_workers) <= len(resources):
         costs = [
             [
-                _manhattan(worker.position, resource)
-                + (
-                    0
-                    if resource in visible_resources
-                    else history_penalty
-                    + _resource_age(resource, turn.tick) * _HISTORY_RESOURCE_AGE_WEIGHT
-                )
+                assignment_cost(worker, resource)
                 for resource in resources
             ]
             for worker in dispatch_workers
@@ -1101,13 +1207,7 @@ def _worker_resource_assignments(
         # 此时只需继续最小化总路程。
         costs = [
             [
-                _manhattan(resource, worker.position)
-                + (
-                    0
-                    if resource in visible_resources
-                    else history_penalty
-                    + _resource_age(resource, turn.tick) * _HISTORY_RESOURCE_AGE_WEIGHT
-                )
+                assignment_cost(worker, resource)
                 for worker in dispatch_workers
             ]
             for resource in resources

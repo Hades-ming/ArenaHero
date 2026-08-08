@@ -215,6 +215,7 @@ def _workers_state(
     *,
     cargo: list[int] | None = None,
     resources: list[tuple[int, int]] | None = None,
+    obstacles: list[tuple[int, int]] | None = None,
 ) -> PlayerState:
     """Build a deterministic Core plus Worker fleet for dispatcher tests."""
     cargo = cargo or [0] * len(positions)
@@ -245,6 +246,10 @@ def _workers_state(
     if resources:
         objects.append(
             {"kind": "RESOURCE", "positions": [list(cell) for cell in resources]}
+        )
+    if obstacles:
+        objects.append(
+            {"kind": "OBSTACLE", "positions": [list(cell) for cell in obstacles]}
         )
     return _state(population=len(positions), objects=objects)
 
@@ -307,6 +312,78 @@ def test_visible_distant_resource_is_always_assignable() -> None:
     assert tactic._worker_resource_assignments(turn) == {
         str(UUID(int=0x6000)): distant
     }
+
+
+def test_visible_resource_skips_proven_unreachable_nearest_worker() -> None:
+    """可见资源应交给最近的可达 Worker，而不是被障碍封死的最近者。"""
+    near_id = str(UUID(int=0x6000))
+    far_id = str(UUID(int=0x6001))
+    target = (3, 0)
+    turn = _turn(
+        _workers_state(
+            [(1, 0), (1, 5)],
+            resources=[target],
+            obstacles=[(2, 0), (1, 1), (1, -1)],
+        ),
+        tick=20,
+    )
+
+    tactic._observe_resources(turn)
+    assignments = tactic._worker_resource_assignments(
+        turn, blocked_resources=frozenset(turn.obstacle_cells)
+    )
+
+    assert assignments == {far_id: target}
+    assert near_id not in assignments
+
+
+def test_visible_resource_keeps_only_reachable_worker_from_explorer_reserve() -> None:
+    """历史资源存在时，探索保留不能抢走可见资源的唯一可达 Worker。"""
+    near_id = str(UUID(int=0x6000))
+    far_id = str(UUID(int=0x6001))
+    target = (3, 0)
+    history = (100, 0)
+    tactic._known_resources.add(history)
+    tactic._resource_hints[history] = tactic.ResourceHint(19, "history")
+    turn = _turn(
+        _workers_state(
+            [(1, 0), (1, 5)],
+            resources=[target],
+            obstacles=[(2, 0), (1, 1), (1, -1)],
+        ),
+        tick=20,
+    )
+
+    tactic._observe_resources(turn)
+    assignments = tactic._worker_resource_assignments(
+        turn, blocked_resources=frozenset(turn.obstacle_cells)
+    )
+
+    assert assignments == {far_id: target}
+    assert near_id not in assignments
+
+
+def test_control_workers_sends_reachable_worker_to_visible_resource() -> None:
+    """资源唯一可达时，最终计划必须让远 Worker 向资源移动。"""
+    target = (3, 0)
+    history = (100, 0)
+    tactic._known_resources.add(history)
+    tactic._resource_hints[history] = tactic.ResourceHint(19, "history")
+    turn = _turn(
+        _workers_state(
+            [(1, 0), (1, 5)],
+            resources=[target],
+            obstacles=[(2, 0), (1, 1), (1, -1)],
+        ),
+        tick=20,
+    )
+
+    tactic._observe_resources(turn)
+    tactic._control_workers(turn, turn.core.position)
+
+    assert _action(turn.plan, UUID(int=0x6000)) is None
+    assert _action(turn.plan, UUID(int=0x6001)).type == "MOVE"
+    assert _action(turn.plan, UUID(int=0x6001)).direction == Direction.UP
 
 
 def test_worker_on_visible_distant_resource_harvests_immediately() -> None:
