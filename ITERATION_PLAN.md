@@ -709,7 +709,7 @@
   变化当作长期资源收益。继续累计稳定版本的 100–200 Tick 与 20 条完整采集→入核链路，并按
   官方规则/SDK 版本复核后再决定下一变量。
 
-## `RULE-006` Worker 读取战斗单位同 Tick 目的地预约（IN_PROGRESS，2026-08-08）
+## `RULE-006` Worker 读取战斗单位同 Tick 目的地预约（SAFE_CANARY_VERIFIED，待长窗收益，2026-08-08）
 
 - **问题证据**：`decide()` 先排队 Ranger/Vanguard 的移动，再进入 `_control_workers()`；Worker 原先
   只维护自己的 `reserved_destinations`。扩容窗口的 Core 邻格 `CELL_UNIT_LIMIT` 表明 Worker 可能
@@ -723,6 +723,8 @@
 - **live canary**：代码提交并推送后重启唯一 `io.arenahero.tactic`；从新计划完成结算后的下一 Tick
   观察 20 个唯一 Tick，要求无新增 `CELL_UNIT_LIMIT`/`MOVE_CONTESTED`、资源失败、窗口/协议/提交
   错误、Core/Unit 死亡。随后累计至少 100–200 Tick 与 20 条完整采集→入核链路，比较移动失败率、
-  入核率、净资源/Tick 和决策耗时；不能用短窗库存变化宣称收益。
+  入核率、净资源/Tick 和决策耗时；不能用短窗库存变化宣称收益。`5868021` 重启后的
+  `t72859..t72878` 20 个唯一 Tick 已通过护栏：无移动/资源失败、死亡、Core 伤害或提交异常，
+  资源 `90→91`，2 次采集、1 次入核；这是安全结果，不是长期收益结论。
 - **回滚**：若 Worker 等待导致采集/入核率下降 10% 以上、战斗单位仍频繁失败、或出现 Core/窗口/协议
   故障，只反向提交本规则修复；保留测试和运行归档，不销毁现有 W16。
