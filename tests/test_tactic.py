@@ -2882,6 +2882,40 @@ def test_full_core_without_all_workers_laden_does_not_use_capacity_elevator() ->
     assert tactic._resource_telemetry["capacity_elevator"] == 0
 
 
+def test_full_core_laden_worker_without_exit_does_not_spawn() -> None:
+    # The Core cell may be occupied only by a laden Worker and still have no
+    # legal same-Tick exit.  Do not submit a spawn that the server must reject
+    # with CELL_UNIT_LIMIT when all four adjacent cells are blocked.
+    state = _state_with_workers(
+        n_workers=15,
+        resources=115,
+        n_vanguards=4,
+        n_rangers=4,
+    )
+    objects = [obj.model_dump(mode="json") for obj in state.objects]
+    worker_objects = [
+        obj for obj in objects
+        if obj.get("kind") == "UNIT" and obj.get("unit_type") == "WORKER"
+    ]
+    for obj in worker_objects:
+        obj["cargo"] = 1
+    worker_objects[0]["position"] = [0, 0]
+    objects.append(
+        {
+            "kind": "OBSTACLE",
+            "positions": [[1, 0], [-1, 0], [0, 1], [0, -1]],
+        }
+    )
+    state = _state(resources=115, population=23, objects=objects)
+    turn = _turn(state)
+
+    decide(turn)
+
+    assert _core_action(turn.plan) is None
+    assert tactic._resource_telemetry["full_core_loaded"] == 1
+    assert tactic._resource_telemetry["capacity_elevator"] == 0
+
+
 def test_migrating_core_does_not_act() -> None:
     state = _state(
         resources=10,

@@ -2874,6 +2874,71 @@ def _record_core_saturation(turn: "Turn") -> bool:
     return full_core_loaded
 
 
+def _core_laden_workers_can_leave(turn: "Turn", laden_count: int) -> bool:
+    """判断占据 Core 的带货 Worker 能否在本 Tick 全部离核。
+
+    Core 的 SPAWN 在 Worker 移动之后结算，但 Worker 控制器会为每个目的
+    格做一次 Tick 内预约；因此只按“占位者都是带货 Worker”放行仍可能在
+    障碍或满邻格下提交必败的 ``CELL_UNIT_LIMIT``。按真实移动阻塞和独立
+    邻格数做保守检查，宁可等待一 Tick，也不消耗一个失败的 Core 动作窗口。
+    """
+    if laden_count <= 0 or turn.core is None:
+        return laden_count <= 0
+    core_pos = tuple(turn.core.position)
+    blocked = (
+        frozenset(turn.obstacle_cells)
+        | _known_obstacles
+        | frozenset(e.position for e in turn.visible_enemies)
+    )
+    friendly_occupancy = Counter(tuple(unit.position) for unit in turn.units)
+    available_destinations = 0
+    for direction in DIRECTIONS:
+        target = (core_pos[0] + direction.delta[0], core_pos[1] + direction.delta[1])
+        if target in blocked or friendly_occupancy.get(target, 0) >= 2:
+            continue
+        # queue_worker_move reserves each destination once per Tick even when
+        # the server cell capacity would permit a second occupant.
+        available_destinations += 1
+    if available_destinations < laden_count:
+        return False
+
+    # Worker routing runs before this Core decision.  Verify the exact plan
+    # rather than assuming that an adjacent slot is still available: another
+    # laden Worker may already have reserved the only exit in this Tick.
+    unit_actions = turn.plan.unit_actions
+    planned_destinations = Counter(
+        (
+            tuple(unit.position)[0] + action.direction.delta[0],
+            tuple(unit.position)[1] + action.direction.delta[1],
+        )
+        for unit in turn.units
+        for action in (unit_actions.get(unit.id),)
+        if action is not None and getattr(action, "type", None) == "MOVE"
+    )
+    core_laden_workers = [
+        worker
+        for worker in turn.workers
+        if worker.cargo > 0 and tuple(worker.position) == core_pos
+    ]
+    if len(core_laden_workers) != laden_count:
+        return False
+    for worker in core_laden_workers:
+        action = unit_actions.get(worker.id)
+        if action is None or getattr(action, "type", None) != "MOVE":
+            return False
+        target = (
+            core_pos[0] + action.direction.delta[0],
+            core_pos[1] + action.direction.delta[1],
+        )
+        if (
+            target in blocked
+            or friendly_occupancy.get(target, 0) >= 2
+            or planned_destinations.get(target, 0) > 1
+        ):
+            return False
+    return True
+
+
 def _control_core(
     turn: "Turn",
     threats: list[UnitView | CoreView],
@@ -2938,7 +3003,12 @@ def _control_core(
     laden_on_core = sum(
         w.cargo > 0 for w in turn.workers if w.position == core.position
     )
-    can_clear_occupied = core_full and colocated == laden_on_core and laden_on_core > 0
+    can_clear_occupied = (
+        core_full
+        and colocated == laden_on_core
+        and laden_on_core > 0
+        and _core_laden_workers_can_leave(turn, laden_on_core)
+    )
     if colocated >= 1 and not can_clear_occupied:
         return
     # Deposits resolve before Unit heals and the Core action in the same Tick;
@@ -3554,6 +3624,9 @@ def decide(turn: "Turn") -> None:
     )
     _control_rangers(turn, core_pos, heal_ids=heal_ids)
     _control_vanguards(turn, core_pos, heal_ids=heal_ids)
+    # Queue Worker movement/deposits first so the capacity-elevator guard can
+    # inspect the actual same-Tick exit plan and avoid CELL_UNIT_LIMIT.
+    _control_workers(turn, core_pos)
     _control_core(
         turn,
         threats,
@@ -3561,5 +3634,4 @@ def decide(turn: "Turn") -> None:
         enemy_core_visible=enemy_core_visible,
         available_resources=available_resources,
     )
-    _control_workers(turn, core_pos)
     _flush_persistent_state()

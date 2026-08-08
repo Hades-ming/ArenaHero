@@ -624,9 +624,11 @@
   不短缺、Worker 数 `<MAX_WORKERS(21)`”时，允许一个动态定价的 Worker 作为容量电梯；新 Worker
   使下一 Tick 容量增加 5，其他探索、A*、战斗和敌情规则不变。新增 `sat[full,elev]` Tick 遥测。
   `meta/monitor.py` 同时修正 `idle_gold_streak` 为历史最长连续满容量平台，并增加 `FULL_CORE_LOCK` 告警。
+- **安全边界**：若 Core 格上的带货 Worker 没有足够的独立合法离核格（障碍、敌占或友方满格），
+  不排容量电梯；Core 移动结算前不会用一个必败的 `CELL_UNIT_LIMIT` 生产动作换取遥测上的假成功。
 - **允许文件**：`tactic.py`、`play.py`、`meta/monitor.py`、`tests/test_tactic.py`、本文档和
   `LESSONS.md`。不暂存 `uv.lock`、`tactic_state.json.archive-*`、`game.log*` 或 `play.out*`。
-- **静态验收**：全量 `pytest` `170 passed`；`compileall`、`git diff --check`、`uv pip check` 通过。
+- **静态验收**：全量 `pytest` `171 passed`；`compileall`、`git diff --check`、`uv pip check` 通过。
 - **live canary**：提交后重启唯一 `io.arenahero.tactic`，从新计划完成结算后的下一 Tick 起先观察
   20 个连续唯一 Tick；随后累计至少 100 个唯一 Tick/20 条完整采集→入核链路。重点比较满核带货 Tick、
   容量电梯成功生产、满核最长平台、HARVEST/DEPOSIT、链路 P50/P95、Agent 净资源/Tick、决策 P50/P95，
