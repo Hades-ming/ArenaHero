@@ -36,6 +36,7 @@ RE_CORE = re.compile(r"core@([^ ]+) hp(\d+)/sh(\d+)/(\w+)")
 RE_VIS = re.compile(r"vis(\d+)\[([^\]]*)\]")
 RE_VIS_CORE = re.compile(r"(?:^|,)-?\d+,-?\d+C(?:,|$)")
 RE_ECO = re.compile(r"eco\[([^\]]*)\]")
+RE_SAT = re.compile(r"sat\[([^\]]*)\]")
 RE_PATH = re.compile(r"path\[([^\]]*)\]")
 # Event payloads may contain their own amount brackets, e.g.
 # ``ev[HARVEST_SUCCEEDED[1];CORE_SPAWN_SUCCEEDED]``. Match the outer event
@@ -102,6 +103,8 @@ class KPI:
     core_move_failed: int = 0
     resource_not_found: int = 0
     idle_gold_streak: int = 0       # longest run of consecutive capacity-sitting ticks
+    full_core_loaded_ticks: int = 0  # ticks with a full Core and every Worker laden
+    capacity_elevator_spawns: int = 0  # bounded Worker spawns used to release that lock
     resource_drops: int = 0         # ticks where resources fell > RESOURCE_DROP_THRESHOLD w/o spawn
     largest_drop: int = 0
     ticks_with_enemy_visible: int = 0
@@ -258,6 +261,14 @@ def _parse_line(line: str) -> dict | None:
             if (match := re.fullmatch(r"([a-z]+)(\d+)", token))
             for name, value in [match.groups()]
         }
+    m = RE_SAT.search(line)
+    if m:
+        rec["sat"] = {
+            name: int(value)
+            for token in m.group(1).split(",")
+            if (match := re.fullmatch(r"([a-z]+)(\d+)", token))
+            for name, value in [match.groups()]
+        }
     m = RE_PATH.search(line)
     if m:
         rec["path"] = {
@@ -319,6 +330,7 @@ def analyze(path: str | Path) -> KPI:
     last_observed_tick: int | None = None
     pending_harvests: dict[str, deque[int]] = {}
     harvest_deposit_latencies: list[int] = []
+    current_idle_gold_streak = 0
     with p.open("r", encoding="utf-8", errors="replace") as fh:
         for raw in fh:
             rec = _parse_line(raw)
@@ -397,9 +409,12 @@ def analyze(path: str | Path) -> KPI:
                 kpi.capacity_last = cap
                 # Consecutive capacity-sitting streak (under-investing signal).
                 if res >= cap:
-                    kpi.idle_gold_streak += 1
+                    current_idle_gold_streak += 1
+                    kpi.idle_gold_streak = max(
+                        kpi.idle_gold_streak, current_idle_gold_streak
+                    )
                 else:
-                    kpi.idle_gold_streak = 0
+                    current_idle_gold_streak = 0
                 # Unexplained resource loss: a big drop with no spawn that tick.
                 spawned = any(_is_spawn_event(e.split("[")[0]) for e in rec.get("events", []))
                 if (
@@ -433,6 +448,9 @@ def analyze(path: str | Path) -> KPI:
                     if rec.get("res", 0) >= raid_threshold:
                         kpi.ticks_with_raid_budget += 1
             if not excluded_from_agent:
+                sat = rec.get("sat", {})
+                kpi.full_core_loaded_ticks += sat.get("full", 0)
+                kpi.capacity_elevator_spawns += sat.get("elev", 0)
                 eco = rec.get("eco", {})
                 kpi.resource_assignments += eco.get("a", 0)
                 kpi.visible_resource_assignments += eco.get("av", 0)
@@ -614,6 +632,12 @@ def detect_bottlenecks(kpi: KPI) -> list[str]:
             f"consecutive ticks (last {kpi.resources_last}/{kpi.capacity_last}) "
             f"— capital not working"
         )
+    if kpi.full_core_loaded_ticks >= IDLE_GOLD_TICKS:
+        alerts.append(
+            f"FULL_CORE_LOCK: Core was full while every Worker was laden for "
+            f"{kpi.full_core_loaded_ticks} ticks — capacity-elevator policy "
+            f"should be verified ({kpi.capacity_elevator_spawns} queued)"
+        )
     # ``move_failed_cell`` predates the reason-aware counter. Keep it as a
     # fallback for callers constructing KPI objects from the old schema.
     failed_moves = max(kpi.move_failed, kpi.move_failed_cell)
@@ -720,6 +744,12 @@ def report(kpi: KPI, alerts: list[str]) -> str:
     lines.append(
         f"Resources      : last {kpi.resources_last}/{kpi.capacity_last} "
         f"(min {kpi.resources_min}, max {kpi.resources_max})"
+    )
+    lines.append(
+        f"Saturation     : full Core + all Workers laden "
+        f"{kpi.full_core_loaded_ticks} ticks; capacity-elevator spawns "
+        f"{kpi.capacity_elevator_spawns}; longest full streak "
+        f"{kpi.idle_gold_streak} ticks"
     )
     lines.append(
         f"Army/Pop      : pop {kpi.pop_last} "

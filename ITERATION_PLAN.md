@@ -613,3 +613,25 @@
   客户端；每次人工续接先复核官方规则/SDK、唯一进程、唯一 Tick KPI 和 GitHub SHA。
 - **恢复条件**：Codex 自动化接口可正常返回时，创建每 6 小时 heartbeat，仅失败运行通知；任务内容
   必须沿用本文件的样本、单变量、canary、提交/推送和回滚门槛，禁止无门槛自动调参。
+
+## `PERF-003` 满核带货容量电梯（STATIC_VERIFIED，待 live canary）
+
+- **基线与证据**：基线 `main@4d5e85e`，规则 gameplay `v0.14`、SDK `0.2.9`。专家按
+  `t66300..t72364` 审计发现，`t69441..t70440` 约 1,000 Tick 处于 `r115/115`、W15/V4/R4，
+  15 个 Worker 均带货且没有采集/交付；普通 Worker 目标已受军备预算压到 W12，因此常规生产分支
+  不会释放容量。该窗口不是 A* 找不到路，而是 Core 满容量导致交付闭环锁死。
+- **单一假设与实现**：仅当当前 Turn 同时满足“Core 满、每个 Worker `cargo>0`、无可见敌人、军备
+  不短缺、Worker 数 `<MAX_WORKERS(21)`”时，允许一个动态定价的 Worker 作为容量电梯；新 Worker
+  使下一 Tick 容量增加 5，其他探索、A*、战斗和敌情规则不变。新增 `sat[full,elev]` Tick 遥测。
+  `meta/monitor.py` 同时修正 `idle_gold_streak` 为历史最长连续满容量平台，并增加 `FULL_CORE_LOCK` 告警。
+- **允许文件**：`tactic.py`、`play.py`、`meta/monitor.py`、`tests/test_tactic.py`、本文档和
+  `LESSONS.md`。不暂存 `uv.lock`、`tactic_state.json.archive-*`、`game.log*` 或 `play.out*`。
+- **静态验收**：全量 `pytest` `170 passed`；`compileall`、`git diff --check`、`uv pip check` 通过。
+- **live canary**：提交后重启唯一 `io.arenahero.tactic`，从新计划完成结算后的下一 Tick 起先观察
+  20 个连续唯一 Tick；随后累计至少 100 个唯一 Tick/20 条完整采集→入核链路。重点比较满核带货 Tick、
+  容量电梯成功生产、满核最长平台、HARVEST/DEPOSIT、链路 P50/P95、Agent 净资源/Tick、决策 P50/P95，
+  并要求无新 `TICK_MISMATCH`、Tick 缺口、Core/Unit 死亡或资源失败。三次既有未归因的 50/50/95
+  资源骤降仍单独标记，不并入本实验收益。
+- **回滚**：若 20 Tick 内出现容量电梯连续生产、敌情下漏造攻击单位、`CELL_UNIT_LIMIT`/资源失败、
+  命令窗口/协议/提交错误，或两个干净 50-Tick 窗口的入核率较 `RULE-002` 201-Tick 基线下降 10%，
+  只反向提交本任务改动；不删除运行归档，不回滚用户的 `uv.lock` 修改。

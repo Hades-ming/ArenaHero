@@ -724,6 +724,17 @@ def _resource_telemetry_summary() -> str:
     )
 
 
+def _saturation_telemetry_summary() -> str:
+    """返回 Core 饱和与扩容电梯的有界 Tick 级指标。"""
+    return ",".join(
+        f"{short}{_resource_telemetry.get(name, 0)}"
+        for name, short in (
+            ("full_core_loaded", "full"),
+            ("capacity_elevator", "elev"),
+        )
+    )
+
+
 def _astar_telemetry_summary() -> str:
     """Return bounded per-Tick A* counters for the performance experiment."""
     return ",".join(
@@ -2849,6 +2860,20 @@ def _standing_army_targets(n_workers: int) -> tuple[int, int]:
     return max(vanguards, floor_v), max(rangers, floor_r)
 
 
+def _record_core_saturation(turn: "Turn") -> bool:
+    """记录本 Tick 的满核且全员带货状态，并返回该状态。"""
+    core_full = (
+        turn.core is not None and turn.resources >= turn.resource_capacity
+    )
+    loaded_workers = sum(worker.cargo > 0 for worker in turn.workers)
+    full_core_loaded = bool(turn.workers) and core_full and loaded_workers == len(
+        turn.workers
+    )
+    _resource_telemetry["full_core_loaded"] = int(full_core_loaded)
+    _resource_telemetry["capacity_elevator"] = 0
+    return full_core_loaded
+
+
 def _control_core(
     turn: "Turn",
     threats: list[UnitView | CoreView],
@@ -2859,6 +2884,7 @@ def _control_core(
     core = turn.core
     if core is None:
         return
+    full_core_loaded = _record_core_saturation(turn)
     # A migrating Core cannot spawn, repair, or receive deposits; let the move
     # resolve rather than queue an action that would fail with CORE_ALREADY_MOVING.
     if core.view.state == "MOVING":
@@ -3016,6 +3042,25 @@ def _control_core(
             )
         ):
             return
+
+    # 满核且所有 Worker 都已经带货时，继续等待会把采集闭环锁死：Core
+    # 没有空位接收货物，Worker 又无法产生新的采集收益。只在和平期、军备
+    # 已齐且仍处于有界 Worker 上限内时，生产一个“容量电梯” Worker。新
+    # Worker 使容量增加 5，生产成本由 v0.14 的动态价格决定；下一 Tick
+    # 旧 Worker 即可把货物交付。该分支不是常规 Worker 桥接，也不会在
+    # 敌情或军备短缺时抢占资源。
+    if (
+        full_core_loaded
+        and not enemy_present
+        and not army_short
+        and len(turn.workers) < MAX_WORKERS
+    ):
+        worker_price = unit_cost(UnitType.WORKER, population)
+        if effective_resources >= worker_price + WORKER_SPAWN_RESERVE:
+            core.spawn(UnitType.WORKER)
+            _resource_telemetry["capacity_elevator"] = 1
+            return
+
     # Bank reserve: only spawn a Worker if the Core keeps at least
     # WORKER_SPAWN_RESERVE resources afterward, so the economy never drains to
     # zero and the standing-army bank is not reset each spawn.

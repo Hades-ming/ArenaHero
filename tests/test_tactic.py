@@ -2833,6 +2833,55 @@ def test_core_spawns_when_full_and_laden_worker_steps_off() -> None:
     assert getattr(_action(turn.plan, WORKER_ID), "direction", None) is not None
 
 
+def test_full_core_with_all_workers_laden_spawns_capacity_elevator() -> None:
+    # Long-live evidence showed W15/V4/R4 with r==capacity and every Worker
+    # carrying cargo.  The ordinary Worker target is already capped at W12,
+    # so only the explicit saturation escape may open one extra capacity slot.
+    state = _state_with_workers(
+        n_workers=15,
+        resources=115,
+        n_vanguards=4,
+        n_rangers=4,
+    )
+    objects = [obj.model_dump(mode="json") for obj in state.objects]
+    for obj in objects:
+        if obj.get("kind") == "UNIT" and obj.get("unit_type") == "WORKER":
+            obj["cargo"] = 1
+    state = _state(resources=115, population=23, objects=objects)
+    turn = _turn(state)
+
+    decide(turn)
+
+    action = _core_action(turn.plan)
+    assert action is not None
+    assert action.type == "SPAWN"
+    assert action.unit_type == UnitType.WORKER
+    assert tactic._resource_telemetry["full_core_loaded"] == 1
+    assert tactic._resource_telemetry["capacity_elevator"] == 1
+
+
+def test_full_core_without_all_workers_laden_does_not_use_capacity_elevator() -> None:
+    state = _state_with_workers(
+        n_workers=15,
+        resources=115,
+        n_vanguards=4,
+        n_rangers=4,
+    )
+    objects = [obj.model_dump(mode="json") for obj in state.objects]
+    for obj in objects:
+        if obj.get("kind") == "UNIT" and obj.get("unit_type") == "WORKER":
+            obj["cargo"] = 1
+            break
+    state = _state(resources=115, population=23, objects=objects)
+    turn = _turn(state)
+
+    decide(turn)
+
+    assert _core_action(turn.plan) is None
+    assert tactic._resource_telemetry["full_core_loaded"] == 0
+    assert tactic._resource_telemetry["capacity_elevator"] == 0
+
+
 def test_migrating_core_does_not_act() -> None:
     state = _state(
         resources=10,
@@ -4165,6 +4214,40 @@ def test_monitor_parses_timing_field() -> None:
     assert rec["decide_ms"] == 80
     assert rec["submit_ms"] == 12
     assert rec["total_ms"] == 92
+
+
+def test_monitor_tracks_saturation_and_longest_full_streak(tmp_path) -> None:
+    from meta import monitor
+
+    def line(tick: int, resources: int, sat: str) -> str:
+        return (
+            f"t{tick} r{resources}/10 pop2(W2 V0 R0) core@0,0 hp5/sh5/NORMAL "
+            "W[-] O[-] vis0[-] res0[] obs0 beacon0,0 "
+            "eco[a0,av0,ah0,stale0,far0,exp0,ref0,blk0,cool0,unr0,harv0,dep0] "
+            f"sat[{sat}] path[c0,e0,b0,p0] TM[1,2,3] ST[ACCEPTED] ev[] plan[-]\n"
+        )
+
+    log_path = tmp_path / "game.log"
+    lines = [line(10, 10, "full1,elev0")]
+    lines.extend(
+        line(tick, 10, "full1,elev1" if tick == 11 else "full1,elev0")
+        for tick in range(11, 25)
+    )
+    lines.extend(
+        [line(25, 9, "full0,elev0"), line(26, 10, "full1,elev0")]
+    )
+    log_path.write_text("".join(lines), encoding="utf-8")
+
+    record = monitor._parse_line(line(11, 10, "full1,elev1"))
+    assert record is not None
+    assert record["sat"] == {"full": 1, "elev": 1}
+
+    kpi = monitor.analyze(log_path)
+    assert kpi.full_core_loaded_ticks == 16
+    assert kpi.capacity_elevator_spawns == 1
+    assert kpi.idle_gold_streak == 15
+    assert any("IDLE_GOLD" in alert for alert in monitor.detect_bottlenecks(kpi))
+    assert any("FULL_CORE_LOCK" in alert for alert in monitor.detect_bottlenecks(kpi))
 
 
 def test_monitor_aggregates_astar_path_telemetry(tmp_path) -> None:

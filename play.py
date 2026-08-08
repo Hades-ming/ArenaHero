@@ -254,6 +254,7 @@ def _log_line(
         f"obs{len(turn.obstacle_cells)} "
         f"beacon{turn.beacon.position[0]},{turn.beacon.position[1]} "
         f"eco[{tactic._resource_telemetry_summary()}] "
+        f"sat[{tactic._saturation_telemetry_summary()}] "
         f"path[{tactic._astar_telemetry_summary()}] "
         f"TM[{decide_ms},{submit_ms},{total_local_ms}] ST[{status}]"
         f"{f' ER[{safe_error_code}]' if error_code else ''}{dup_flag} "
