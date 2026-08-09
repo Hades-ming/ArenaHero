@@ -3455,6 +3455,31 @@ def test_full_core_with_all_workers_laden_spawns_capacity_elevator() -> None:
     assert tactic._resource_telemetry["capacity_elevator"] == 1
 
 
+def test_w21_full_core_can_open_one_capacity_elevator_slot() -> None:
+    """扩容实验只在 W21 真正满核且全员带货时允许第 22 个 Worker。"""
+    state = _state_with_workers(
+        n_workers=21,
+        resources=145,
+        n_vanguards=4,
+        n_rangers=4,
+    )
+    objects = [obj.model_dump(mode="json") for obj in state.objects]
+    for obj in objects:
+        if obj.get("kind") == "UNIT" and obj.get("unit_type") == "WORKER":
+            obj["cargo"] = 1
+    state = _state(resources=145, population=29, objects=objects)
+    turn = _turn(state)
+
+    decide(turn)
+
+    action = _core_action(turn.plan)
+    assert action is not None
+    assert action.type == "SPAWN"
+    assert action.unit_type == UnitType.WORKER
+    assert tactic.MAX_WORKERS == 22
+    assert tactic._resource_telemetry["capacity_elevator"] == 1
+
+
 def test_full_core_without_all_workers_laden_does_not_use_capacity_elevator() -> None:
     state = _state_with_workers(
         n_workers=15,

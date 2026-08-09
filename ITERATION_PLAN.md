@@ -1021,3 +1021,32 @@
 - **后续门槛**：本次已完成一个 128-Tick 相位的安全/覆盖验证；继续累计至少 `50` 条完整采集→入核
   链路并观察第二相位，再决定是否只读修正 `NO_RAID` 监控半径或调整经济扩容。暂不改变战斗巡逻、
   hunt 半径、人口生产或资源任务优先级。
+
+## `ECONOMY-CAP-008` 解除历史 W21 容量电梯上限（STATIC_VERIFIED，待 LIVE_CANARY，2026-08-09）
+
+- **当前事实**：规则 gameplay `v0.14` 没有人口 20 硬上限，SDK `0.2.9`；但策略的
+  `FREE_UPKEEP_CAP=20`、`ECONOMY_BRIDGE_MAX_WORKERS=15` 只是和平期软预算。当前 live
+  严格窗口 `t79106..t79283` 共 `178` 个唯一 Tick，编制始终为 `pop29(W21/V4/R4)`，库存
+  `127→137/145`，自然采集 `13`、入核 `11`，没有任何 `CORE_SPAWN_*`、移动/资源失败、伤亡或
+  Core 受击。`worker_target=min(20-8,15)=12`，普通 Worker 桥不会再生产；容量电梯的
+  `full_core_loaded` 全窗为 `0`，因此 W21 是历史扩容遗留，不是当前库存已满后的服务端卡点。
+- **可证伪假设**：若真正出现“Core 满、全部 Worker 带货”的交付死锁，放宽一个容量槽到 W22
+  可以用一次动态定价 Worker 把容量从 `145` 提到 `150`，恢复 `DEPOSIT` 出口；若该状态不出现，
+  或扩容后的新增吞吐不足以回收成本，则不应继续上调人口。
+- **单一变更**：仅将 `MAX_WORKERS` 从 `FREE_UPKEEP_CAP+1`（W21）改为
+  `FREE_UPKEEP_CAP+2`（W22）。未改变 `FREE_UPKEEP_CAP`、`ECONOMY_BRIDGE_MAX_WORKERS`、
+  军备目标、四象限 Worker 回扫、近/远战斗巡逻、资源匹配或容量电梯触发条件。仍必须同时满足
+  和平、军备不短缺、Core 满、全部 Worker 带货、动态 Worker 价格加 3 点储备以及 Core 邻格可
+  合法离核等门槛；当前 `r137/145`、仅约 `3–4/21` Worker 带货时不会触发。
+- **离线验收**：新增 W21 满核全带货允许第 22 Worker 的回归；满核但未全带货、邻格无合法出口的
+  负例仍不生产。全量 `pytest 196 passed`，`compileall`、`uv pip check`、`git diff --check`
+  通过。
+- **LIVE_CANARY**：提交后重启唯一 `play.py`，从新计划结算后的下一 Tick 起先观察 `20` 个唯一
+  Tick，随后至少 `128` 个唯一 Tick。护栏必须保持全 Tick `ST[ACCEPTED]`、无窗口/提交/协议/
+  `MOVE_FAILED`/资源失败、无 Unit/Core 损失或 Core 受击；若不出现 `full1/elev1`，记录为“容量
+  压力不足”，不继续盲目放宽。若触发，记录 `CORE_SPAWN_SUCCEEDED` 实际成本、容量变化、
+  `DEPOSIT`/Tick、完整链路 P50/P95 与扩容后 `256–300` Tick 净资源回本情况；当前基线 gross
+  入核约 `0.0618/Tick`，扩容后至少提升 `5%` 且能回收一次 `8` 资源成本才可保留。
+- **回滚**：出现任一窗口/协议/提交错误、移动/资源失败、伤亡/Core 受击，或扩容后两个干净
+  `100`-Tick 窗口的 gross 入核下降 `10%`、链路 P95 上升 `25%`、`256–300` Tick 仍未回收成本，
+  只反向提交本任务；不回滚已验证的持久地图、Worker cohort 重编号或战斗巡逻。

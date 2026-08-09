@@ -88,7 +88,10 @@ FREE_UPKEEP_CAP = 20
 # past 70. Still below the first price step (pop 17 < 20). The bank reserve +
 # army-short gate still prevent draining deposits to r0.
 TARGET_WORKERS = FREE_UPKEEP_CAP
-MAX_WORKERS = FREE_UPKEEP_CAP + 1
+# Capacity-elevator experiment: allow exactly one additional Worker beyond the
+# historical W21 ceiling, but only through the strict full-Core/all-laden gate
+# below. This does not reopen ordinary peaceful Worker growth.
+MAX_WORKERS = FREE_UPKEEP_CAP + 2
 # Bank reserve: never spend down to zero on a Worker spawn. A spawn must leave
 # the Core with at least this many resources afterward, so the economy keeps a
 # positive balance and the standing-army bank (toward the 10/12 combat Unit)
