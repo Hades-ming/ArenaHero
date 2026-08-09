@@ -689,7 +689,7 @@ def test_control_workers_reports_exploration_reservation_without_resources() -> 
     assert len(turn.plan.unit_actions) == 3
 
 
-def test_control_workers_reserves_two_refresh_patrols_without_visible_resources(
+def test_control_workers_reserves_four_refresh_patrols_without_visible_resources(
     monkeypatch,
 ) -> None:
     turn = _turn(_workers_state([(0, 1), (0, 2), (0, 3), (0, 4), (0, 5), (0, 6)]), tick=20)
@@ -703,13 +703,58 @@ def test_control_workers_reserves_two_refresh_patrols_without_visible_resources(
     tactic._control_workers(turn, turn.core.position)
 
     assert len(captured) == 1
-    assert len(captured[0]) == 4
-    assert tactic._resource_telemetry["refresh_reservations"] == 2
+    assert len(captured[0]) == 2
+    assert tactic._resource_telemetry["refresh_reservations"] == 4
     assert len(turn.plan.unit_actions) == 6
 
 
+def test_refresh_patrols_keep_four_quadrants_even_with_frontier_targets(
+    monkeypatch,
+) -> None:
+    """固定回扫名额不能被一批前沿目标重新吸回同一侧。"""
+    turn = _turn(
+        _workers_state(
+            [(0, 1), (0, 2), (0, 3), (0, 4), (0, 5), (0, 6), (0, 7), (0, 8)]
+        ),
+        tick=20,
+    )
+    monkeypatch.setattr(
+        tactic,
+        "_assign_explore_targets",
+        lambda workers, *args, **kwargs: {
+            worker_id: (40 + index, 40)
+            for index, (worker_id, _position) in enumerate(workers)
+        },
+    )
+    patrol_goals: list[tuple[int, int]] = []
+
+    def fake_patrol_step(_pos, goal, *_args, **_kwargs):
+        patrol_goals.append(goal)
+        return Direction.RIGHT
+
+    monkeypatch.setattr(tactic, "_patrol_step", fake_patrol_step)
+    tactic._control_workers(turn, turn.core.position)
+
+    assert len(patrol_goals) == 4
+    quadrants = {
+        (1 if x > 0 else -1, 1 if y > 0 else -1)
+        for x, y in patrol_goals
+    }
+    assert len(quadrants) == 4
+    # The first four stable Worker IDs are the refresh cohort; the others may
+    # still receive ordinary frontier actions in the same Tick.
+    assert all(
+        _action(turn.plan, UUID(int=0x6000 + index)) is not None
+        for index in range(4)
+    )
+    assert all(
+        _action(turn.plan, UUID(int=0x6000 + index)) is not None
+        for index in range(4, 8)
+    )
+
+
 def test_frontier_reassignment_keeps_refresh_patrols_reserved(monkeypatch) -> None:
-    """前沿停滞重派不能抢走两个 Chunk 回扫 Worker。"""
+    """前沿停滞重派不能抢走四个 Chunk 回扫 Worker。"""
     turn = _turn(
         _workers_state(
             [(0, 1), (0, 2), (0, 3), (0, 4), (0, 5), (0, 6)]

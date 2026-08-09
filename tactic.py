@@ -329,11 +329,12 @@ _EXPLORE_STALL_TICKS = 6
 # 分散探索，又不会为了追求一个远端高 frontier_gain 目标，让整队在已探索
 # 地面上行走几十个 Tick。
 _EXPLORATION_SECTOR_COVER = 4
-# Natural nodes refill in tracked chunks every four logical Ticks.  Keep a
-# small, stable patrol cohort on the persisted chunk sweep so refilled nodes in
-# already-explored ground are rediscovered while the rest of the fleet pursues
-# new frontier cells.
-_RESOURCE_REFRESH_PATROL_WORKERS = 2
+# Natural nodes refill in tracked chunks every four logical Ticks.  Keep four
+# stable patrol Workers on the persisted chunk sweep, one per compass quadrant,
+# so refilled nodes in already-explored ground are rediscovered while the rest
+# of the fleet pursues new frontier cells.  Two Workers were not enough to stop
+# a long drought from collapsing the fleet into one north/east band.
+_RESOURCE_REFRESH_PATROL_WORKERS = 4
 
 
 @dataclass
@@ -2148,10 +2149,12 @@ def _control_workers(turn: "Turn", core_pos: tuple[int, int]) -> None:
     if not resource_cells and len(idle_workers) >= 3:
         _resource_telemetry["explore_reserved"] = 1
     # Natural nodes refill in already-tracked chunks.  When no node is visible,
-    # reserve two stable empty Workers for the boustrophedon refresh sweep and
-    # let the remaining fleet continue the four-sector frontier search.  The
-    # reserve never removes a Worker assigned to a current visible resource.
+    # reserve a stable four-Worker cohort for the compass-quadrant refresh
+    # sweep and let the remaining fleet continue the four-sector frontier
+    # search.  The reserve never removes a Worker assigned to a current
+    # visible resource.
     frontier_workers = idle_workers
+    sector_patrol_worker_ids: set[str] = set()
     if not resource_cells and len(idle_workers) >= 4:
         refresh_count = min(
             _RESOURCE_REFRESH_PATROL_WORKERS, len(idle_workers) - 1
@@ -2160,6 +2163,7 @@ def _control_workers(turn: "Turn", core_pos: tuple[int, int]) -> None:
             worker_id
             for worker_id, _ in sorted(idle_workers)[:refresh_count]
         }
+        sector_patrol_worker_ids = set(refresh_ids)
         for worker_id in refresh_ids:
             _explore_targets.pop(worker_id, None)
             _explore_progress.pop(worker_id, None)
@@ -2174,9 +2178,10 @@ def _control_workers(turn: "Turn", core_pos: tuple[int, int]) -> None:
     # 先占住已有前沿目标，再逐个登记新选中的巡查站点，避免重复派遣。
     sector_patrol_reserved = set(explore_targets.values())
     # 持久地图已经照亮大部分常规半径时，前沿目标数量会骤减；这正是
-    # live 日志里 13/16 个 Worker 长期落在同一象限的触发条件。只在这种
-    # “前沿不足”状态启用四向站点，保留真实未知前沿的优先级，不让本轮
-    # 分散逻辑抢走仍可立即兑现的前沿目标。
+    # live 日志里 13/16 个 Worker 长期落在同一象限的触发条件。四个回扫
+    # Worker 无论前沿候选数量如何都走四向站点；其余 Worker 只在“前沿不足”
+    # 时启用站点，保留真实未知前沿的优先级，不让分散逻辑抢走可立即兑现的
+    # 资源任务。
     sector_patrol_mode = bool(_explored_cells) and len(explore_targets) < max(
         1, len(frontier_workers) // 2
     )
@@ -2528,7 +2533,7 @@ def _control_workers(turn: "Turn", core_pos: tuple[int, int]) -> None:
         if (
             step is None
             and target is None
-            and sector_patrol_mode
+            and (sector_patrol_mode or wid in sector_patrol_worker_ids)
             and wid not in resource_assignments
         ):
             sector_target = _worker_sector_patrol_target(

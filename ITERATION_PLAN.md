@@ -905,3 +905,26 @@
   分开比较四象限覆盖、发现→分配、入核资源/Tick、追击 MOVE_CONTESTED 和 A* 长尾。当前只接受
   安全结论，不放宽容量电梯或继续生产普通 Worker；若连续两个 50-Tick 窗口出现敌格 MOVE、
   `CELL_UNIT_LIMIT`、Core/窗口/协议故障，再回滚本单变量修复。
+
+## `RESOURCE-DISPATCH-019` 四个 Worker 固定四象限回扫（STATIC_VERIFIED，待 LIVE_CANARY，2026-08-09）
+
+- **用户问题与基线**：持久地图已积累后，Worker 历史上长期集中在北/东区域，约有 `2000` 个 Tick
+  没有采集；长窗的象限占比约为 `WN 49% / EN 30% / WS 12.5% / ES 8.4%`。最近 `500` Tick
+  已回到约 `WN 30.1% / EN 37.2% / WS 14.6% / ES 12.5%`，但仍存在东/北偏置，不能把短期恢复
+  解释成长期发现效率已最优。当前旧版本窗口约 `t73610..t78803`，唯一 Tick、协议和提交链路正常，
+  Core 保持 `5/5`；长窗仍记录 `MOVE_CONTESTED`，应在新版本 canary 中单独归因。
+- **单一变更**：将无当前可见资源时的持久 Chunk 回扫名额从 `2` 提高到 `4`；当空载 Worker 至少
+  `4` 个时，按稳定 ID 预留最多 `min(4, N-1)` 个，优先分别绑定 NW/NE/SW/SE 巡查站点。只有
+  `4` 个空载 Worker 时保留 `N-1` 的前沿余量，四向覆盖会在下一名 Worker 出现后完整启用；当前
+  可见资源分配、带货回 Core、障碍绕行、站点唯一预约和持久地图写入逻辑保持不变。
+- **静态验收**：增加“前沿目标存在时仍保留四象限回扫”回归，修正旧的两名巡查断言；全量
+  `pytest` `191 passed`，`compileall`、`uv pip check`、`git diff --check` 均通过。由于虚拟环境
+  未安装 `pip`，依赖检查使用官方 `uv pip check`。
+- **上线与 canary**：当前 PID `33191` 仍是旧版本，提交后只重启一个 `play.py`，从重启边界之后的
+  下一完整 authoritative Tick 开始统计。先验收连续 `20` 个唯一 Tick：无认证/协议/提交/窗口错误、
+  无 `HARVEST_FAILED`、`MOVE_CONTESTED`、`CELL_UNIT_LIMIT`、Core/Unit 损失；再累计 `100–200`
+  个 Tick 与至少 `50` 条 `HARVEST_SUCCEEDED → DEPOSIT_SUCCEEDED` 链路，比较四象限占比、发现→
+  分配延迟、入核资源/Tick、完整链路 P50/P95、刷新名额和决策耗时。安全 canary 不等于收益提升。
+- **回滚**：若连续两个 `100`-Tick 窗口入核率下降 `10%`、四象限仍未改善、完整链路 P95 上升
+  `25%`，或出现移动竞态、Core/窗口/协议故障，只恢复本任务的战术提交；保留持久地图、`uv.lock`
+  与用户已有 archive 文件。
