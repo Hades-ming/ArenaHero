@@ -3494,7 +3494,7 @@ def test_full_core_with_all_workers_laden_spawns_capacity_elevator() -> None:
 
 
 def test_w21_full_core_can_open_one_capacity_elevator_slot() -> None:
-    """扩容实验只在 W21 真正满核且全员带货时允许第 22 个 Worker。"""
+    """扩容实验只在 W21 真正满核且全员带货时允许继续扩容。"""
     state = _state_with_workers(
         n_workers=21,
         resources=145,
@@ -3514,7 +3514,32 @@ def test_w21_full_core_can_open_one_capacity_elevator_slot() -> None:
     assert action is not None
     assert action.type == "SPAWN"
     assert action.unit_type == UnitType.WORKER
-    assert tactic.MAX_WORKERS == 22
+    assert tactic.MAX_WORKERS == 23
+    assert tactic._resource_telemetry["capacity_elevator"] == 1
+
+
+def test_w22_full_core_can_open_next_capacity_elevator_slot() -> None:
+    """W22 达到旧上限后，满核全员带货仍可继续释放一个容量槽。"""
+    state = _state_with_workers(
+        n_workers=22,
+        resources=150,
+        n_vanguards=4,
+        n_rangers=4,
+    )
+    objects = [obj.model_dump(mode="json") for obj in state.objects]
+    for obj in objects:
+        if obj.get("kind") == "UNIT" and obj.get("unit_type") == "WORKER":
+            obj["cargo"] = 1
+    state = _state(resources=150, population=30, objects=objects)
+    turn = _turn(state)
+
+    decide(turn)
+
+    action = _core_action(turn.plan)
+    assert action is not None
+    assert action.type == "SPAWN"
+    assert action.unit_type == UnitType.WORKER
+    assert tactic._resource_telemetry["full_core_loaded"] == 1
     assert tactic._resource_telemetry["capacity_elevator"] == 1
 
 

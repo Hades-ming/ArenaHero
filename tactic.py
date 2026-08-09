@@ -89,9 +89,9 @@ FREE_UPKEEP_CAP = 20
 # army-short gate still prevent draining deposits to r0.
 TARGET_WORKERS = FREE_UPKEEP_CAP
 # Capacity-elevator experiment: allow exactly one additional Worker beyond the
-# historical W21 ceiling, but only through the strict full-Core/all-laden gate
+# previous W22 ceiling, but only through the strict full-Core/all-laden gate
 # below. This does not reopen ordinary peaceful Worker growth.
-MAX_WORKERS = FREE_UPKEEP_CAP + 2
+MAX_WORKERS = FREE_UPKEEP_CAP + 3
 # Bank reserve: never spend down to zero on a Worker spawn. A spawn must leave
 # the Core with at least this many resources afterward, so the economy keeps a
 # positive balance and the standing-army bank (toward the 10/12 combat Unit)
