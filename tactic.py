@@ -1981,6 +1981,7 @@ def _worker_sector_patrol_target(
     tick: int,
     blocked: frozenset[tuple[int, int]],
     reserved: frozenset[tuple[int, int]] = frozenset(),
+    cohort_rank: int | None = None,
 ) -> tuple[int, int] | None:
     """为前沿不足时的空载 Worker 选择四向分散巡查站点。
 
@@ -2000,8 +2001,14 @@ def _worker_sector_patrol_target(
     ) % 6
     # 站点按 NW/NE/SE/SW 四组各六个排列。用 Worker 序号的模 4 先锁定
     # 象限，再在该象限内轮换站点，保证当前人口上限内的 Worker 不复用目标。
-    quadrant = worker_index % 4
-    within_quadrant = (worker_index // 4 + phase) % 6
+    # ``worker_index`` 是完整 Worker 舰队中的索引。回扫队列刻意从空载
+    # Worker 子集中选取（较小索引的 Worker 可能正在带货或已有资源任务），
+    # 直接使用 ``worker_index % 4`` 会让全部回扫 Worker 落入同一象限；例如
+    # 索引 [1, 5, 9, 13] 会全部映射到 NE。对当前巡查 cohort 连续编号，
+    # 同时保留旧参数作为直接调用/旧测试的兼容回退。
+    patrol_index = worker_index if cohort_rank is None else cohort_rank
+    quadrant = patrol_index % 4
+    within_quadrant = (patrol_index // 4 + phase) % 6
     start = quadrant * 6 + within_quadrant
     cx, cy = core_pos
     for offset in range(len(_WORKER_SECTOR_OFFSETS)):
@@ -2215,6 +2222,15 @@ def _control_workers(turn: "Turn", core_pos: tuple[int, int]) -> None:
 
     stable_workers = sorted(turn.workers, key=lambda worker: str(worker.id))
     stable_index = {str(worker.id): index for index, worker in enumerate(stable_workers)}
+    # 回扫 Worker 来自空载子集，其舰队索引不保证连续。为当前扇区巡查
+    # cohort 使用紧凑排名；否则类似 [1, 5, 9, 13] 的子集会把四个 Worker
+    # 全部映射到同一个 ``worker_index % 4`` 象限。
+    sector_patrol_rank: dict[str, int] = {}
+    ranked_patrol_ids = set(sector_patrol_worker_ids)
+    if sector_patrol_mode:
+        ranked_patrol_ids.update(worker_id for worker_id, _ in frontier_workers)
+    for rank, worker_id in enumerate(sorted(ranked_patrol_ids)):
+        sector_patrol_rank[worker_id] = rank
     worker_order = sorted(
         stable_workers,
         key=lambda worker: (worker.cargo == 0, str(worker.id)),
@@ -2536,12 +2552,14 @@ def _control_workers(turn: "Turn", core_pos: tuple[int, int]) -> None:
             and (sector_patrol_mode or wid in sector_patrol_worker_ids)
             and wid not in resource_assignments
         ):
+            patrol_rank = sector_patrol_rank.get(wid)
             sector_target = _worker_sector_patrol_target(
                 orig_index,
                 core_pos,
                 turn.tick,
                 blocked_empty,
                 reserved=frozenset(sector_patrol_reserved),
+                cohort_rank=patrol_rank,
             )
             if sector_target is not None:
                 sector_patrol_reserved.add(sector_target)

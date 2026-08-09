@@ -781,6 +781,34 @@ def test_worker_waits_at_refresh_patrol_station_instead_of_falling_back(
     assert action.type == "WAIT"
 
 
+def test_worker_refresh_subset_is_reindexed_by_cohort_rank(monkeypatch) -> None:
+    """实际控制器不能把有间隔的空载索引全派到同一象限。"""
+    positions = [(0, index + 1) for index in range(15)]
+    cargo = [1 if index not in {1, 5, 9, 13, 14} else 0 for index in range(15)]
+    turn = _turn(_workers_state(positions, cargo=cargo), tick=20)
+    captured: list[tuple[int, int | None]] = []
+
+    def fake_sector_target(
+        worker_index,
+        core_pos,
+        tick,
+        blocked,
+        reserved=frozenset(),
+        cohort_rank=None,
+    ):
+        captured.append((worker_index, cohort_rank))
+        return (20 + (cohort_rank or 0), 20)
+
+    monkeypatch.setattr(tactic, "_worker_sector_patrol_target", fake_sector_target)
+    monkeypatch.setattr(tactic, "_patrol_step", lambda *args, **kwargs: Direction.RIGHT)
+    monkeypatch.setattr(tactic, "_assign_explore_targets", lambda *args, **kwargs: {})
+    monkeypatch.setattr(tactic, "_explore_step", lambda *args, **kwargs: Direction.LEFT)
+
+    tactic._control_workers(turn, turn.core.position)
+
+    assert captured[:4] == [(1, 0), (5, 1), (9, 2), (13, 3)]
+
+
 def test_frontier_reassignment_keeps_refresh_patrols_reserved(monkeypatch) -> None:
     """前沿停滞重派不能抢走四个 Chunk 回扫 Worker。"""
     turn = _turn(
@@ -1445,6 +1473,29 @@ def test_worker_sector_patrol_covers_four_quadrants_when_frontier_is_exhausted()
             index, (0, 0), tick=240, blocked=frozenset()
         )
         for index in range(8)
+    ]
+
+    assert all(target is not None for target in targets)
+    quadrants = {
+        (1 if target[0] > 0 else -1, 1 if target[1] > 0 else -1)
+        for target in targets
+    }
+    assert len(quadrants) == 4
+    assert len(set(targets)) == len(targets)
+
+
+def test_worker_sector_patrol_reindexes_idle_subset_across_quadrants() -> None:
+    """空载子集的原始索引有间隔时仍要覆盖不同象限。"""
+    original_indices = [1, 5, 9, 13]
+    targets = [
+        tactic._worker_sector_patrol_target(
+            worker_index,
+            (0, 0),
+            tick=0,
+            blocked=frozenset(),
+            cohort_rank=rank,
+        )
+        for rank, worker_index in enumerate(original_indices)
     ]
 
     assert all(target is not None for target in targets)

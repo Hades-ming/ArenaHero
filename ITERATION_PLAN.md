@@ -970,3 +970,24 @@
 - **回滚**：若连续两个完整相位仍出现站点到达后下一 Tick 非预期 MOVE、四象限覆盖无改善且入核率
   下降 10%，或出现 `CELL_UNIT_LIMIT`/`MOVE_CONTESTED`、Core/窗口/协议故障，只反向提交本修复；
   保留持久地图、`uv.lock` 与用户已有 archive 文件。
+
+## `RESOURCE-DISPATCH-021` 回扫 cohort 重新编号修复 Worker 象限偏置（STATIC_VERIFIED，待 live canary，2026-08-09）
+
+- **问题证据**：`t79059..t79078` 的 20 Tick 观察中，四个固定回扫 Worker 的完整 Worker 索引为
+  `[1,5,9,13]`，原逻辑按全体舰队索引 `%4` 计算象限，四者全部落在 NE；该窗口 Worker 聚合为
+  `NW646/NE829/SW326/SE196`，北侧占 `70.2%`。战斗单位仍维持近/远两层巡逻，未见移动、资源或伤亡失败。
+- **可证伪假设**：回扫 Worker 的子集索引空洞是偏置主因；将当前巡查 cohort 连续编号后，四名回扫
+  Worker 应覆盖至少三个、目标设计上四个象限，同时不改变资源任务优先级、128 Tick 驻留、战斗巡逻
+  或人口生产。
+- **单一变更**：`_worker_sector_patrol_target()` 新增可选 `cohort_rank`；`_control_workers()` 对
+  当前回扫/扇区巡查子集按稳定 UUID 连续编号，再传入该排名。没有排名时保留原索引兼容行为。
+- **回归覆盖**：新增间隔索引 `[1,5,9,13]` 的直接站点象限测试，以及真实控制器确认传入排名
+  `[(1,0),(5,1),(9,2),(13,3)]`；全量 `pytest 195 passed`，`compileall`、`uv pip check`、
+  `git diff --check` 通过。
+- **live canary**：提交后重启唯一实例，从新进程首个完整状态开始观察至少 20 Tick；要求全 Tick
+  `ST[ACCEPTED]`、无窗口/提交/协议/移动/资源失败、无 Unit/Core 死亡或 Core 伤害。记录固定回扫
+  目标的象限覆盖、`max_sector_share`、站点唯一数、资源 `HARVEST→DEPOSIT` 链路与
+  `decide_ms P95/P99`。随后至少跨一个 128 Tick 回扫驻留轮换，再判断长期收益。
+- **停止/回滚**：若连续两个 50-Tick 窗口仍出现四名回扫全在一象限，或入核资源/Tick 下降 10%、
+  `MOVE_CONTESTED`/`CELL_UNIT_LIMIT`/资源失败、Core/窗口/协议故障，反向提交本任务；不回滚已验证的
+  战斗巡逻和持久地图逻辑。
