@@ -1055,3 +1055,31 @@
 - **回滚**：出现任一窗口/协议/提交错误、移动/资源失败、伤亡/Core 受击，或扩容后两个干净
   `100`-Tick 窗口的 gross 入核下降 `10%`、链路 P95 上升 `25%`、`256–300` Tick 仍未回收成本，
   只反向提交本任务；不回滚已验证的持久地图、Worker cohort 重编号或战斗巡逻。
+
+## `RESOURCE-DISPATCH-022` 巡查绕障回退修复与恢复后观察（RECOVERY_OBSERVING，2026-08-09）
+
+- **问题证据**：`b8171b8` 修复 boxed Worker 抢占回扫意图后，真实障碍地图仍可能要求巡查站点
+  路径先回一步；`_patrol_step()` 若同时使用 Worker 的 anti-backtrack 历史，会屏蔽这一步，A*
+  随后退回贪心路径，在 Core 周边形成局部四格小环。该问题会让站点“目标生成正确”但实际到站时间
+  失真，不能据此把 NW 偏置归因于象限配额。
+- **单一变更**：提交 `c3cfd3e` 仅在有明确巡查站点目标时传入 `avoid=None`，允许 A* 为绕障回步；
+  无目标的自由扫掠、带货回 Core 仍保留最近位置 anti-backtrack。配套回归确认巡查调用不再传入
+  历史避让集合；未改变资源优先级、四象限站点、128 Tick 驻留、战斗巡逻、人口或生产门槛。
+- **静态验收**：全量 `pytest 197 passed`；`compileall`、`uv pip check`、`git diff --check`
+  均通过。当前 `HEAD=origin/main=c3cfd3e`，SDK `0.2.9`、规则 `v0.14` 未变。
+- **live 证据（截至 `t79517`）**：唯一 LaunchAgent PID `40708`。`t79454` 出现 1 次
+  `TRANSPORT_ERROR`，不能把该段称为无错误 canary；错误后 `t79455..t79517` 共 `63` 个连续
+  `ST[ACCEPTED]` Tick，未再出现提交/窗口/协议错误、移动/资源失败、Unit/Core 损失或 Core 受击。
+  编制保持 `pop29(W21/V4/R4)`、Core `5/5`、库存 `145/145`；该恢复段有 `5` 次自然采集、
+  `0` 次交付（容量已满）。Worker 位置采样约为 `NW 41.9% / NE 19.0% / SW 19.2% /
+  SE 17.2%`，另有 `2.7%` 同轴；`decide_ms` P95 约 `200ms`，本地总耗时 P95 约 `9.82s`，
+  低于 15 秒窗口但提交长尾仍需监控。
+- **专家结论**：当前持久地图约 `7580` 个已探索格、`1208` 个障碍；半径 40 内仅剩两个真实
+  前沿候选，巡查站点重放目标约为 `NW6/NE5/SE5/SW5`。`_EXPLORATION_SECTOR_COVER=4` 在该
+  场景不是 NW 偏置根因。资源出现/消失时，回扫 cohort 会从固定四人切换为全部空载 Worker，
+  连续重排 `cohort_rank`，可能造成站点目标在短窗频繁换位；需要先用只读遥测确认，不能立即改策略。
+- **下一步与停止条件**：至少跨进程锚点后的一个完整 `128` Tick 驻留相位（最好两个），新增
+  `frontier_target_sector`、`patrol_target_sector`、A* ETA 与到站 `WAIT` 比例遥测；期间保持唯一
+  进程、全 Tick accepted、无移动/资源失败、无伤亡/Core 受击，且 `decide_ms P95<1000ms`、
+  `P99<2000ms`。若两个相位后遥测仍证明目标分配失衡，再单变量评估 `COVER=4→8` 或稳定
+  `worker_id→patrol_quadrant`；在此之前不修改巡查半径、人口和战斗逻辑。
