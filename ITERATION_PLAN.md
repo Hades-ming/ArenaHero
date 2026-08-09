@@ -1022,7 +1022,7 @@
   链路并观察第二相位，再决定是否只读修正 `NO_RAID` 监控半径或调整经济扩容。暂不改变战斗巡逻、
   hunt 半径、人口生产或资源任务优先级。
 
-## `ECONOMY-CAP-008` 解除历史 W21 容量电梯上限（STATIC_VERIFIED，待 LIVE_CANARY，2026-08-09）
+## `ECONOMY-CAP-008` 解除历史 W21 容量电梯上限（SAFE_CANARY_VERIFIED，长窗观察中，2026-08-09）
 
 - **当前事实**：规则 gameplay `v0.14` 没有人口 20 硬上限，SDK `0.2.9`；但策略的
   `FREE_UPKEEP_CAP=20`、`ECONOMY_BRIDGE_MAX_WORKERS=15` 只是和平期软预算。当前 live
@@ -1047,6 +1047,11 @@
   压力不足”，不继续盲目放宽。若触发，记录 `CORE_SPAWN_SUCCEEDED` 实际成本、容量变化、
   `DEPOSIT`/Tick、完整链路 P50/P95 与扩容后 `256–300` Tick 净资源回本情况；当前基线 gross
   入核约 `0.0618/Tick`，扩容后至少提升 `5%` 且能回收一次 `8` 资源成本才可保留。
+- **20-Tick 安全结果（2026-08-09）**：提交 `37e9336` 后重启唯一 PID `35678`，新进程边界为
+  `t79316..t79335`，严格窗口 `20/20` 均为 `ST[ACCEPTED]`。编制保持 `pop29(W21/V4/R4)`，Core
+  `5/5`，资源 `138→141/145`；事件只有合法 `UNIT_MOVE_SUCCEEDED` 与 `DEPOSIT_SUCCEEDED`，无窗口、
+  提交、协议、移动/资源失败、Unit/Core 损失或 Core 受击。`full_core_loaded=0`、`capacity_elevator=0`
+  全窗，说明 W22 门槛未触发；这只是安全验证，不是吞吐收益证明。
 - **回滚**：出现任一窗口/协议/提交错误、移动/资源失败、伤亡/Core 受击，或扩容后两个干净
   `100`-Tick 窗口的 gross 入核下降 `10%`、链路 P95 上升 `25%`、`256–300` Tick 仍未回收成本，
   只反向提交本任务；不回滚已验证的持久地图、Worker cohort 重编号或战斗巡逻。
