@@ -971,7 +971,7 @@
   下降 10%，或出现 `CELL_UNIT_LIMIT`/`MOVE_CONTESTED`、Core/窗口/协议故障，只反向提交本修复；
   保留持久地图、`uv.lock` 与用户已有 archive 文件。
 
-## `RESOURCE-DISPATCH-021` 回扫 cohort 重新编号修复 Worker 象限偏置（STATIC_VERIFIED，待 live canary，2026-08-09）
+## `RESOURCE-DISPATCH-021` 回扫 cohort 重新编号修复 Worker 象限偏置（OBSERVING，2026-08-09）
 
 - **问题证据**：`t79059..t79078` 的 20 Tick 观察中，四个固定回扫 Worker 的完整 Worker 索引为
   `[1,5,9,13]`，原逻辑按全体舰队索引 `%4` 计算象限，四者全部落在 NE；该窗口 Worker 聚合为
@@ -991,3 +991,10 @@
 - **停止/回滚**：若连续两个 50-Tick 窗口仍出现四名回扫全在一象限，或入核资源/Tick 下降 10%、
   `MOVE_CONTESTED`/`CELL_UNIT_LIMIT`/资源失败、Core/窗口/协议故障，反向提交本任务；不回滚已验证的
   战斗巡逻和持久地图逻辑。
+- **首轮 live canary**：提交 `fbd59d0` 后重启唯一 LaunchAgent 实例 PID `22321`，从新进程边界
+  严格统计 `t79106..t79125` 的 20 个唯一 Tick。20/20 为 `ST[ACCEPTED]`，重复/失败/窗口/提交/
+  决策错误、Tick 缺口、`MOVE_CONTESTED`、`CELL_UNIT_LIMIT`、资源失败、Unit/Core 死亡和 Core 受击
+  均为 0；Core 保持 `hp5/sh5`，人口保持 `29 (W21/V4/R4)`。窗口采集 3、入核 1（净入核 `+1`），
+  资源从 `127/145` 未下降；`decide_ms` 最大 217ms，未触及时限门槛。该 canary 只证明安全和运行
+  正确性，未记录到完整巡查目标象限遥测，不能据此宣称长期收益已提升；继续观察至少一个 128-Tick
+  驻留周期和 50 条完整采集→入核链路。
