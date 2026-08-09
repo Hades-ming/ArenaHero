@@ -946,7 +946,7 @@
   `25%`，或出现移动竞态、Core/窗口/协议故障，只恢复本任务的战术提交；保留持久地图、`uv.lock`
   与用户已有 archive 文件。
 
-## `RESOURCE-DISPATCH-020` 修复巡查站点到达后的隐式回退（STATIC_VERIFIED，待新版本 canary，2026-08-09）
+## `RESOURCE-DISPATCH-020` 修复巡查站点到达后的隐式回退（SAFE_CANARY_VERIFIED，继续观察，2026-08-09）
 
 - **问题证据**：专家用真实 Worker 夹具复现：`_patrol_step()` 在 `pos == goal` 时返回 `None`，
   `_control_workers()` 随后把该结果当成“没有巡查动作”，继续调用 `_explore_step()`；因此 Worker
@@ -957,10 +957,16 @@
   站点预约均不变，避免把多个行为变量混入同一轮。
 - **回归覆盖**：新增 Worker 到站防止 `_explore_step()` 回退、近/远战斗巡逻到站显式 `WAIT` 两项
   测试；全量 `pytest` `193 passed`，`compileall`、`uv pip check`、`git diff --check` 通过。
-- **上线验收**：提交后重启唯一 LaunchAgent，排除重启边界，从新版本完整 state 开始做 20-Tick
-  canary；随后观察至少两个 128-Tick 巡查相位。必须同时满足全 Tick accepted、无窗口/提交/移动/
-  资源失败、无伤亡/Core 伤害、`decide_ms P95<1000ms/P99<2000ms`，再比较到站 WAIT 比例、四象限
-  覆盖、发现→采集→入核延迟和净资源/Tick。安全窗口不等于收益提升。
+- **20-Tick canary（2026-08-09）**：提交 `6045042` 后重启唯一 PID `18966`；严格窗口
+  `t79015..t79034` 共 `20` 个唯一 `ST[ACCEPTED]` Tick，重复/缺口/窗口/提交错误均为 `0`。
+  无 `MOVE_CONTESTED`、`CELL_UNIT_LIMIT`、资源失败、Unit/Core 损失或 Core 伤害；库存 `120→122`，
+  自然采集 `1`、交付 `2`，人口稳定 `29 (W21/V4/R4)`。`decide_ms P50/P95/P99=`
+  `96/181.75/193.15ms`，本地总耗时 `P50/P95/P99=1156.5/1230.35/1250.87ms`，均低于命令窗口。
+  日志确认回扫 Worker 在到站后持续提交 `WAIT`，没有被 `_explore_step()` 覆盖；该窗口只证明安全和
+  驻留生效，不证明长期收益提升。
+- **后续验收**：继续保持唯一实例，至少观察两个完整 128-Tick 巡查相位；同时比较到站 WAIT 比例、
+  四象限覆盖、发现→采集→入核延迟和净资源/Tick。必须继续满足全 Tick accepted、无窗口/提交/移动/
+  资源失败、无伤亡/Core 伤害、`decide_ms P95<1000ms/P99<2000ms`。
 - **回滚**：若连续两个完整相位仍出现站点到达后下一 Tick 非预期 MOVE、四象限覆盖无改善且入核率
   下降 10%，或出现 `CELL_UNIT_LIMIT`/`MOVE_CONTESTED`、Core/窗口/协议故障，只反向提交本修复；
   保留持久地图、`uv.lock` 与用户已有 archive 文件。
