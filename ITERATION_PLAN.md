@@ -906,7 +906,7 @@
   安全结论，不放宽容量电梯或继续生产普通 Worker；若连续两个 50-Tick 窗口出现敌格 MOVE、
   `CELL_UNIT_LIMIT`、Core/窗口/协议故障，再回滚本单变量修复。
 
-## `RESOURCE-DISPATCH-019` 四个 Worker 固定四象限回扫（STATIC_VERIFIED，待 LIVE_CANARY，2026-08-09）
+## `RESOURCE-DISPATCH-019` 四个 Worker 固定四象限回扫（SAFE_CANARY_VERIFIED，长窗观察中，2026-08-09）
 
 - **用户问题与基线**：持久地图已积累后，Worker 历史上长期集中在北/东区域，约有 `2000` 个 Tick
   没有采集；长窗的象限占比约为 `WN 49% / EN 30% / WS 12.5% / ES 8.4%`。最近 `500` Tick
@@ -920,11 +920,16 @@
 - **静态验收**：增加“前沿目标存在时仍保留四象限回扫”回归，修正旧的两名巡查断言；全量
   `pytest` `191 passed`，`compileall`、`uv pip check`、`git diff --check` 均通过。由于虚拟环境
   未安装 `pip`，依赖检查使用官方 `uv pip check`。
-- **上线与 canary**：当前 PID `33191` 仍是旧版本，提交后只重启一个 `play.py`，从重启边界之后的
-  下一完整 authoritative Tick 开始统计。先验收连续 `20` 个唯一 Tick：无认证/协议/提交/窗口错误、
-  无 `HARVEST_FAILED`、`MOVE_CONTESTED`、`CELL_UNIT_LIMIT`、Core/Unit 损失；再累计 `100–200`
-  个 Tick 与至少 `50` 条 `HARVEST_SUCCEEDED → DEPOSIT_SUCCEEDED` 链路，比较四象限占比、发现→
-  分配延迟、入核资源/Tick、完整链路 P50/P95、刷新名额和决策耗时。安全 canary 不等于收益提升。
+- **20-Tick 安全 canary（2026-08-09）**：提交 `3cb7b94` 后只重启一个实例，新 PID `13209`；重启
+  边界 `t78812` 的一次 `TICK_MISMATCH` 单独剔除，严格窗口 `t78813..t78832` 共 `20` 个唯一
+  `ST[ACCEPTED]` Tick，重复/失败/窗口错误均为 `0`。无 `MOVE_CONTESTED`、`CELL_UNIT_LIMIT`、
+  `HARVEST_FAILED`、Unit/Core 损失或 Core 伤害；资源 `97→101`，自然采集 `2`、交付 `5`、完整
+  采集→入核配对 `1`，刷新预约 `12` 次。`decide_ms` P50/P95/P99=`141/382.25/583.65ms`，
+  本地总耗时 P50/P95/P99=`1184.5/1408.7/1601.74ms`，均低于 15 秒窗口；该结果只证明安全，
+  不证明四象限长期覆盖或净资源收益提升。
+- **后续观察**：继续保持唯一实例，累计 `100–200` 个 Tick 与至少 `50` 条
+  `HARVEST_SUCCEEDED → DEPOSIT_SUCCEEDED` 链路，比较四象限占比、发现→分配延迟、入核资源/Tick、
+  完整链路 P50/P95、刷新名额和决策耗时。安全 canary 不等于收益提升。
 - **回滚**：若连续两个 `100`-Tick 窗口入核率下降 `10%`、四象限仍未改善、完整链路 P95 上升
   `25%`，或出现移动竞态、Core/窗口/协议故障，只恢复本任务的战术提交；保留持久地图、`uv.lock`
   与用户已有 archive 文件。
