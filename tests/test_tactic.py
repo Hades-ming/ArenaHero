@@ -753,6 +753,34 @@ def test_refresh_patrols_keep_four_quadrants_even_with_frontier_targets(
     )
 
 
+def test_worker_waits_at_refresh_patrol_station_instead_of_falling_back(
+    monkeypatch,
+) -> None:
+    """回扫 Worker 到站后不能被通用扫掠逻辑立刻带离站点。"""
+    turn = _turn(_workers_state([(0, 1), (0, 2), (0, 3), (0, 4)]), tick=20)
+    tactic._explored_cells.add((0, 0))
+
+    def fake_sector_target(worker_index, *_args, **_kwargs):
+        return (0, 1) if worker_index == 0 else (20 + worker_index, 20)
+
+    monkeypatch.setattr(tactic, "_worker_sector_patrol_target", fake_sector_target)
+    monkeypatch.setattr(
+        tactic,
+        "_patrol_step",
+        lambda pos, goal, *_args, **_kwargs: (
+            None if pos == goal else Direction.RIGHT
+        ),
+    )
+    # 若到站仍落入旧的通用扫掠回退，这个动作会变成 MOVE RIGHT。
+    monkeypatch.setattr(tactic, "_explore_step", lambda *args, **kwargs: Direction.RIGHT)
+
+    tactic._control_workers(turn, turn.core.position)
+
+    action = _action(turn.plan, UUID(int=0x6000))
+    assert action is not None
+    assert action.type == "WAIT"
+
+
 def test_frontier_reassignment_keeps_refresh_patrols_reserved(monkeypatch) -> None:
     """前沿停滞重派不能抢走四个 Chunk 回扫 Worker。"""
     turn = _turn(
@@ -3868,6 +3896,33 @@ def test_successful_patrol_move_is_not_overwritten_by_fallback(monkeypatch) -> N
         str(UUID(int=0x4002)),
     }
     assert all(calls.get(unit_id) == 1 for unit_id in patrol_ids)
+
+
+def test_patrol_combat_pair_waits_explicitly_at_assigned_stations() -> None:
+    """近/远巡逻队到站后应提交 WAIT，而不是依赖隐式空动作。"""
+    state = _state_with_workers(
+        n_workers=0,
+        resources=0,
+        n_vanguards=1,
+        n_rangers=2,
+    )
+    turn = _turn(state, tick=48)
+    vanguard = turn.vanguards[0]
+    patrol_ranger = turn.rangers[1]
+    patrol_goals = {
+        str(vanguard.id): tuple(vanguard.position),
+        str(patrol_ranger.id): tuple(patrol_ranger.position),
+    }
+
+    tactic._control_vanguards(turn, turn.core.position, patrol_goals=patrol_goals)
+    tactic._control_rangers(turn, turn.core.position, patrol_goals=patrol_goals)
+
+    vanguard_action = _action(turn.plan, vanguard.id)
+    ranger_action = _action(turn.plan, patrol_ranger.id)
+    assert vanguard_action is not None
+    assert ranger_action is not None
+    assert vanguard_action.type == "WAIT"
+    assert ranger_action.type == "WAIT"
 
 
 def test_vanguard_keeps_guard_route_when_enemy_is_visible(monkeypatch) -> None:

@@ -945,3 +945,22 @@
 - **回滚**：若连续两个 `100`-Tick 窗口入核率下降 `10%`、四象限仍未改善、完整链路 P95 上升
   `25%`，或出现移动竞态、Core/窗口/协议故障，只恢复本任务的战术提交；保留持久地图、`uv.lock`
   与用户已有 archive 文件。
+
+## `RESOURCE-DISPATCH-020` 修复巡查站点到达后的隐式回退（STATIC_VERIFIED，待新版本 canary，2026-08-09）
+
+- **问题证据**：专家用真实 Worker 夹具复现：`_patrol_step()` 在 `pos == goal` 时返回 `None`，
+  `_control_workers()` 随后把该结果当成“没有巡查动作”，继续调用 `_explore_step()`；因此 Worker
+  到达 128-Tick 回扫站点后会立刻离站，文档声称的驻留窗口没有真正成立。旧进程
+  `t78940..t78999` 的方向统计不能验证本修复，且已停止旧监测会话。
+- **单一修复**：Worker 在回扫站点到达时显式提交 `WAIT` 并结束本 Tick；Vanguard/Ranger 在近/远
+  巡逻站点到达时同样显式 `WAIT`。敌情攻击、治疗、护核、资源分配、`min(4, N-1)` 前沿余量和
+  站点预约均不变，避免把多个行为变量混入同一轮。
+- **回归覆盖**：新增 Worker 到站防止 `_explore_step()` 回退、近/远战斗巡逻到站显式 `WAIT` 两项
+  测试；全量 `pytest` `193 passed`，`compileall`、`uv pip check`、`git diff --check` 通过。
+- **上线验收**：提交后重启唯一 LaunchAgent，排除重启边界，从新版本完整 state 开始做 20-Tick
+  canary；随后观察至少两个 128-Tick 巡查相位。必须同时满足全 Tick accepted、无窗口/提交/移动/
+  资源失败、无伤亡/Core 伤害、`decide_ms P95<1000ms/P99<2000ms`，再比较到站 WAIT 比例、四象限
+  覆盖、发现→采集→入核延迟和净资源/Tick。安全窗口不等于收益提升。
+- **回滚**：若连续两个完整相位仍出现站点到达后下一 Tick 非预期 MOVE、四象限覆盖无改善且入核率
+  下降 10%，或出现 `CELL_UNIT_LIMIT`/`MOVE_CONTESTED`、Core/窗口/协议故障，只反向提交本修复；
+  保留持久地图、`uv.lock` 与用户已有 archive 文件。

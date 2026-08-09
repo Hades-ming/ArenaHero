@@ -2552,6 +2552,11 @@ def _control_workers(turn: "Turn", core_pos: tuple[int, int]) -> None:
                     blocked_empty,
                     avoid=_avoid_set(wid),
                 )
+                if pos == sector_target:
+                    # 到达回扫站点后必须显式驻留；否则下面的通用前沿扫掠
+                    # 会覆盖这个“无移动”结果，把 Worker 立刻带离站点。
+                    worker.wait()
+                    continue
         if step is None:
             step = _explore_step(
                 orig_index, wid, pos, core_pos, blocked_empty,
@@ -2765,6 +2770,7 @@ def _control_vanguards(
             # 近核，造成巡逻队在同一侧往返。若目标因障碍不可达，则继续
             # 走护核目标，不能让失效巡逻意图让 Vanguard 长期失守。
             if vanguard.position == patrol_target:
+                vanguard.wait()
                 continue
         target = targets.get(str(vanguard.id))
         # A Vanguard at full HP (4) can absorb one more hit before dying; a 1-HP
@@ -3251,6 +3257,7 @@ def _control_rangers(
             # 因障碍不可达，则继续执行后面的旧巡查/护核回退，不能让失效
             # 巡逻意图把 Ranger 锁死。
             if pos == patrol_target:
+                ranger.wait()
                 continue
         # Boxed-in escape (same pocket-cycle trap as workers): if the Ranger's
         # recent positions fit a tiny box, it is spinning in an obstacle pocket
