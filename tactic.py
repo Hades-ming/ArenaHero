@@ -2297,12 +2297,18 @@ def _control_workers(turn: "Turn", core_pos: tuple[int, int]) -> None:
             _prev_pos.pop(wid, None)
             _last_pos.pop(wid, None)
             _stuck_ticks[wid] = 0
-            step = _step_away_from(pos, core_pos, reserved_away, avoid=None)
-            if step is not None:
-                _prev_pos[wid] = pos
-                _record_pos(wid, pos)
-                queue_worker_move(worker, step)
-                continue
+            # 固定回扫 cohort 的方向由四象限站点决定。若先执行通用
+            # ``_step_away_from``，boxed Worker 会被送回最近的 Core 外侧，
+            # 直接跳过后面的 patrol 分支；真实地图上这会让 SW cohort
+            # 长期留在 NW。清理循环记忆仍然保留，但让回扫 Worker 继续
+            # 执行本 Tick 的站点路径；普通 Worker 仍沿用原来的脱困动作。
+            if wid not in sector_patrol_worker_ids:
+                step = _step_away_from(pos, core_pos, reserved_away, avoid=None)
+                if step is not None:
+                    _prev_pos[wid] = pos
+                    _record_pos(wid, pos)
+                    queue_worker_move(worker, step)
+                    continue
         # Detect a stuck Worker (no movement for STUCK_TICKS): reset its
         # exploration state and anti-backtrack memory so it can pick a fresh
         # direction instead of WAITing forever in a self-made deadlock.

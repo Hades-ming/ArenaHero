@@ -781,6 +781,42 @@ def test_worker_waits_at_refresh_patrol_station_instead_of_falling_back(
     assert action.type == "WAIT"
 
 
+def test_boxed_refresh_worker_keeps_patrol_intent(monkeypatch) -> None:
+    """回扫 Worker 脱困时不能被通用远离 Core 步骤抢走方向。"""
+    turn = _turn(
+        _workers_state([(0, 1), (0, 2), (0, 3), (0, 4)]),
+        tick=20,
+    )
+    first_worker_id = str(UUID(int=0x6000))
+    tactic._pos_history[first_worker_id] = [
+        (0, 1),
+        (0, 2),
+        (0, 1),
+        (0, 2),
+    ]
+    patrol_calls: list[tuple[tuple[int, int], tuple[int, int]]] = []
+
+    def fake_sector_target(_worker_index, _core_pos, _tick, _blocked, **_kwargs):
+        return (20, 20)
+
+    def fake_patrol_step(pos, goal, *_args, **_kwargs):
+        patrol_calls.append((tuple(pos), tuple(goal)))
+        return Direction.RIGHT
+
+    monkeypatch.setattr(tactic, "_worker_sector_patrol_target", fake_sector_target)
+    monkeypatch.setattr(tactic, "_patrol_step", fake_patrol_step)
+    monkeypatch.setattr(tactic, "_explore_step", lambda *args, **kwargs: Direction.LEFT)
+
+    tactic._control_workers(turn, turn.core.position)
+
+    assert patrol_calls
+    assert patrol_calls[0] == ((0, 1), (20, 20))
+    action = _action(turn.plan, UUID(int=0x6000))
+    assert action is not None
+    assert action.type == "MOVE"
+    assert action.direction == Direction.RIGHT
+
+
 def test_worker_refresh_subset_is_reindexed_by_cohort_rank(monkeypatch) -> None:
     """实际控制器不能把有间隔的空载索引全派到同一象限。"""
     positions = [(0, index + 1) for index in range(15)]
