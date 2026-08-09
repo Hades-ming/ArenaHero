@@ -794,13 +794,15 @@ def test_boxed_refresh_worker_keeps_patrol_intent(monkeypatch) -> None:
         (0, 1),
         (0, 2),
     ]
-    patrol_calls: list[tuple[tuple[int, int], tuple[int, int]]] = []
+    patrol_calls: list[
+        tuple[tuple[int, int], tuple[int, int], frozenset[tuple[int, int]] | None]
+    ] = []
 
     def fake_sector_target(_worker_index, _core_pos, _tick, _blocked, **_kwargs):
         return (20, 20)
 
     def fake_patrol_step(pos, goal, *_args, **_kwargs):
-        patrol_calls.append((tuple(pos), tuple(goal)))
+        patrol_calls.append((tuple(pos), tuple(goal), _kwargs.get("avoid")))
         return Direction.RIGHT
 
     monkeypatch.setattr(tactic, "_worker_sector_patrol_target", fake_sector_target)
@@ -810,7 +812,7 @@ def test_boxed_refresh_worker_keeps_patrol_intent(monkeypatch) -> None:
     tactic._control_workers(turn, turn.core.position)
 
     assert patrol_calls
-    assert patrol_calls[0] == ((0, 1), (20, 20))
+    assert patrol_calls[0] == ((0, 1), (20, 20), None)
     action = _action(turn.plan, UUID(int=0x6000))
     assert action is not None
     assert action.type == "MOVE"

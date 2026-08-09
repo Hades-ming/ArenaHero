@@ -2577,7 +2577,11 @@ def _control_workers(turn: "Turn", core_pos: tuple[int, int]) -> None:
                     sector_target,
                     base_blocked,
                     blocked_empty,
-                    avoid=_avoid_set(wid),
+                    # A* 的目标路径允许回到上一格绕过障碍；Worker 的
+                    # anti-backtrack 历史只适用于无目标扫掠。把它传给
+                    # 巡查站点会屏蔽唯一的回步，A* 随后退回贪心方向，
+                    # 在 Core 附近形成 UP/RIGHT/DOWN/LEFT 小环。
+                    avoid=None,
                 )
                 if pos == sector_target:
                     # 到达回扫站点后必须显式驻留；否则下面的通用前沿扫掠
