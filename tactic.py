@@ -2891,7 +2891,35 @@ def _control_vanguards(
     resources = turn.resources
     core_normal = turn.core is not None and turn.core.view.state == "NORMAL"
     reserved_destinations = _planned_move_destinations(turn)
-    for vanguard in sorted(turn.vanguards, key=lambda unit: str(unit.id)):
+    vanguards = sorted(turn.vanguards, key=lambda unit: str(unit.id))
+    rangers = sorted(turn.rangers, key=lambda unit: str(unit.id))
+    # 第一 Vanguard/第一 Ranger 始终守核；第二 Vanguard 与远端非守核
+    # Ranger 组成主动拦截队。Ranger 的目标选择仍复用同一套射击/追击闸门，
+    # 因而低资源、超出范围、冷却或路径不可达时不会把 Vanguard 拉离防线。
+    assault_vanguard_id: str | None = None
+    assault_target: tuple[int, int] | None = None
+    if len(vanguards) >= 2 and len(rangers) >= 2:
+        assault_vanguard_id = str(vanguards[1].id)
+        # 有第三名 Ranger 时使用远端巡逻对；只有一名非守核 Ranger 时，
+        # 回退到它作为拦截队的射手。
+        assault_ranger = rangers[2] if len(rangers) >= 3 else rangers[1]
+        direct_target = _select_ranger_target(
+            assault_ranger.position, enemies, obstacles, core_pos
+        )
+        if direct_target is not None:
+            assault_target = tuple(direct_target.position)
+        else:
+            assault_target = _chase_target(
+                tuple(assault_ranger.position),
+                core_pos,
+                enemies,
+                str(assault_ranger.id),
+                turn.tick,
+                turn.resources,
+                turn.state.population,
+            )
+
+    for vanguard in vanguards:
         # Resolve a legal combat action before considering recovery.  HEAL is
         # valuable, but giving up a guaranteed hit lets the enemy live for an
         # extra Tick and can cost the Core or the entire resource stockpile.
@@ -2916,6 +2944,32 @@ def _control_vanguards(
             vanguard.heal()
             continue
         hp = getattr(vanguard, "hp", 4)
+        # 主动歼灭编组：让远端 Vanguard 追到敌方格的相邻位置，下一 Tick
+        # 由现有的相邻 SWEEP 完成攻击。敌方格保持阻塞，避免提交必败的
+        # MOVE_DESTINATION_OCCUPIED；第一 Vanguard 仍只走护核路线。
+        if (
+            str(vanguard.id) == assault_vanguard_id
+            and assault_target is not None
+            and hp > 1
+            and tuple(vanguard.position) != assault_target
+        ):
+            blocked = (
+                obstacles | enemy_positions | friendly_full | {core_pos}
+            ) - {tuple(vanguard.position)}
+            step = _astar_step(
+                tuple(vanguard.position), assault_target, obstacles, blocked
+            )
+            if step is None:
+                step = _step_toward(
+                    tuple(vanguard.position),
+                    assault_target,
+                    blocked,
+                    avoid=_avoid_set(str(vanguard.id)),
+                )
+            if step is not None and _queue_combat_move(
+                vanguard, step, reserved_destinations
+            ):
+                continue
         patrol_target = (patrol_goals or {}).get(str(vanguard.id))
         if patrol_target is not None and hp > 1 and not enemies:
             blocked = obstacles | enemy_positions | friendly_full | {core_pos}

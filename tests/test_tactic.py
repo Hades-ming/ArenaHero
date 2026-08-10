@@ -3059,6 +3059,98 @@ def test_vanguard_sweeps_adjacent_enemy_cell() -> None:
     assert action.direction == Direction.RIGHT
 
 
+def test_patrol_squad_dispatches_remote_vanguard_with_ranger() -> None:
+    """资源足够时，远端 Vanguard 应跟随非守核 Ranger 主动拦截敌人。"""
+    second_vanguard = UUID(int=0x3001)
+    second_ranger = UUID("00000000-0000-4000-8000-000000000006")
+    state = _state(
+        resources=15,
+        population=5,
+        objects=[
+            {
+                "kind": "CORE",
+                "id": str(CORE_ID),
+                "controlled": True,
+                "owner_username": "arena_hero",
+                "position": [0, 0],
+                "hp": 5,
+                "shield": 5,
+                "state": "NORMAL",
+            },
+            {
+                "kind": "UNIT",
+                "id": str(WORKER_ID),
+                "controlled": True,
+                "position": [10, 10],
+                "hp": 2,
+                "unit_type": "WORKER",
+                "cargo": 0,
+            },
+            {
+                "kind": "UNIT",
+                "id": str(UUID(int=0x3000)),
+                "controlled": True,
+                "position": [3, 0],
+                "hp": 4,
+                "unit_type": "VANGUARD",
+                "cargo": None,
+            },
+            {
+                "kind": "UNIT",
+                "id": str(second_vanguard),
+                "controlled": True,
+                "position": [4, 0],
+                "hp": 4,
+                "unit_type": "VANGUARD",
+                "cargo": None,
+            },
+            {
+                "kind": "UNIT",
+                "id": str(RANGER_ID),
+                "controlled": True,
+                "position": [3, 3],
+                "hp": 2,
+                "unit_type": "RANGER",
+                "cargo": None,
+            },
+            {
+                "kind": "UNIT",
+                "id": str(second_ranger),
+                "controlled": True,
+                "position": [4, 3],
+                "hp": 2,
+                "unit_type": "RANGER",
+                "cargo": None,
+            },
+            {
+                "kind": "UNIT",
+                "id": str(ENEMY_UNIT_ID),
+                "controlled": False,
+                "position": [8, 0],
+                "hp": 2,
+                "unit_type": "RANGER",
+                "cargo": None,
+            },
+        ],
+    )
+    turn = _turn(state, tick=48)
+
+    decide(turn)
+
+    vanguard_action = _action(turn.plan, second_vanguard)
+    ranger_action = _action(turn.plan, second_ranger)
+    assert vanguard_action is not None
+    assert vanguard_action.type == "MOVE"
+    assert vanguard_action.direction == Direction.RIGHT
+    assert ranger_action is not None
+    assert ranger_action.type == "MOVE"
+    dx, dy = ranger_action.direction.delta
+    assert tactic._manhattan((4 + dx, 3 + dy), (8, 0)) < tactic._manhattan(
+        (4, 3), (8, 0)
+    )
+    assert tactic._chase_start[str(second_ranger)] == turn.tick
+
+
 def test_vanguard_steps_off_core_cell_to_unblock_deposit() -> None:
     # A Vanguard that spawned on the Core cell (Core + Vanguard = 2/2 capacity)
     # blocks laden Workers from entering the Core cell to deposit. With nothing
