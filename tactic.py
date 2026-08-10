@@ -237,6 +237,41 @@ def _advance_col_off(col_off: int) -> int:
     return col_off
 
 
+def _normalize_explore_col_off(
+    col_off: int,
+    base_col: int,
+    chunk_x_lo: int,
+    chunk_x_hi: int,
+) -> int:
+    """将持久化的列偏移环绕到当前 Worker 的可达横向范围。
+
+    ``_explore_state`` 会跨 Tick 持久化。boxed 脱困曾直接累加偏移，导致
+    重启前后状态逐步漂移到 chunk 之外；这里保留当前 chunk 加 apron 的
+    合法范围，不把前沿 Worker 的有效偏移硬截回 ``[-10, 10]``。
+    """
+    lo = chunk_x_lo - base_col
+    hi = chunk_x_hi - base_col
+    if lo > hi:
+        return 0
+    span = hi - lo + 1
+    return lo + (col_off - lo) % span
+
+
+def _bounded_advance_col_off(
+    col_off: int,
+    base_col: int,
+    chunk_x_lo: int,
+    chunk_x_hi: int,
+) -> int:
+    """在归一化后推进一列，并再次限制在可达范围内。"""
+    normalized = _normalize_explore_col_off(
+        col_off, base_col, chunk_x_lo, chunk_x_hi
+    )
+    return _normalize_explore_col_off(
+        _advance_col_off(normalized), base_col, chunk_x_lo, chunk_x_hi
+    )
+
+
 def _next_explore_col_off(
     col_off: int,
     base_col: int,
@@ -1912,6 +1947,10 @@ def _explore_step(
         if step is not None:
             return step
     col_off, south = state[0], state[1]
+    col_off = _normalize_explore_col_off(
+        col_off, base_col, chunk_x_lo, chunk_x_hi
+    )
+    _explore_state[worker_id] = [col_off, south, None, None]
     target_x = max(chunk_x_lo, min(chunk_x_hi, base_col + col_off))
 
     # First reach the assigned column, detouring vertically (never off-column)
@@ -1925,10 +1964,34 @@ def _explore_step(
     # then step the column and reverse.
     if south and pos[1] >= sweep_y_hi:
         south = 0
-        col_off = _next_explore_col_off(col_off, base_col, sweep_y_lo, sweep_y_hi, chunk_x_lo, chunk_x_hi)
+        col_off = _normalize_explore_col_off(
+            _next_explore_col_off(
+                col_off,
+                base_col,
+                sweep_y_lo,
+                sweep_y_hi,
+                chunk_x_lo,
+                chunk_x_hi,
+            ),
+            base_col,
+            chunk_x_lo,
+            chunk_x_hi,
+        )
     elif not south and pos[1] <= sweep_y_lo:
         south = 1
-        col_off = _next_explore_col_off(col_off, base_col, sweep_y_lo, sweep_y_hi, chunk_x_lo, chunk_x_hi)
+        col_off = _normalize_explore_col_off(
+            _next_explore_col_off(
+                col_off,
+                base_col,
+                sweep_y_lo,
+                sweep_y_hi,
+                chunk_x_lo,
+                chunk_x_hi,
+            ),
+            base_col,
+            chunk_x_lo,
+            chunk_x_hi,
+        )
 
     _explore_state[worker_id] = [col_off, south, None, None]
     new_target_x = max(chunk_x_lo, min(chunk_x_hi, base_col + col_off))
@@ -1947,7 +2010,9 @@ def _explore_step(
     ):
         return march
     # March blocked (or would backtrack): advance the column and step onto it.
-    col_off = _advance_col_off(col_off)
+    col_off = _bounded_advance_col_off(
+        col_off, base_col, chunk_x_lo, chunk_x_hi
+    )
     _explore_state[worker_id] = [col_off, south, None, None]
     target_col_now = base_col + col_off
     if pos[0] != target_col_now:
@@ -2293,9 +2358,18 @@ def _control_workers(turn: "Turn", core_pos: tuple[int, int]) -> None:
         if worker.cargo == 0 and _is_boxed_in(wid):
             st = _explore_state.get(wid)
             col_off = st[0] if st is not None and len(st) >= 1 else 0
+            chunk_x0, _ = _chunk_origin(core_pos)
+            chunk_x_lo = chunk_x0 - 12
+            chunk_x_hi = chunk_x0 + CHUNK_SIZE + 12 - 1
+            base_col = _worker_column(
+                orig_index, len(turn.workers), core_pos
+            )
             # Keep the half-zone direction on escape (even -> north, odd ->
             # south), otherwise a boxed escape re-sends even workers south.
-            _explore_state[wid] = [col_off + _SWEEP_COL_STEP, 1 if orig_index % 2 == 1 else 0, None, None]
+            col_off = _bounded_advance_col_off(
+                col_off, base_col, chunk_x_lo, chunk_x_hi
+            )
+            _explore_state[wid] = [col_off, 1 if orig_index % 2 == 1 else 0, None, None]
             _pos_history.pop(wid, None)
             _prev_pos.pop(wid, None)
             _last_pos.pop(wid, None)

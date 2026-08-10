@@ -4801,6 +4801,44 @@ def test_worker_sweep_directions_alternate_by_index() -> None:
     assert tactic._explore_state["worker1"][1] == 1  # odd  -> south first
 
 
+@pytest.mark.parametrize("offset", [-1_000_000, -42, 0, 42, 1_000_000])
+def test_explore_column_offset_stays_inside_worker_apron(offset: int) -> None:
+    """持久化或异常偏移都必须环绕回当前 Worker 的可达横向范围。"""
+    base_col = tactic._worker_column(0, 1, (0, 0))
+    normalized = tactic._normalize_explore_col_off(
+        offset,
+        base_col,
+        -12,
+        43,
+    )
+
+    assert -28 <= normalized <= 27
+    advanced = tactic._bounded_advance_col_off(
+        offset,
+        base_col,
+        -12,
+        43,
+    )
+    assert -28 <= advanced <= 27
+
+
+def test_explore_step_normalizes_overflowed_state_for_laden_worker() -> None:
+    """满核带货 Worker 复用探索状态时也必须先归一化列偏移。"""
+    tactic._explore_state["laden"] = [1_000_000, 0, None, None]
+
+    step = tactic._explore_step(
+        0,
+        "laden",
+        (5, 5),
+        (0, 0),
+        frozenset(),
+        fleet_size=1,
+    )
+
+    assert step is not None
+    assert -28 <= tactic._explore_state["laden"][0] <= 27
+
+
 def test_guard_ranger_holds_near_core() -> None:
     # 7th review DEF-2-1: the first Ranger is the dedicated Core guard — it
     # returns toward the Core when far instead of roaming the whole chunk, so
@@ -5111,6 +5149,41 @@ def test_boxed_in_worker_escapes_pocket() -> None:
     nxt = (5 + action.direction.delta[0], 5 + action.direction.delta[1])
     # It must not walk toward the Core (that would re-enter the pocket).
     assert tactic._manhattan(nxt, (0, 0)) >= tactic._manhattan((5, 5), (0, 0))
+
+
+def test_boxed_escape_normalizes_persisted_column_offset() -> None:
+    """boxed 脱困不能把持久化列偏移继续累加到 chunk 外。"""
+    tactic._explore_state[str(WORKER_ID)] = [1_000_000, 0, None, None]
+    tactic._pos_history[str(WORKER_ID)] = [(5, 5), (5, 6), (5, 5), (5, 6)]
+    turn = _turn(
+        _state(
+            objects=[
+                {
+                    "kind": "CORE",
+                    "id": str(CORE_ID),
+                    "controlled": True,
+                    "owner_username": "arena_hero",
+                    "position": [0, 0],
+                    "hp": 5,
+                    "shield": 5,
+                    "state": "NORMAL",
+                },
+                {
+                    "kind": "UNIT",
+                    "id": str(WORKER_ID),
+                    "controlled": True,
+                    "position": [5, 5],
+                    "hp": 2,
+                    "unit_type": "WORKER",
+                    "cargo": 0,
+                },
+            ]
+        )
+    )
+
+    tactic._control_workers(turn, (0, 0))
+
+    assert -28 <= tactic._explore_state[str(WORKER_ID)][0] <= 27
 
 
 def test_worker_harvests_resource_before_boxed_escape() -> None:
