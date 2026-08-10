@@ -60,6 +60,9 @@ PLAN_P50_MAX = 250
 PLAN_P95_MAX = 1000
 PLAN_P99_MAX = 2000
 RAID_REBUILD_RESERVE = 3
+# A visible enemy Core outside the immediate defense band may require a
+# bounded chase ETA. Do not label a single observation as a failed raid.
+RAID_DELAY_TICKS = 12
 
 
 def _percentile(values: list[int], pct: float) -> float:
@@ -106,6 +109,11 @@ class KPI:
     full_core_loaded_ticks: int = 0  # ticks with a full Core and every Worker laden
     capacity_elevator_spawns: int = 0  # bounded Worker spawns used to release that lock
     capacity_recovery_spawns: int = 0  # W26 continuation spawns that clear residual cargo
+    capital_sink_spawns: int = 0       # post-W26 combat-unit capacity exits
+    capital_sink_waiting_ticks: int = 0
+    capital_sink_repaid_resources: int = 0
+    capital_sink_chain_ticks: int = 0
+    capital_sink_price_blocks: int = 0
     resource_drops: int = 0         # ticks where resources fell > RESOURCE_DROP_THRESHOLD w/o spawn
     largest_drop: int = 0
     ticks_with_enemy_visible: int = 0
@@ -453,6 +461,11 @@ def analyze(path: str | Path) -> KPI:
                 kpi.full_core_loaded_ticks += sat.get("full", 0)
                 kpi.capacity_elevator_spawns += sat.get("elev", 0)
                 kpi.capacity_recovery_spawns += sat.get("rec", 0)
+                kpi.capital_sink_spawns += sat.get("sink", 0)
+                kpi.capital_sink_waiting_ticks += sat.get("wait", 0)
+                kpi.capital_sink_repaid_resources += sat.get("rep", 0)
+                kpi.capital_sink_chain_ticks += sat.get("chain", 0)
+                kpi.capital_sink_price_blocks += sat.get("priceblock", 0)
                 eco = rec.get("eco", {})
                 kpi.resource_assignments += eco.get("a", 0)
                 kpi.visible_resource_assignments += eco.get("av", 0)
@@ -635,10 +648,23 @@ def detect_bottlenecks(kpi: KPI) -> list[str]:
             f"— capital not working"
         )
     if kpi.full_core_loaded_ticks >= IDLE_GOLD_TICKS:
+        if kpi.capital_sink_spawns == 0 and kpi.capital_sink_waiting_ticks == 0:
+            alerts.append(
+                f"FULL_CORE_LOCK: Core was full while every Worker was laden for "
+                f"{kpi.full_core_loaded_ticks} ticks — capacity-elevator/capital "
+                f"sink policy should be verified ({kpi.capacity_elevator_spawns} "
+                f"elevator, {kpi.capital_sink_spawns} capital queued)"
+            )
+        elif kpi.capital_sink_waiting_ticks > 0 and kpi.capital_sink_chain_ticks == 0:
+            alerts.append(
+                f"CAPITAL_SINK_REPAYMENT: post-W26 capacity exit is waiting for "
+                f"new HARVEST->DEPOSIT evidence ({kpi.capital_sink_waiting_ticks} "
+                f"ticks); do not queue another combat unit"
+            )
+    if kpi.capital_sink_price_blocks > 0:
         alerts.append(
-            f"FULL_CORE_LOCK: Core was full while every Worker was laden for "
-            f"{kpi.full_core_loaded_ticks} ticks — capacity-elevator policy "
-            f"should be verified ({kpi.capacity_elevator_spawns} queued)"
+            f"CAPITAL_SINK_PRICE_GUARD: dynamic price left the reviewed tier "
+            f"({kpi.capital_sink_price_blocks} ticks); experiment is stopped"
         )
     # ``move_failed_cell`` predates the reason-aware counter. Keep it as a
     # fallback for callers constructing KPI objects from the old schema.
@@ -656,15 +682,19 @@ def detect_bottlenecks(kpi: KPI) -> list[str]:
             f"CORE_DEFENSE: core hp dipped to {kpi.core_hp_min} "
             f"(died {kpi.core_died}x) — defense failed, stored resources lost"
         )
-    if kpi.enemy_core_destroyed == 0 and kpi.ticks_with_raid_budget > 0:
+    if (
+        kpi.enemy_core_destroyed == 0
+        and kpi.ticks_with_raid_budget >= RAID_DELAY_TICKS
+        and kpi.ticks_with_enemy_core_visible >= RAID_DELAY_TICKS
+    ):
         alerts.append(
-            f"NO_RAID: enemy Cores were visible for "
-            f"{kpi.ticks_with_enemy_core_visible} ticks and resources met the "
+            f"RAID_DELAY: enemy Core remained visible for "
+            f"{kpi.ticks_with_enemy_core_visible} ticks while resources met the "
             f"dynamic Ranger replacement budget for {kpi.ticks_with_raid_budget} ticks, "
-            f"but 0 enemy Cores were destroyed — verify attack-unit count and "
-            f"line of fire before changing the tactic "
-            f"(note: enemy-core loot is variable via CORE_RESOURCES_CAPTURED, not a "
-            f"flat +6; see LESSONS L10)"
+            f"but no destruction was observed — classify as a possible bounded "
+            f"long-range ETA/line-of-fire delay, not proof of a failed raid; "
+            f"inspect the live target distance before changing the <40 chase gate "
+            f"(loot remains variable via CORE_RESOURCES_CAPTURED)"
         )
     if kpi.resource_drops > 0:
         alerts.append(
@@ -751,7 +781,10 @@ def report(kpi: KPI, alerts: list[str]) -> str:
         f"Saturation     : full Core + all Workers laden "
         f"{kpi.full_core_loaded_ticks} ticks; capacity-elevator spawns "
         f"{kpi.capacity_elevator_spawns} "
-        f"(recovery {kpi.capacity_recovery_spawns}); longest full streak "
+        f"(recovery {kpi.capacity_recovery_spawns}); capital-sink spawns "
+        f"{kpi.capital_sink_spawns} (repay-wait {kpi.capital_sink_waiting_ticks}, "
+        f"repaid {kpi.capital_sink_repaid_resources}, chain "
+        f"{kpi.capital_sink_chain_ticks}); longest full streak "
         f"{kpi.idle_gold_streak} ticks"
     )
     lines.append(

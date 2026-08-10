@@ -1220,3 +1220,25 @@
   且出现自然 `HARVEST_SUCCEEDED→DEPOSIT_SUCCEEDED` 链路，才可进入 ACCEPTED。
 - **停止/回滚**：新的窗口、提交、协议、移动竞态、Core/Unit 损失立即停止；128 Tick 无首个交付、
   256–300 Tick 无自然采集入核、再次满核锁死或净资源未覆盖成本时，回滚本任务，不回滚持久地图和巡查修复。
+
+## `ECONOMY-CAP-013` W26 后资本消耗出口（STATIC_VERIFYING，待 live canary，2026-08-10）
+
+- **问题证据**：W26 后约 `t83575..t84009` 仍为 `170/170`、`W26/V4/R4`；连续满载 `425` Tick，
+  最近约 `300` 个成功 Tick 只有 `20` 次采集、`0` 次交付。Worker 已分散，Core 无伤，故瓶颈是
+  “全员带货但没有可消费的容量出口”，不是路径拥堵或 SDK 不兼容。
+- **单一方案**：满核且全 Worker 带货连续 `15` Tick、W26 已完成、Core 满血满盾、无近核威胁、
+  待交付货物不少于生产成本、生产后保留 `3` 点库存时，每个满载周期最多生产一个战斗单位。无合法
+  远袭射击位时生产 Vanguard；只有已有 `2V/2R`、存在可达合法 Ranger 射击位且 ETA≤`48` Tick
+  时生产 Ranger。普通 Worker 扩容仍停止。
+- **动态价格护栏**：只接受当前审查档 `V=22` 或 `R=26`；下一价格档、Manual 改变人口或
+  `CORE_SPAWN_SUCCEEDED.values.cost` 不匹配时停止实验，不静默扩大成本。
+- **回本门控**：成功回执必须匹配目标 UUID、目标类型和实际 cost；生产后累计新的交付金额至少覆盖
+  该 cost，并确认同一 Worker 的新 `HARVEST_SUCCEEDED -> DEPOSIT_SUCCEEDED` 链路后，才允许下一次
+  资本消耗。新增 `sink/wait/rep/chain/streak/priceblock` 饱和遥测和监控字段。
+- **监控修正**：远距敌核仅满足可见性和资源预算时从 `NO_RAID` 改为至少 12 Tick 的 `RAID_DELAY`，
+  明确这是 ETA/射击线待核查，不再直接判定攻击策略失败，也不放宽 `_chase_target()` 的 `<40` 门槛。
+- **静态证据**：资本出口、权威回执、回本链路、动态价停止和监控解析均有回归测试；当前需在
+  `pytest`、`compileall`、`uv pip check`、`git diff --check` 完成后才进入 canary。
+- **canary/停止**：主代理确认后只重启唯一 live 进程，先观察 `20` 个唯一 accepted Tick；若出口触发，
+  观察至少 `128` Tick 的首个交付，再用 `256–300` Tick 检查成本回收和自然采集入核。任一窗口/协议/
+  提交错误、Core/Unit 损失、价格漂移、成本未回收或再次满载无出口，回滚本任务，不回滚持久地图。

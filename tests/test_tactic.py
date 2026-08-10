@@ -55,6 +55,17 @@ def _reset_explore_state(tmp_path, monkeypatch) -> None:
     tactic._capacity_elevator_pending_tick = None
     tactic._capacity_elevator_pre_spawn_worker_ids = frozenset()
     tactic._capacity_recovery_worker_ids.clear()
+    tactic._capital_sink_full_loaded_streak = 0
+    tactic._capital_sink_pending_tick = None
+    tactic._capital_sink_pending_unit_type = None
+    tactic._capital_sink_pending_cost = None
+    tactic._capital_sink_pending_unit_ids = frozenset()
+    tactic._capital_sink_waiting_repay = False
+    tactic._capital_sink_production_tick = None
+    tactic._capital_sink_repaid = 0
+    tactic._capital_sink_harvest_workers.clear()
+    tactic._capital_sink_chain_workers.clear()
+    tactic._capital_sink_price_blocked = False
     tactic._resource_absence_streak = 0
     tactic._last_harvest_tick = None
     tactic._worker_sector_patrol_start_tick = None
@@ -83,6 +94,17 @@ def _reset_explore_state(tmp_path, monkeypatch) -> None:
     tactic._capacity_elevator_pending_tick = None
     tactic._capacity_elevator_pre_spawn_worker_ids = frozenset()
     tactic._capacity_recovery_worker_ids.clear()
+    tactic._capital_sink_full_loaded_streak = 0
+    tactic._capital_sink_pending_tick = None
+    tactic._capital_sink_pending_unit_type = None
+    tactic._capital_sink_pending_cost = None
+    tactic._capital_sink_pending_unit_ids = frozenset()
+    tactic._capital_sink_waiting_repay = False
+    tactic._capital_sink_production_tick = None
+    tactic._capital_sink_repaid = 0
+    tactic._capital_sink_harvest_workers.clear()
+    tactic._capital_sink_chain_workers.clear()
+    tactic._capital_sink_price_blocked = False
     tactic._resource_absence_streak = 0
     tactic._last_harvest_tick = None
     tactic._worker_sector_patrol_start_tick = None
@@ -4212,6 +4234,156 @@ def test_w26_is_hard_capacity_recovery_stop() -> None:
     assert tactic._resource_telemetry["capacity_recovery"] == 0
 
 
+def _full_w26_state(
+    *,
+    resources: int = 170,
+    n_vanguards: int = 4,
+    n_rangers: int = 4,
+    events: list[dict[str, Any]] | None = None,
+) -> PlayerState:
+    """Build the observed W26/full-core/all-laden capital-sink fixture."""
+    state = _state_with_workers(
+        n_workers=26,
+        resources=resources,
+        n_vanguards=n_vanguards,
+        n_rangers=n_rangers,
+    )
+    objects = [obj.model_dump(mode="json") for obj in state.objects]
+    for obj in objects:
+        if obj.get("kind") == "UNIT" and obj.get("unit_type") == "WORKER":
+            obj["cargo"] = 1
+    return _state(
+        resources=resources,
+        population=26 + n_vanguards + n_rangers,
+        objects=objects,
+        events=events,
+    )
+
+
+def test_capital_sink_waits_for_fifteen_full_loaded_ticks_then_spawns_vanguard() -> None:
+    """W26 后持续满载才允许一次 22 资源 Vanguard 容量出口。"""
+    for tick in range(100, 114):
+        turn = _turn(_full_w26_state(), tick=tick)
+        decide(turn)
+        assert _core_action(turn.plan) is None
+
+    turn = _turn(_full_w26_state(), tick=114)
+    decide(turn)
+
+    action = _core_action(turn.plan)
+    assert action is not None
+    assert action.type == "SPAWN"
+    assert action.unit_type == UnitType.VANGUARD
+    assert tactic._resource_telemetry["capital_sink"] == 1
+    assert tactic._capital_sink_pending_tick == 114
+
+
+def test_capital_sink_chooses_ranger_only_with_reachable_far_target() -> None:
+    """远距敌人有可达射击位时才选择 Ranger，否则默认 Vanguard。"""
+    for tick in range(200, 214):
+        decide(_turn(_full_w26_state(), tick=tick))
+
+    state = _full_w26_state()
+    objects = [obj.model_dump(mode="json") for obj in state.objects]
+    objects.append(
+        {
+            "kind": "UNIT",
+            "id": str(UUID(int=0x9000)),
+            "controlled": False,
+            "position": [0, 20],
+            "hp": 2,
+            "unit_type": "RANGER",
+            "cargo": None,
+        }
+    )
+    state = _state(resources=170, population=34, objects=objects)
+    turn = _turn(state, tick=214)
+    decide(turn)
+
+    action = _core_action(turn.plan)
+    assert action is not None
+    assert action.type == "SPAWN"
+    assert action.unit_type == UnitType.RANGER
+    assert tactic._resource_telemetry["capital_sink_expected_cost"] == 26
+
+
+def test_capital_sink_requires_authoritative_success_and_repayment_chain() -> None:
+    """错误回执不能开闸；成功后必须成本回本且出现新采集入核链路。"""
+    for tick in range(300, 314):
+        decide(_turn(_full_w26_state(), tick=tick))
+    turn = _turn(_full_w26_state(), tick=314)
+    decide(turn)
+    assert tactic._capital_sink_pending_tick == 314
+
+    new_vanguard_id = UUID(int=0x3000 + 4)
+    success = {
+        "event_id": str(UUID(int=0xA001)),
+        "event_type": "CORE_SPAWN_SUCCEEDED",
+        "tick": 314,
+        "target_id": str(new_vanguard_id),
+        "values": {"cost": 22},
+    }
+    next_turn = _turn(
+        _full_w26_state(
+            resources=148,
+            n_vanguards=5,
+            events=[success],
+        ),
+        tick=315,
+    )
+    decide(next_turn)
+    assert tactic._capital_sink_waiting_repay is True
+    assert _core_action(next_turn.plan) is None
+
+    worker_id = UUID(int=0x2000)
+    harvest = {
+        "event_id": str(UUID(int=0xA002)),
+        "event_type": "HARVEST_SUCCEEDED",
+        "tick": 315,
+        "actor_id": str(worker_id),
+        "position": [1, 0],
+        "values": {"amount": 1},
+    }
+    deposit_events = [
+        {
+            "event_id": str(UUID(int=0xA100 + index)),
+            "event_type": "DEPOSIT_SUCCEEDED",
+            "tick": 316,
+            "actor_id": str(worker_id if index == 0 else UUID(int=0x2001 + index)),
+            "values": {"amount": 1},
+        }
+        for index in range(22)
+    ]
+    repaid_turn = _turn(
+        _full_w26_state(
+            resources=149,
+            n_vanguards=5,
+            events=[harvest, *deposit_events],
+        ),
+        tick=317,
+    )
+    decide(repaid_turn)
+
+    assert tactic._capital_sink_waiting_repay is False
+    assert tactic._capital_sink_repaid == 0
+
+
+def test_capital_sink_stops_when_price_moves_out_of_reviewed_tier() -> None:
+    """人口/手动扩军把价格推到下一档时，出口必须停止。"""
+    state = _full_w26_state(
+        resources=180,
+        n_vanguards=5,
+        n_rangers=5,
+    )
+    # W26 + V5 + R5 = population 36, Vanguard price is 29, outside the
+    # reviewed 22/26 experiment tier.
+    for tick in range(400, 415):
+        turn = _turn(state, tick=tick)
+        decide(turn)
+    assert _core_action(turn.plan) is None
+    assert tactic._resource_telemetry.get("capital_sink_price_blocked") == 1
+
+
 def test_w25_residual_recovery_stays_blocked_under_enemy() -> None:
     """敌情出现时优先护核/补军备，不抢资源开 W26。"""
     state = _state_with_workers(
@@ -6000,6 +6172,31 @@ def test_monitor_tracks_saturation_and_longest_full_streak(tmp_path) -> None:
     assert any("FULL_CORE_LOCK" in alert for alert in monitor.detect_bottlenecks(kpi))
 
 
+def test_monitor_tracks_capital_sink_repayment_telemetry(tmp_path) -> None:
+    from meta import monitor
+
+    line = (
+        "t100 r148/175 pop35(W26 V5 R4) core@0,0 hp5/sh5/NORMAL "
+        "W[-] O[-] vis0[-] res0[] obs0 beacon0,0 "
+        "eco[a0,av0,ah0,blk0,cool0,unr0,harv0,dep0] "
+        "sat[full1,elev0,rec0,pat0,sink1,wait1,rep22,chain1,streak15,priceblock0] "
+        "path[c0,e0,b0,p0] TM[1,2,3] ST[ACCEPTED] ev[] plan[-]\n"
+    )
+    log_path = tmp_path / "game.log"
+    log_path.write_text(line, encoding="utf-8")
+
+    record = monitor._parse_line(line)
+    assert record is not None
+    assert record["sat"]["sink"] == 1
+    kpi = monitor.analyze(log_path)
+    assert kpi.capital_sink_spawns == 1
+    assert kpi.capital_sink_waiting_ticks == 1
+    assert kpi.capital_sink_repaid_resources == 22
+    assert kpi.capital_sink_chain_ticks == 1
+    alerts = monitor.detect_bottlenecks(kpi)
+    assert not any("FULL_CORE_LOCK" in alert for alert in alerts)
+
+
 def test_monitor_aggregates_astar_path_telemetry(tmp_path) -> None:
     from meta import monitor
 
@@ -6055,31 +6252,33 @@ def test_monitor_backward_compat_no_timing() -> None:
 def test_monitor_classifies_move_failures_and_enemy_core_visibility(tmp_path) -> None:
     from meta import monitor
 
-    line = (
-        "t100 r15/20 pop2(W2 V0 R0) core@0,0 hp5/sh5/NORMAL "
-        "W[-] O[-] vis2[4,4C,5,5WORKER] res0[] obs0 beacon0,0 "
-        "eco[a0,av0,ah0,blk0,cool0,unr0,harv0,dep0] "
-        "TM[1,2,3] ST[ACCEPTED] "
-        "ev[UNIT_MOVE_FAILED.MOVE_CONTESTED;UNIT_MOVE_FAILED.CELL_UNIT_LIMIT;"
-        "UNIT_MOVE_SUCCEEDED] plan[-]\n"
-    )
+    def line(tick: int) -> str:
+        return (
+            f"t{tick} r15/20 pop2(W2 V0 R0) core@0,0 hp5/sh5/NORMAL "
+            "W[-] O[-] vis2[4,4C,5,5WORKER] res0[] obs0 beacon0,0 "
+            "eco[a0,av0,ah0,blk0,cool0,unr0,harv0,dep0] "
+            "TM[1,2,3] ST[ACCEPTED] "
+            "ev[UNIT_MOVE_FAILED.MOVE_CONTESTED;UNIT_MOVE_FAILED.CELL_UNIT_LIMIT;"
+            "UNIT_MOVE_SUCCEEDED] plan[-]\n"
+        )
     log_path = tmp_path / "game.log"
-    log_path.write_text(line, encoding="utf-8")
+    log_path.write_text("".join(line(tick) for tick in range(100, 112)), encoding="utf-8")
 
-    record = monitor._parse_line(line)
+    record = monitor._parse_line(line(100))
     assert record is not None
     assert record["vis_core"] is True
 
     kpi = monitor.analyze(log_path)
-    assert kpi.move_failed == 2
-    assert kpi.move_failed_contested == 1
-    assert kpi.move_failed_cell == 1
-    assert kpi.move_succeeded == 1
-    assert kpi.ticks_with_enemy_visible == 1
-    assert kpi.ticks_with_enemy_core_visible == 1
+    assert kpi.move_failed == 24
+    assert kpi.move_failed_contested == 12
+    assert kpi.move_failed_cell == 12
+    assert kpi.move_succeeded == 12
+    assert kpi.ticks_with_enemy_visible == 12
+    assert kpi.ticks_with_enemy_core_visible == 12
     alerts = monitor.detect_bottlenecks(kpi)
     assert any("UNIT_CLUMPING" in alert for alert in alerts)
-    assert any("NO_RAID" in alert for alert in alerts)
+    assert any("RAID_DELAY" in alert for alert in alerts)
+    assert not any("NO_RAID" in alert for alert in alerts)
 
 
 def test_monitor_does_not_call_worker_visibility_no_raid(tmp_path) -> None:

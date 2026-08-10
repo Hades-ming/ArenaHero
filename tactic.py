@@ -54,7 +54,7 @@ from __future__ import annotations
 
 import heapq
 import json
-from collections import Counter
+from collections import Counter, deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -421,6 +421,28 @@ CHASE_COOLDOWN_TICKS = 12
 ENEMY_MEMORY_TICKS = 6    # forget a last-seen enemy position after this many ticks
 RAID_REBUILD_RESERVE = 3  # keep a small bank in case the raiding Ranger dies
 CORE_MAX_HP = 5
+
+# 资本消耗出口：W26 之后，满核且全员带货会停止产生新的入核收益。每个
+# 满载周期最多投入一个战斗单位，把容量增加的 5 点换成可兑现的交付空间。
+# 这是一次受控实验，不把动态价格的下一档（V29/R34）静默扩大为常规扩军。
+CAPITAL_SINK_STREAK_TICKS = 15
+CAPITAL_SINK_RESERVE = 3
+CAPITAL_SINK_MAX_ETA = CHASE_MAX_TICKS
+CAPITAL_SINK_ALLOWED_COSTS = {
+    UnitType.VANGUARD: 22,
+    UnitType.RANGER: 26,
+}
+_capital_sink_full_loaded_streak = 0
+_capital_sink_pending_tick: int | None = None
+_capital_sink_pending_unit_type: UnitType | None = None
+_capital_sink_pending_cost: int | None = None
+_capital_sink_pending_unit_ids: frozenset[str] = frozenset()
+_capital_sink_waiting_repay = False
+_capital_sink_production_tick: int | None = None
+_capital_sink_repaid = 0
+_capital_sink_harvest_workers: set[str] = set()
+_capital_sink_chain_workers: set[str] = set()
+_capital_sink_price_blocked = False
 
 # Local resource memory pool: remember resource cells even after they leave
 # vision, so Workers don't re-sweep bare ground they already confirmed empty.
@@ -821,11 +843,17 @@ def _saturation_telemetry_summary() -> str:
         f"{short}{_resource_telemetry.get(name, 0)}"
         for name, short in (
             ("full_core_loaded", "full"),
-            ("capacity_elevator", "elev"),
-            ("capacity_recovery", "rec"),
-            ("full_core_patrol", "pat"),
-        )
+        ("capacity_elevator", "elev"),
+        ("capacity_recovery", "rec"),
+        ("full_core_patrol", "pat"),
+        ("capital_sink", "sink"),
+        ("capital_sink_waiting", "wait"),
+        ("capital_sink_repaid", "rep"),
+        ("capital_sink_chain", "chain"),
+        ("capital_sink_streak", "streak"),
+        ("capital_sink_price_blocked", "priceblock"),
     )
+)
 
 
 def _astar_telemetry_summary() -> str:
@@ -3223,6 +3251,82 @@ def _can_shoot(
     return not _obstacles_between(shooter, target, obstacles)
 
 
+def _capital_ranger_fire_eta(
+    turn: "Turn", core_pos: tuple[int, int]
+) -> int | None:
+    """返回到一个合法 Ranger 射击位的有界 ETA。
+
+    资本出口只在远距敌情确实可兑现时选择 Ranger。这里不把“看见敌人”
+    当作可攻击证据：先检查当前是否能射击，再在目标周围枚举合法射击格，
+    用有界 BFS 验证至少一名现有 Ranger 能到达。BFS 只在资本出口门控通过
+    前调用，且有固定展开上限，不会挤占普通 Tick 的 15 秒窗口。
+    """
+    if not turn.rangers or not turn.visible_enemies:
+        return None
+
+    obstacles = frozenset(turn.obstacle_cells) | _known_obstacles
+    enemy_cells = frozenset(tuple(enemy.position) for enemy in turn.visible_enemies)
+    friendly_counts = Counter(tuple(unit.position) for unit in turn.units)
+    friendly_full = frozenset(
+        cell for cell, count in friendly_counts.items() if count >= 2
+    )
+
+    # 先处理当前 Tick 已经能开火的 Ranger，避免为零 ETA 做路径搜索。
+    for ranger in turn.rangers:
+        if _select_ranger_target(
+            tuple(ranger.position), turn.visible_enemies, obstacles, core_pos
+        ) is not None:
+            return 0
+
+    target_goals: list[set[tuple[int, int]]] = []
+    for enemy in sorted(
+        turn.visible_enemies,
+        key=lambda item: (item.kind != "CORE", _manhattan(core_pos, item.position), str(item.id)),
+    ):
+        target = tuple(enemy.position)
+        goals: set[tuple[int, int]] = set()
+        for dx in range(-RANGER_MAX_RANGE, RANGER_MAX_RANGE + 1):
+            for dy in range(-RANGER_MAX_RANGE, RANGER_MAX_RANGE + 1):
+                candidate = (target[0] + dx, target[1] + dy)
+                if candidate in obstacles or candidate in enemy_cells:
+                    continue
+                if candidate in friendly_full:
+                    continue
+                if _can_shoot(candidate, target, obstacles):
+                    goals.add(candidate)
+        if goals:
+            target_goals.append(goals)
+
+    if not target_goals:
+        return None
+
+    blocked = obstacles | enemy_cells | friendly_full
+    best_eta: int | None = None
+    for ranger in sorted(turn.rangers, key=lambda item: str(item.id)):
+        start = tuple(ranger.position)
+        for goals in target_goals:
+            queue: deque[tuple[tuple[int, int], int]] = deque([(start, 0)])
+            seen = {start}
+            expansions = 0
+            while queue and expansions < 1200:
+                current, distance = queue.popleft()
+                expansions += 1
+                if current in goals:
+                    if best_eta is None or distance < best_eta:
+                        best_eta = distance
+                    break
+                if distance >= CAPITAL_SINK_MAX_ETA:
+                    continue
+                for direction in DIRECTIONS:
+                    ddx, ddy = direction.delta
+                    nxt = (current[0] + ddx, current[1] + ddy)
+                    if nxt in seen or nxt in blocked:
+                        continue
+                    seen.add(nxt)
+                    queue.append((nxt, distance + 1))
+    return best_eta
+
+
 def _guard_reposition_step(
     pos: tuple[int, int],
     core_pos: tuple[int, int],
@@ -3546,16 +3650,31 @@ def _standing_army_targets(n_workers: int) -> tuple[int, int]:
 
 def _record_core_saturation(turn: "Turn") -> bool:
     """记录本 Tick 的满核且全员带货状态，并返回该状态。"""
+    global _capital_sink_full_loaded_streak
     core_full = (
-        turn.core is not None and turn.resources >= turn.resource_capacity
+        turn.core is not None
+        and turn.core.view.state == "NORMAL"
+        and turn.resources >= turn.resource_capacity
     )
     loaded_workers = sum(worker.cargo > 0 for worker in turn.workers)
     full_core_loaded = bool(turn.workers) and core_full and loaded_workers == len(
         turn.workers
     )
+    if full_core_loaded:
+        _capital_sink_full_loaded_streak += 1
+    else:
+        _capital_sink_full_loaded_streak = 0
     _resource_telemetry["full_core_loaded"] = int(full_core_loaded)
     _resource_telemetry["capacity_elevator"] = 0
     _resource_telemetry["capacity_recovery"] = 0
+    _resource_telemetry["capital_sink"] = 0
+    _resource_telemetry["capital_sink_waiting"] = int(_capital_sink_waiting_repay)
+    _resource_telemetry["capital_sink_repaid"] = _capital_sink_repaid
+    _resource_telemetry["capital_sink_chain"] = int(bool(_capital_sink_chain_workers))
+    _resource_telemetry["capital_sink_streak"] = _capital_sink_full_loaded_streak
+    _resource_telemetry["capital_sink_price_blocked"] = int(
+        _capital_sink_price_blocked
+    )
     return full_core_loaded
 
 
@@ -3621,6 +3740,91 @@ def _core_laden_workers_can_leave(turn: "Turn", laden_count: int) -> bool:
             or planned_destinations.get(target, 0) > 1
         ):
             return False
+    return True
+
+
+def _try_capital_sink(
+    turn: "Turn",
+    threats: list[UnitView | CoreView],
+    available_resources: int,
+) -> bool:
+    """在 W26 满核锁死后投入一个受控战斗单位，释放 5 点容量。
+
+    该函数只负责“是否排队”。生产结果必须由下一 Tick 的权威
+    ``CORE_SPAWN_SUCCEEDED`` 回执确认；确认后还要等本次成本被新的交付
+    覆盖并完成至少一条新的 HARVEST -> DEPOSIT 链路，才能再次进入出口。
+    """
+    global _capital_sink_pending_tick
+    global _capital_sink_pending_unit_type
+    global _capital_sink_pending_cost
+    global _capital_sink_pending_unit_ids
+    global _capital_sink_price_blocked
+
+    core = turn.core
+    if core is None or core.view.state != "NORMAL":
+        return False
+    if _capital_sink_price_blocked:
+        return False
+    if _capital_sink_waiting_repay or _capital_sink_pending_tick is not None:
+        return False
+    if _capital_sink_full_loaded_streak < CAPITAL_SINK_STREAK_TICKS:
+        return False
+    if len(turn.workers) < MAX_WORKERS:
+        return False
+    if _capacity_elevator_pending_tick is not None or _capacity_recovery_worker_ids:
+        return False
+    if threats:
+        return False
+    if turn.resources < turn.resource_capacity:
+        return False
+    if turn.plan.core_action is not None:
+        return False
+    if core.hp < CORE_MAX_HP:
+        return False
+
+    friendly_ids = {unit.id for unit in turn.units}
+    friendly_ids.add(core.id)
+    owns_beacon = (
+        turn.beacon.status == BeaconStatus.CARRIED
+        and turn.beacon.carrier_id in friendly_ids
+    )
+    shield_cap = 10 if owns_beacon else 5
+    if core.shield < shield_cap:
+        return False
+
+    # 资本出口永远保留两对基础防守力量；军备不足交给上面的常规生产门控。
+    if len(turn.vanguards) < 2 or len(turn.rangers) < 2:
+        return False
+
+    ranger_eta = _capital_ranger_fire_eta(turn, tuple(core.position))
+    unit_type = (
+        UnitType.RANGER
+        if ranger_eta is not None and ranger_eta <= CAPITAL_SINK_MAX_ETA
+        else UnitType.VANGUARD
+    )
+    expected_cost = unit_cost(unit_type, turn.state.population)
+    # 只做当前已审查的 30-34 人口价格档实验；如果人口或 Manual 生产把
+    # 价格推到下一档，停机等待重新审查，而不是默默扩大资本风险。
+    if expected_cost != CAPITAL_SINK_ALLOWED_COSTS[unit_type]:
+        _capital_sink_price_blocked = True
+        _resource_telemetry["capital_sink_price_blocked"] = 1
+        return False
+    cargo_total = sum(max(0, int(worker.cargo)) for worker in turn.workers)
+    if cargo_total < expected_cost:
+        return False
+    if available_resources < expected_cost + CAPITAL_SINK_RESERVE:
+        return False
+
+    core.spawn(unit_type)
+    _capital_sink_pending_tick = turn.tick
+    _capital_sink_pending_unit_type = unit_type
+    _capital_sink_pending_cost = expected_cost
+    _capital_sink_pending_unit_ids = frozenset(str(unit.id) for unit in turn.units)
+    _resource_telemetry["capital_sink"] = 1
+    _resource_telemetry["capital_sink_unit"] = (
+        1 if unit_type == UnitType.VANGUARD else 2
+    )
+    _resource_telemetry["capital_sink_expected_cost"] = expected_cost
     return True
 
 
@@ -3859,6 +4063,12 @@ def _control_core(
                 )
                 _capacity_recovery_worker_ids.clear()
             return
+
+    # W26 之后的第二阶段出口：只有满核、全员带货持续足够长、军备完整且
+    # 没有近核威胁时，才把资本投入一个战斗单位换取 5 点容量。该调用位于
+    # W25/W26 电梯之后，确保普通 Worker 扩容已经停止。
+    if _try_capital_sink(turn, threats, effective_resources):
+        return
 
     # Bank reserve: only spawn a Worker if the Core keeps at least
     # WORKER_SPAWN_RESERVE resources afterward, so the economy never drains to
@@ -4244,7 +4454,107 @@ def _process_events(turn: "Turn") -> None:
     global _capacity_elevator_pending_tick
     global _capacity_elevator_pre_spawn_worker_ids
     global _capacity_recovery_worker_ids
+    global _capital_sink_pending_tick
+    global _capital_sink_pending_unit_type
+    global _capital_sink_pending_cost
+    global _capital_sink_pending_unit_ids
+    global _capital_sink_waiting_repay
+    global _capital_sink_production_tick
+    global _capital_sink_repaid
+    global _capital_sink_harvest_workers
+    global _capital_sink_chain_workers
+    global _capital_sink_price_blocked
     resource_invalidated = False
+
+    # A destroyed Core invalidates an in-flight capital experiment. The
+    # replacement Core starts with fresh resources and must not inherit a
+    # repayment obligation from the old fleet.
+    if turn.core is None:
+        _capital_sink_pending_tick = None
+        _capital_sink_pending_unit_type = None
+        _capital_sink_pending_cost = None
+        _capital_sink_pending_unit_ids = frozenset()
+        _capital_sink_waiting_repay = False
+        _capital_sink_production_tick = None
+        _capital_sink_repaid = 0
+        _capital_sink_harvest_workers.clear()
+        _capital_sink_chain_workers.clear()
+
+    current_units = {str(unit.id): unit for unit in turn.units}
+    pending_tick = _capital_sink_pending_tick
+    if pending_tick is not None and turn.tick > pending_tick:
+        events = turn.events if turn.tick == pending_tick + 1 else ()
+        confirmed = False
+        price_mismatch = False
+        for event in events:
+            if event.tick != pending_tick:
+                continue
+            if event.event_type == "CORE_SPAWN_SUCCEEDED":
+                values = event.values if isinstance(event.values, dict) else {}
+                target_id = str(event.target_id) if event.target_id is not None else None
+                target = current_units.get(target_id or "")
+                cost = values.get("cost")
+                if (
+                    target is not None
+                    and target_id not in _capital_sink_pending_unit_ids
+                    and _capital_sink_pending_unit_type is not None
+                    and target.unit_type == _capital_sink_pending_unit_type
+                    and cost == _capital_sink_pending_cost
+                ):
+                    confirmed = True
+                else:
+                    price_mismatch = True
+            elif event.event_type in {"CORE_SPAWN_FAILED", "INSUFFICIENT_RESOURCES"}:
+                values = event.values if isinstance(event.values, dict) else {}
+                required = values.get("required")
+                if required is not None and required != _capital_sink_pending_cost:
+                    price_mismatch = True
+
+        if confirmed:
+            _capital_sink_pending_tick = None
+            _capital_sink_waiting_repay = True
+            _capital_sink_production_tick = pending_tick
+            _capital_sink_repaid = 0
+            _capital_sink_harvest_workers.clear()
+            _capital_sink_chain_workers.clear()
+        else:
+            # The next authoritative state should contain either the success or
+            # failure event. Missing/delayed evidence is not permission to
+            # retry indefinitely; clear the request and wait for a fresh full
+            # cycle. A changed authoritative price permanently stops this
+            # experiment until the process is reviewed/restarted.
+            if price_mismatch:
+                _capital_sink_price_blocked = True
+            _capital_sink_pending_tick = None
+            _capital_sink_pending_unit_type = None
+            _capital_sink_pending_cost = None
+            _capital_sink_pending_unit_ids = frozenset()
+
+    if _capital_sink_waiting_repay and _capital_sink_production_tick is not None:
+        for event in turn.events:
+            if event.tick <= _capital_sink_production_tick:
+                continue
+            actor_id = str(event.actor_id) if event.actor_id is not None else None
+            if event.event_type == "HARVEST_SUCCEEDED" and actor_id is not None:
+                _capital_sink_harvest_workers.add(actor_id)
+            elif event.event_type == "DEPOSIT_SUCCEEDED":
+                amount = event.resource_amount or 0
+                _capital_sink_repaid += max(0, amount)
+                if actor_id is not None and actor_id in _capital_sink_harvest_workers:
+                    _capital_sink_chain_workers.add(actor_id)
+        if (
+            _capital_sink_pending_cost is not None
+            and _capital_sink_repaid >= _capital_sink_pending_cost
+            and _capital_sink_chain_workers
+        ):
+            _capital_sink_waiting_repay = False
+            _capital_sink_production_tick = None
+            _capital_sink_pending_unit_type = None
+            _capital_sink_pending_cost = None
+            _capital_sink_pending_unit_ids = frozenset()
+            _capital_sink_repaid = 0
+            _capital_sink_harvest_workers.clear()
+            _capital_sink_chain_workers.clear()
 
     # A recovery qualification is tied to the original Worker cargo that was
     # still present when the confirmed W25 elevator settled.  Once a tracked
