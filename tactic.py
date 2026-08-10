@@ -815,6 +815,7 @@ def _saturation_telemetry_summary() -> str:
         for name, short in (
             ("full_core_loaded", "full"),
             ("capacity_elevator", "elev"),
+            ("full_core_patrol", "pat"),
         )
     )
 
@@ -1918,6 +1919,14 @@ def _explore_step(
         south_init = 0 if worker_index % 2 == 0 else 1
         state = [0, south_init, None, None]
         _explore_state[worker_id] = state
+    # 先归一化持久化偏移，再处理距离早退。否则远离 Core 的 Worker 会在
+    # A* 回程分支直接 return，异常 col_off 会继续跨 Tick 保留并再次污染日志。
+    col_off, south = state[0], state[1]
+    col_off = _normalize_explore_col_off(
+        col_off, base_col, chunk_x_lo, chunk_x_hi
+    )
+    _explore_state[worker_id] = [col_off, south, None, None]
+
     # Sweep-radius cap: a worker must not wander beyond the current discovery
     # radius. Empty workers may expand this radius during a resource drought;
     # laden workers never call this path unless the Core is full and use the
@@ -1946,11 +1955,6 @@ def _explore_step(
             step = _step_toward(pos, core_pos, blocked)
         if step is not None:
             return step
-    col_off, south = state[0], state[1]
-    col_off = _normalize_explore_col_off(
-        col_off, base_col, chunk_x_lo, chunk_x_hi
-    )
-    _explore_state[worker_id] = [col_off, south, None, None]
     target_x = max(chunk_x_lo, min(chunk_x_hi, base_col + col_off))
 
     # First reach the assigned column, detouring vertically (never off-column)
@@ -2181,6 +2185,13 @@ def _threats_to_core(
 def _control_workers(turn: "Turn", core_pos: tuple[int, int]) -> None:
     resource_cells = turn.resource_cells
     explore_radius = _exploration_radius()
+    _resource_telemetry["full_core_patrol"] = 0
+    full_core_loaded = (
+        turn.core is not None
+        and bool(turn.workers)
+        and turn.resources >= turn.resource_capacity
+        and all(worker.cargo > 0 for worker in turn.workers)
+    )
     # Base blocked set: obstacle terrain plus visible enemy Core/Unit cells.
     # A Worker that steps onto an enemy cell fails with MOVE_DESTINATION_OCCUPIED
     # every tick and deadlocks, so enemy positions must be routed around.
@@ -2233,6 +2244,11 @@ def _control_workers(turn: "Turn", core_pos: tuple[int, int]) -> None:
     # visible resource.
     frontier_workers = idle_workers
     sector_patrol_worker_ids: set[str] = set()
+    full_core_patrol_worker_ids = (
+        {str(worker.id) for worker in turn.workers}
+        if full_core_loaded
+        else set()
+    )
     if not resource_cells and len(idle_workers) >= 4:
         refresh_count = min(
             _RESOURCE_REFRESH_PATROL_WORKERS, len(idle_workers) - 1
@@ -2300,6 +2316,7 @@ def _control_workers(turn: "Turn", core_pos: tuple[int, int]) -> None:
     ranked_patrol_ids = set(sector_patrol_worker_ids)
     if sector_patrol_mode:
         ranked_patrol_ids.update(worker_id for worker_id, _ in frontier_workers)
+    ranked_patrol_ids.update(full_core_patrol_worker_ids)
     for rank, worker_id in enumerate(sorted(ranked_patrol_ids)):
         sector_patrol_rank[worker_id] = rank
     worker_order = sorted(
@@ -2437,12 +2454,47 @@ def _control_workers(turn: "Turn", core_pos: tuple[int, int]) -> None:
                 _pos_history.pop(wid, None)  # fresh start after deposit
             else:
                 if core_full:
-                    # Core full: laden Workers cannot deposit. Instead of
-                    # orbiting the Core (dead time), resume the boustrophedon
-                    # sweep to keep discovering nodes; once a slot frees
-                    # (spawn/casualty) the Worker returns to deposit (9th
-                    # review rank 1). This preserves discovery during the
-                    # saturation window.
+                    # Core full: laden Workers cannot deposit. Keep them on
+                    # independent four-quadrant stations so their vision still
+                    # refreshes the persistent map instead of sending the whole
+                    # fleet through one north-biased column sweep. As soon as a
+                    # capacity slot opens, this branch is skipped and the next
+                    # block routes the cargo back to Core with A*.
+                    if full_core_loaded:
+                        patrol_target = _worker_sector_patrol_target(
+                            orig_index,
+                            core_pos,
+                            turn.tick,
+                            blocked,
+                            reserved=frozenset(sector_patrol_reserved),
+                            cohort_rank=sector_patrol_rank.get(wid),
+                        )
+                        if patrol_target is not None:
+                            _resource_telemetry["full_core_patrol"] += 1
+                            sector_patrol_reserved.add(patrol_target)
+                            # 巡查站点不是交付路径，不能复用“带货可回 Core”
+                            # 的 blocked 集合；否则 A* 可能把 Core 当作中间
+                            # 格穿过，破坏 Core 占位并制造容量竞态。
+                            patrol_blocked = blocked | {core_pos}
+                            patrol_step = _patrol_step(
+                                pos,
+                                patrol_target,
+                                base_blocked,
+                                patrol_blocked,
+                                avoid=None,
+                            )
+                            if pos == patrol_target:
+                                worker.wait()
+                                continue
+                            if patrol_step is not None and queue_worker_move(
+                                worker, patrol_step
+                            ):
+                                _prev_pos[wid] = pos
+                                _record_pos(wid, pos)
+                                continue
+                    # If no valid station exists, retain the old bounded sweep
+                    # fallback so a single blocked station cannot stall a
+                    # laden Worker forever.
                     step = _explore_step(
                         orig_index, wid, pos, core_pos, blocked,
                         target_col=None, avoid=_avoid_set(wid),

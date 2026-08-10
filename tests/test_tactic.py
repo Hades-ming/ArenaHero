@@ -753,6 +753,116 @@ def test_refresh_patrols_keep_four_quadrants_even_with_frontier_targets(
     )
 
 
+def test_full_core_loaded_workers_use_four_quadrant_patrol(monkeypatch) -> None:
+    """满核全带货时，整支 Worker 舰队也必须使用四向站点。"""
+    state = _state_with_workers(
+        n_workers=8,
+        resources=50,
+        n_vanguards=1,
+        n_rangers=1,
+    )
+    objects = [obj.model_dump(mode="json") for obj in state.objects]
+    for obj in objects:
+        if obj.get("kind") == "UNIT" and obj.get("unit_type") == "WORKER":
+            obj["cargo"] = 1
+    state = _state(resources=50, population=10, objects=objects)
+    turn = _turn(state, tick=20)
+    captured: list[tuple[int, int | None, tuple[int, int] | None]] = []
+    original_target = tactic._worker_sector_patrol_target
+
+    def capture_target(*args, **kwargs):
+        target = original_target(*args, **kwargs)
+        captured.append((args[0], kwargs.get("cohort_rank"), target))
+        return target
+
+    monkeypatch.setattr(tactic, "_worker_sector_patrol_target", capture_target)
+    monkeypatch.setattr(tactic, "_patrol_step", lambda *args, **kwargs: Direction.RIGHT)
+
+    tactic._control_workers(turn, turn.core.position)
+
+    assert len(captured) == 8
+    assert tactic._resource_telemetry["full_core_patrol"] == 8
+    assert [rank for _index, rank, _target in captured] == list(range(8))
+    targets = [target for _index, _rank, target in captured]
+    assert all(target is not None for target in targets)
+    quadrants = {
+        (1 if target[0] > 0 else -1, 1 if target[1] > 0 else -1)
+        for target in targets
+    }
+    assert len(quadrants) == 4
+    assert len(set(targets)) == 8
+
+
+def test_capacity_recovery_routes_laden_workers_back_to_core(monkeypatch) -> None:
+    """容量恢复后，带货 Worker 必须退出巡查并回 Core 交付。"""
+    state = _state_with_workers(
+        n_workers=8,
+        resources=49,
+        n_vanguards=1,
+        n_rangers=1,
+    )
+    objects = [obj.model_dump(mode="json") for obj in state.objects]
+    for obj in objects:
+        if obj.get("kind") == "UNIT" and obj.get("unit_type") == "WORKER":
+            obj["cargo"] = 1
+    state = _state(resources=49, population=10, objects=objects)
+    turn = _turn(state, tick=20)
+
+    monkeypatch.setattr(
+        tactic,
+        "_worker_sector_patrol_target",
+        lambda *args, **kwargs: pytest.fail("容量恢复后不应继续派发巡查站点"),
+    )
+    tactic._control_workers(turn, turn.core.position)
+
+    action = _action(turn.plan, UUID(int=0x2000))
+    assert action is not None
+    assert action.type == "MOVE"
+    next_pos = (
+        1 + action.direction.delta[0],
+        action.direction.delta[1],
+    )
+    assert tactic._manhattan(next_pos, (0, 0)) < tactic._manhattan((1, 0), (0, 0))
+
+
+def test_full_core_patrol_never_routes_through_core(monkeypatch) -> None:
+    """满核巡查路径不能把 Core 当作中间通道。"""
+    turn = _turn(
+        _workers_state([(1, 0)], cargo=[1]),
+        tick=20,
+    )
+    # _workers_state defaults to resources=5; fill the minimum Core capacity
+    # so the single laden Worker enters the full-core patrol branch.
+    turn.state = _state(
+        resources=10,
+        population=1,
+        objects=[obj.model_dump(mode="json") for obj in turn.state.objects],
+    )
+    captured_blocked: list[frozenset[tuple[int, int]]] = []
+    original_patrol_step = tactic._patrol_step
+
+    monkeypatch.setattr(
+        tactic,
+        "_worker_sector_patrol_target",
+        lambda *args, **kwargs: (-1, 0),
+    )
+
+    def capture_patrol_step(pos, goal, obstacles, blocked, **kwargs):
+        captured_blocked.append(blocked)
+        return original_patrol_step(pos, goal, obstacles, blocked, **kwargs)
+
+    monkeypatch.setattr(tactic, "_patrol_step", capture_patrol_step)
+
+    tactic._control_workers(turn, turn.core.position)
+
+    assert captured_blocked
+    assert (0, 0) in captured_blocked[0]
+    action = _action(turn.plan, UUID(int=0x6000))
+    assert action is not None
+    assert action.type == "MOVE"
+    assert action.direction in {Direction.UP, Direction.DOWN}
+
+
 def test_worker_waits_at_refresh_patrol_station_instead_of_falling_back(
     monkeypatch,
 ) -> None:
@@ -4837,6 +4947,23 @@ def test_explore_step_normalizes_overflowed_state_for_laden_worker() -> None:
 
     assert step is not None
     assert -28 <= tactic._explore_state["laden"][0] <= 27
+
+
+def test_explore_step_normalizes_overflow_before_far_return() -> None:
+    """远离 Core 的 A* 早退也不能保留溢出的列偏移。"""
+    tactic._explore_state["far-laden"] = [1_000_000, 0, None, None]
+
+    step = tactic._explore_step(
+        0,
+        "far-laden",
+        (41, 0),
+        (0, 0),
+        frozenset(),
+        fleet_size=1,
+    )
+
+    assert step is not None
+    assert -28 <= tactic._explore_state["far-laden"][0] <= 27
 
 
 def test_guard_ranger_holds_near_core() -> None:
