@@ -3514,7 +3514,7 @@ def test_w21_full_core_can_open_one_capacity_elevator_slot() -> None:
     assert action is not None
     assert action.type == "SPAWN"
     assert action.unit_type == UnitType.WORKER
-    assert tactic.MAX_WORKERS == 23
+    assert tactic.MAX_WORKERS == 24
     assert tactic._resource_telemetry["capacity_elevator"] == 1
 
 
@@ -3541,6 +3541,54 @@ def test_w22_full_core_can_open_next_capacity_elevator_slot() -> None:
     assert action.unit_type == UnitType.WORKER
     assert tactic._resource_telemetry["full_core_loaded"] == 1
     assert tactic._resource_telemetry["capacity_elevator"] == 1
+
+
+def test_w23_full_core_can_open_next_capacity_elevator_slot() -> None:
+    """线上 W23 满核全带货再次锁死时，只释放一个 W24 容量槽。"""
+    state = _state_with_workers(
+        n_workers=23,
+        resources=155,
+        n_vanguards=4,
+        n_rangers=4,
+    )
+    objects = [obj.model_dump(mode="json") for obj in state.objects]
+    for obj in objects:
+        if obj.get("kind") == "UNIT" and obj.get("unit_type") == "WORKER":
+            obj["cargo"] = 1
+    state = _state(resources=155, population=31, objects=objects)
+    turn = _turn(state)
+
+    decide(turn)
+
+    action = _core_action(turn.plan)
+    assert action is not None
+    assert action.type == "SPAWN"
+    assert action.unit_type == UnitType.WORKER
+    assert tactic.MAX_WORKERS == 24
+    assert tactic._resource_telemetry["full_core_loaded"] == 1
+    assert tactic._resource_telemetry["capacity_elevator"] == 1
+
+
+def test_w24_full_core_stops_capacity_elevator_until_canary_review() -> None:
+    """W24 是本轮硬护栏，未完成新一轮收益验证前不继续盲目扩容。"""
+    state = _state_with_workers(
+        n_workers=24,
+        resources=160,
+        n_vanguards=4,
+        n_rangers=4,
+    )
+    objects = [obj.model_dump(mode="json") for obj in state.objects]
+    for obj in objects:
+        if obj.get("kind") == "UNIT" and obj.get("unit_type") == "WORKER":
+            obj["cargo"] = 1
+    state = _state(resources=160, population=32, objects=objects)
+    turn = _turn(state)
+
+    decide(turn)
+
+    assert _core_action(turn.plan) is None
+    assert tactic._resource_telemetry["full_core_loaded"] == 1
+    assert tactic._resource_telemetry["capacity_elevator"] == 0
 
 
 def test_full_core_without_all_workers_laden_does_not_use_capacity_elevator() -> None:
