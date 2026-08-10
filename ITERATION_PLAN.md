@@ -1149,3 +1149,27 @@
   W24 变更，不回滚持久地图和既有巡查修复。
 - **巡查隔离**：当前最后一个有效空载分层样本仍为北侧 `83.43%`（NW `34.02%`、NE `49.41%`）；满核后
   `resources<capacity` 过滤器失效。本轮不调整巡查，避免把容量出口收益与象限覆盖混为一个变量。
+
+## `RESOURCE-DISPATCH-023` 满核全带货四象限巡查与 Core 护栏（SAFE_CANARY_VERIFIED，2026-08-10）
+
+- **问题证据**：最新 live 为 `W24/V4/R4`、Core `160/160`，24/24 Worker 全部带货，连续窗口没有
+  `HARVEST_SUCCEEDED` 或 `DEPOSIT_SUCCEEDED`；旧 `_explore_step()` 让整队回到北偏扫列。另发现远距
+  Worker 在 A* 距离早退前不会归一化持久 `col_off`，可能让偏移长期污染。
+- **单一行为修复**：满核且所有 Worker 带货时，按当前 Worker cohort 连续编号派发独立四象限站点，
+  到站显式 `WAIT`，容量恢复后立即退出巡查并用 A* 回 Core；新增 `full_core_patrol` (`pat`) 遥测。
+  `col_off` 在距离早退前归一化。巡查路径及不可达站点回退均显式阻塞 Core，防止把 Core 当作中间格穿越。
+  不改变 `MAX_WORKERS=24`、敌情生产、普通 Worker 桥或 W25 上限。
+- **离线验收**：新增远距偏移、四象限全带货、容量恢复回程、巡查到站与 Core 阻塞回归；全量
+  `pytest 212 passed`，compileall、`uv pip check`（19 包）、`git diff --check` 均通过。SDK 本地为
+  `0.2.9`；官方 source/version 页面仍为 gameplay `v0.14` / SDK `0.2.9`，未发现兼容漂移。
+- **提交与上线**：代码提交 `577ae8a` 已推送；复核护栏后提交 `4d2c83d` 并推送 `origin/main`。
+  唯一 LaunchAgent PID `37476` 从 `t82939` 开始运行最终代码。
+- **20-Tick canary**：严格窗口 `t82939..t82958` 共 `20/20` 个唯一 `ST[ACCEPTED]` Tick，无缺口、
+  重复、窗口/提交/协议错误、`MOVE_FAILED`、资源失败、Unit/Core 损失或 Core 受击；事件为 `440`
+  次 `UNIT_MOVE_SUCCEEDED`。资源保持 `160/160`、编制 `W24/V4/R4`，每 Tick `full1,elev0,pat22`；
+  Worker 与 Core 的曼哈顿距离≤1样本为 `0`。`decide_ms` P50/P95/P99=`143/184.5/192.1ms`，
+  本地总耗时 P50/P95/P99=`1193.5/1376.85/1389.77ms`。
+- **结论与后续**：本轮证明巡查不再穿 Core、满核舰队能持续分散移动且命令窗口安全，但没有证明资源
+  吞吐已恢复；`HARVEST/DEPOSIT=0` 是当前 W24 容量锁的直接证据。继续观察至少一个 128-Tick 巡查相位，
+  并将 W24→W25 作为下一次独立容量电梯实验（单独核算动态 Worker 成本、容量变化、首个交付延迟和
+  256–300 Tick 净回本），不得与本巡查修复混合。
