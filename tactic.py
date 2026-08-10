@@ -2495,13 +2495,18 @@ def _control_workers(turn: "Turn", core_pos: tuple[int, int]) -> None:
                     # If no valid station exists, retain the old bounded sweep
                     # fallback so a single blocked station cannot stall a
                     # laden Worker forever.
+                    fallback_blocked = (
+                        blocked | {core_pos} if full_core_loaded else blocked
+                    )
                     step = _explore_step(
-                        orig_index, wid, pos, core_pos, blocked,
+                        orig_index, wid, pos, core_pos, fallback_blocked,
                         target_col=None, avoid=_avoid_set(wid),
                         fleet_size=len(turn.workers),
                     )
                     if step is None:
-                        step = _step_away_from(pos, core_pos, blocked, avoid=None)
+                        step = _step_away_from(
+                            pos, core_pos, fallback_blocked, avoid=None
+                        )
                     if step is not None:
                         _prev_pos[wid] = pos
                         _record_pos(wid, pos)

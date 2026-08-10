@@ -863,6 +863,34 @@ def test_full_core_patrol_never_routes_through_core(monkeypatch) -> None:
     assert action.direction in {Direction.UP, Direction.DOWN}
 
 
+def test_full_core_patrol_fallback_also_blocks_core(monkeypatch) -> None:
+    """巡查站点全部失效时，满核回退仍不能穿过 Core。"""
+    turn = _turn(_workers_state([(1, 0)], cargo=[1]), tick=20)
+    turn.state = _state(
+        resources=10,
+        population=1,
+        objects=[obj.model_dump(mode="json") for obj in turn.state.objects],
+    )
+    captured_blocked: list[frozenset[tuple[int, int]]] = []
+
+    monkeypatch.setattr(
+        tactic,
+        "_worker_sector_patrol_target",
+        lambda *args, **kwargs: None,
+    )
+
+    def capture_explore_step(*args, **kwargs):
+        captured_blocked.append(args[4])
+        return Direction.UP
+
+    monkeypatch.setattr(tactic, "_explore_step", capture_explore_step)
+
+    tactic._control_workers(turn, turn.core.position)
+
+    assert captured_blocked
+    assert (0, 0) in captured_blocked[0]
+
+
 def test_worker_waits_at_refresh_patrol_station_instead_of_falling_back(
     monkeypatch,
 ) -> None:
