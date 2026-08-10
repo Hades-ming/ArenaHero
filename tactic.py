@@ -88,13 +88,14 @@ FREE_UPKEEP_CAP = 20
 # past 70. Still below the first price step (pop 17 < 20). The bank reserve +
 # army-short gate still prevent draining deposits to r0.
 TARGET_WORKERS = FREE_UPKEEP_CAP
-# Capacity-elevator experiment: allow the next slot beyond the current W23
-# ceiling, but only through the strict full-Core/all-laden gate below. This does
-# not reopen ordinary peaceful Worker growth. The current live canary has a
-# confirmed W23 full-Core/all-laden deadlock, so W24 is the next single-variable
-# release; the hard bound remains a rollback guard until a later canary proves
-# another slot is worth its dynamic price.
-MAX_WORKERS = FREE_UPKEEP_CAP + 4
+# Capacity-elevator experiment: release W25, then at most one recovery slot
+# (W26) when W25 leaves residual cargo stranded behind a full Core. This does
+# not reopen ordinary peaceful Worker growth. The W24 long window stayed at
+# 160/160 with 24/24 Workers carrying cargo and zero harvest/deposit; one slot
+# can only absorb 16 of those 24 cargo units, so W26 is the minimum bounded
+# continuation that can clear the initial backlog. The hard W26 bound remains
+# until a later canary proves another slot is worth its dynamic price.
+MAX_WORKERS = FREE_UPKEEP_CAP + 6
 # Bank reserve: never spend down to zero on a Worker spawn. A spawn must leave
 # the Core with at least this many resources afterward, so the economy keeps a
 # positive balance and the standing-army bank (toward the 10/12 combat Unit)
@@ -454,6 +455,12 @@ class ResourceHint:
 
 _resource_hints: dict[tuple[int, int], ResourceHint] = {}
 _resource_telemetry: dict[str, int] = {}
+# W25 必须先由本进程实际排队并在下一份 authoritative state 中确认成功，
+# 才获得一次 W26 恢复资格。集合记录当时仍带货的 Worker，避免旧货清空后
+# 仅凭一件新采集货物或手动注入的 W25 误触发扩容。
+_capacity_elevator_pending_tick: int | None = None
+_capacity_elevator_pre_spawn_worker_ids: frozenset[str] = frozenset()
+_capacity_recovery_worker_ids: set[str] = set()
 _resource_absence_streak = 0
 _last_harvest_tick: int | None = None
 _RESOURCE_COOLDOWN_BASE = 4
@@ -815,6 +822,7 @@ def _saturation_telemetry_summary() -> str:
         for name, short in (
             ("full_core_loaded", "full"),
             ("capacity_elevator", "elev"),
+            ("capacity_recovery", "rec"),
             ("full_core_patrol", "pat"),
         )
     )
@@ -3547,6 +3555,7 @@ def _record_core_saturation(turn: "Turn") -> bool:
     )
     _resource_telemetry["full_core_loaded"] = int(full_core_loaded)
     _resource_telemetry["capacity_elevator"] = 0
+    _resource_telemetry["capacity_recovery"] = 0
     return full_core_loaded
 
 
@@ -3622,6 +3631,9 @@ def _control_core(
     enemy_core_visible: bool = False,
     available_resources: int | None = None,
 ) -> None:
+    global _capacity_elevator_pending_tick
+    global _capacity_elevator_pre_spawn_worker_ids
+    global _capacity_recovery_worker_ids
     core = turn.core
     if core is None:
         return
@@ -3791,20 +3803,61 @@ def _control_core(
 
     # 满核且所有 Worker 都已经带货时，继续等待会把采集闭环锁死：Core
     # 没有空位接收货物，Worker 又无法产生新的采集收益。只在和平期、军备
-    # 已齐且仍处于有界 Worker 上限内时，生产一个“容量电梯” Worker。新
-    # Worker 使容量增加 5，生产成本由 v0.14 的动态价格决定；下一 Tick
-    # 旧 Worker 即可把货物交付。该分支不是常规 Worker 桥接，也不会在
-    # 敌情或军备短缺时抢占资源。
+    # 已齐且仍处于有界 Worker 上限内时，生产一个“容量电梯” Worker。W25
+    # 释放的 5 点容量只能接收旧 W24 的 16/24 个货物；因此当 W25 已经
+    # 生成、Core 再次满载且仍有残余带货 Worker 时，允许唯一一次 W26 恢复
+    # 槽。W26 后硬停止，不把这个恢复分支变成无限扩容。
+    recovery_workers = {
+        str(worker.id)
+        for worker in turn.workers
+        if worker.cargo > 0 and str(worker.id) in _capacity_recovery_worker_ids
+    }
+    full_core_elevator = full_core_loaded and len(turn.workers) < MAX_WORKERS - 1
+    capacity_recovery = (
+        core_full
+        and len(turn.workers) == MAX_WORKERS - 1
+        and bool(recovery_workers)
+    )
+    # 新 Worker 使容量增加 5，生产成本由 v0.14 的动态价格决定。该分支
+    # 不是常规 Worker 桥接，也不会在敌情或军备短缺时抢占资源。
     if (
-        full_core_loaded
+        (full_core_elevator or capacity_recovery)
         and not enemy_present
         and not army_short
         and len(turn.workers) < MAX_WORKERS
     ):
         worker_price = unit_cost(UnitType.WORKER, population)
+        # W25/W26 are a bounded 11-resource experiment.  A larger standing
+        # army moves the dynamic price to the next tier; do not silently turn
+        # that manual/population change into an expensive third recovery path.
+        if (
+            worker_price != 11
+            and (
+                capacity_recovery
+                or (full_core_loaded and len(turn.workers) == MAX_WORKERS - 2)
+            )
+        ):
+            return
         if effective_resources >= worker_price + WORKER_SPAWN_RESERVE:
             core.spawn(UnitType.WORKER)
             _resource_telemetry["capacity_elevator"] = 1
+            if capacity_recovery:
+                _resource_telemetry["capacity_recovery"] = 1
+                # W26 is a one-shot recovery slot.  Clear the qualification as
+                # soon as it is queued so a failed/delayed spawn cannot be
+                # retried from a later fresh cargo pile.
+                _capacity_recovery_worker_ids.clear()
+                _capacity_elevator_pending_tick = None
+                _capacity_elevator_pre_spawn_worker_ids = frozenset()
+            elif full_core_elevator and len(turn.workers) == MAX_WORKERS - 2:
+                # This exact branch is the W24 -> W25 elevator.  W26 must not
+                # become eligible until the authoritative success event for
+                # this queued Tick is observed in the next state.
+                _capacity_elevator_pending_tick = turn.tick
+                _capacity_elevator_pre_spawn_worker_ids = frozenset(
+                    str(worker.id) for worker in turn.workers
+                )
+                _capacity_recovery_worker_ids.clear()
             return
 
     # Bank reserve: only spawn a Worker if the Core keeps at least
@@ -4188,7 +4241,60 @@ def _process_events(turn: "Turn") -> None:
     run observer (see play.py) and to surface notable outcomes; they do not
     change the queued plan.
     """
+    global _capacity_elevator_pending_tick
+    global _capacity_elevator_pre_spawn_worker_ids
+    global _capacity_recovery_worker_ids
     resource_invalidated = False
+
+    # A recovery qualification is tied to the original Worker cargo that was
+    # still present when the confirmed W25 elevator settled.  Once a tracked
+    # Worker reaches cargo=0, remove it permanently; later fresh harvests must
+    # never manufacture a second W26 opportunity.  UUIDs that disappeared
+    # from the authoritative state (death/respawn) are removed as well.
+    current_workers = {str(worker.id): worker for worker in turn.workers}
+    _capacity_recovery_worker_ids.intersection_update(
+        {
+            worker_id
+            for worker_id, worker in current_workers.items()
+            if worker.cargo > 0
+        }
+    )
+
+    # The pending marker is deliberately in-memory only.  A process restart,
+    # manual W25 state, or an unsuccessful/delayed spawn has no W26 authority.
+    pending_tick = _capacity_elevator_pending_tick
+    if pending_tick is not None and turn.tick > pending_tick:
+        confirmed = False
+        events = turn.events if turn.tick == pending_tick + 1 else ()
+        for event in events:
+            if event.event_type != "CORE_SPAWN_SUCCEEDED":
+                continue
+            values = event.values if isinstance(event.values, dict) else {}
+            target_id = str(event.target_id) if event.target_id is not None else None
+            target = current_workers.get(target_id or "")
+            cost = values.get("cost")
+            if (
+                event.tick == pending_tick
+                and target is not None
+                and target.unit_type == UnitType.WORKER
+                and target_id not in _capacity_elevator_pre_spawn_worker_ids
+                and len(current_workers) == MAX_WORKERS - 1
+                and cost == 11
+            ):
+                # Exclude the newly-created W25 itself.  Only Workers that
+                # already existed before the spawn can carry residual cargo;
+                # cargo first appearing on W25 must not unlock W26.
+                _capacity_recovery_worker_ids = {
+                    worker_id
+                    for worker_id, worker in current_workers.items()
+                    if worker_id != target_id and worker.cargo > 0
+                }
+                confirmed = True
+                break
+        _capacity_elevator_pending_tick = None
+        _capacity_elevator_pre_spawn_worker_ids = frozenset()
+        if not confirmed:
+            _capacity_recovery_worker_ids.clear()
     for event in turn.events:
         if (
             event.event_type == "HARVEST_FAILED"

@@ -52,6 +52,9 @@ def _reset_explore_state(tmp_path, monkeypatch) -> None:
     tactic._resource_claims.clear()
     tactic._resource_hints.clear()
     tactic._resource_telemetry.clear()
+    tactic._capacity_elevator_pending_tick = None
+    tactic._capacity_elevator_pre_spawn_worker_ids = frozenset()
+    tactic._capacity_recovery_worker_ids.clear()
     tactic._resource_absence_streak = 0
     tactic._last_harvest_tick = None
     tactic._worker_sector_patrol_start_tick = None
@@ -77,6 +80,9 @@ def _reset_explore_state(tmp_path, monkeypatch) -> None:
     tactic._resource_claims.clear()
     tactic._resource_hints.clear()
     tactic._resource_telemetry.clear()
+    tactic._capacity_elevator_pending_tick = None
+    tactic._capacity_elevator_pre_spawn_worker_ids = frozenset()
+    tactic._capacity_recovery_worker_ids.clear()
     tactic._resource_absence_streak = 0
     tactic._last_harvest_tick = None
     tactic._worker_sector_patrol_start_tick = None
@@ -3744,7 +3750,7 @@ def test_w21_full_core_can_open_one_capacity_elevator_slot() -> None:
     assert action is not None
     assert action.type == "SPAWN"
     assert action.unit_type == UnitType.WORKER
-    assert tactic.MAX_WORKERS == 24
+    assert tactic.MAX_WORKERS == 26
     assert tactic._resource_telemetry["capacity_elevator"] == 1
 
 
@@ -3794,13 +3800,13 @@ def test_w23_full_core_can_open_next_capacity_elevator_slot() -> None:
     assert action is not None
     assert action.type == "SPAWN"
     assert action.unit_type == UnitType.WORKER
-    assert tactic.MAX_WORKERS == 24
+    assert tactic.MAX_WORKERS == 26
     assert tactic._resource_telemetry["full_core_loaded"] == 1
     assert tactic._resource_telemetry["capacity_elevator"] == 1
 
 
-def test_w24_full_core_stops_capacity_elevator_until_canary_review() -> None:
-    """W24 是本轮硬护栏，未完成新一轮收益验证前不继续盲目扩容。"""
+def test_w24_full_core_can_open_w25_capacity_elevator() -> None:
+    """W24 满核全带货时只释放一个 W25 容量槽。"""
     state = _state_with_workers(
         n_workers=24,
         resources=160,
@@ -3816,9 +3822,418 @@ def test_w24_full_core_stops_capacity_elevator_until_canary_review() -> None:
 
     decide(turn)
 
+    action = _core_action(turn.plan)
+    assert action is not None
+    assert action.type == "SPAWN"
+    assert action.unit_type == UnitType.WORKER
+    assert tactic._resource_telemetry["full_core_loaded"] == 1
+    assert tactic._resource_telemetry["capacity_elevator"] == 1
+
+
+@pytest.mark.parametrize("residual_workers", [8, 25])
+def test_w25_residual_cargo_can_open_one_recovery_slot(
+    residual_workers: int,
+) -> None:
+    """W25 满核且有已登记残余货物时只释放唯一的 W26 恢复槽。"""
+    state = _state_with_workers(
+        n_workers=25,
+        resources=165,
+        n_vanguards=4,
+        n_rangers=4,
+    )
+    objects = [obj.model_dump(mode="json") for obj in state.objects]
+    laden = 0
+    for obj in objects:
+        if obj.get("kind") == "UNIT" and obj.get("unit_type") == "WORKER":
+            obj["cargo"] = int(laden < residual_workers)
+            laden += 1
+    new_worker_id = UUID(int=0x2000 + 24)
+    state = _state(
+        resources=165,
+        population=33,
+        objects=objects,
+        events=[
+            {
+                "event_id": str(UUID(int=0x7100)),
+                "event_type": "CORE_SPAWN_SUCCEEDED",
+                "tick": 19,
+                "target_id": str(new_worker_id),
+                "values": {"cost": 11},
+            }
+        ],
+    )
+    turn = _turn(state, tick=20)
+    tactic._capacity_elevator_pending_tick = 19
+    tactic._capacity_elevator_pre_spawn_worker_ids = frozenset(
+        str(worker.id) for worker in turn.workers if worker.id != new_worker_id
+    )
+
+    decide(turn)
+
+    action = _core_action(turn.plan)
+    assert action is not None
+    assert action.type == "SPAWN"
+    assert action.unit_type == UnitType.WORKER
+    assert tactic._resource_telemetry["full_core_loaded"] == int(
+        residual_workers == 25
+    )
+    assert tactic._resource_telemetry["capacity_elevator"] == 1
+    assert tactic._resource_telemetry["capacity_recovery"] == 1
+
+
+def test_w25_one_new_cargo_without_confirmed_w25_does_not_recover() -> None:
+    """直接达到 W25 时，新 Worker 的一件货不能伪造 W26 资格。"""
+    state = _state_with_workers(
+        n_workers=25,
+        resources=165,
+        n_vanguards=4,
+        n_rangers=4,
+    )
+    objects = [obj.model_dump(mode="json") for obj in state.objects]
+    new_worker_id = UUID(int=0x2000 + 24)
+    for obj in objects:
+        if obj.get("kind") == "UNIT" and obj.get("id") == str(new_worker_id):
+            obj["cargo"] = 1
+            break
+    state = _state(resources=165, population=33, objects=objects)
+    turn = _turn(state)
+
+    decide(turn)
+
+    assert _core_action(turn.plan) is None
+    assert tactic._resource_telemetry["capacity_recovery"] == 0
+
+
+def test_w25_full_core_all_laden_without_pending_does_not_recover() -> None:
+    """手动直达 W25 且全员带货时，满核电梯也不能绕过资格门。"""
+    state = _state_with_workers(
+        n_workers=25,
+        resources=165,
+        n_vanguards=4,
+        n_rangers=4,
+    )
+    objects = [obj.model_dump(mode="json") for obj in state.objects]
+    for obj in objects:
+        if obj.get("kind") == "UNIT" and obj.get("unit_type") == "WORKER":
+            obj["cargo"] = 1
+    state = _state(resources=165, population=33, objects=objects)
+    turn = _turn(state)
+
+    decide(turn)
+
     assert _core_action(turn.plan) is None
     assert tactic._resource_telemetry["full_core_loaded"] == 1
     assert tactic._resource_telemetry["capacity_elevator"] == 0
+    assert tactic._resource_telemetry["capacity_recovery"] == 0
+
+
+@pytest.mark.parametrize(
+    ("event_type", "target_selector", "cost", "state_tick"),
+    [
+        ("CORE_SPAWN_SUCCEEDED", "old", 11, 20),
+        ("CORE_SPAWN_SUCCEEDED", "new", 12, 20),
+        ("CORE_SPAWN_SUCCEEDED", "new", 11, 21),
+        ("CORE_SPAWN_FAILED", "new", 11, 20),
+    ],
+)
+def test_w25_success_event_must_match_target_cost_and_next_state(
+    event_type: str,
+    target_selector: str,
+    cost: int,
+    state_tick: int,
+) -> None:
+    """错误目标、错误价格或迟到事件都不能建立 W26 资格。"""
+    state = _state_with_workers(
+        n_workers=25,
+        resources=165,
+        n_vanguards=4,
+        n_rangers=4,
+    )
+    objects = [obj.model_dump(mode="json") for obj in state.objects]
+    old_worker_id = UUID(int=0x2000)
+    new_worker_id = UUID(int=0x2000 + 24)
+    for obj in objects:
+        if obj.get("kind") == "UNIT" and obj.get("id") == str(old_worker_id):
+            obj["cargo"] = 1
+        elif obj.get("kind") == "UNIT" and obj.get("id") == str(new_worker_id):
+            obj["cargo"] = 0
+    target_id = old_worker_id if target_selector == "old" else new_worker_id
+    state = _state(
+        resources=165,
+        population=33,
+        objects=objects,
+        events=[
+            {
+                "event_id": str(UUID(int=0x7110)),
+                "event_type": event_type,
+                "tick": 19,
+                "target_id": str(target_id),
+                "values": {"cost": cost},
+            }
+        ],
+    )
+    tactic._capacity_elevator_pending_tick = 19
+    turn = _turn(state, tick=state_tick)
+    tactic._capacity_elevator_pre_spawn_worker_ids = frozenset(
+        str(worker.id) for worker in turn.workers if worker.id != new_worker_id
+    )
+
+    decide(turn)
+
+    assert _core_action(turn.plan) is None
+    assert tactic._capacity_recovery_worker_ids == set()
+
+
+def test_w25_confirmed_event_excludes_new_worker_cargo() -> None:
+    """即使 W25 成功事件已确认，也只认旧 Worker 的残余货物。"""
+    state = _state_with_workers(
+        n_workers=25,
+        resources=165,
+        n_vanguards=4,
+        n_rangers=4,
+    )
+    objects = [obj.model_dump(mode="json") for obj in state.objects]
+    new_worker_id = UUID(int=0x2000 + 24)
+    for obj in objects:
+        if obj.get("kind") == "UNIT" and obj.get("id") == str(new_worker_id):
+            obj["cargo"] = 1
+            break
+    state = _state(
+        resources=165,
+        population=33,
+        objects=objects,
+        events=[
+            {
+                "event_id": str(UUID(int=0x7101)),
+                "event_type": "CORE_SPAWN_SUCCEEDED",
+                "tick": 19,
+                "target_id": str(new_worker_id),
+                "values": {"cost": 11},
+            }
+        ],
+    )
+    turn = _turn(state, tick=20)
+    tactic._capacity_elevator_pending_tick = 19
+    tactic._capacity_elevator_pre_spawn_worker_ids = frozenset(
+        str(worker.id) for worker in turn.workers if worker.id != new_worker_id
+    )
+
+    decide(turn)
+
+    assert _core_action(turn.plan) is None
+    assert tactic._capacity_recovery_worker_ids == set()
+
+
+def test_w26_recovery_stops_when_dynamic_worker_price_leaves_11_tier() -> None:
+    """人口达到下一价格层时，不静默批准昂贵的 W26。"""
+    state = _state_with_workers(
+        n_workers=25,
+        resources=175,
+        n_vanguards=5,
+        n_rangers=5,
+    )
+    objects = [obj.model_dump(mode="json") for obj in state.objects]
+    old_worker_id = UUID(int=0x2000)
+    new_worker_id = UUID(int=0x2000 + 24)
+    for obj in objects:
+        if obj.get("kind") == "UNIT" and obj.get("id") == str(old_worker_id):
+            obj["cargo"] = 1
+        elif obj.get("kind") == "UNIT" and obj.get("id") == str(new_worker_id):
+            obj["cargo"] = 0
+    state = _state(
+        resources=175,
+        population=35,
+        objects=objects,
+        events=[
+            {
+                "event_id": str(UUID(int=0x7104)),
+                "event_type": "CORE_SPAWN_SUCCEEDED",
+                "tick": 19,
+                "target_id": str(new_worker_id),
+                "values": {"cost": 11},
+            }
+        ],
+    )
+    tactic._capacity_elevator_pending_tick = 19
+    tactic._capacity_elevator_pre_spawn_worker_ids = frozenset(
+        str(worker.id) for worker in _turn(state, tick=20).workers
+        if worker.id != new_worker_id
+    )
+    turn = _turn(state, tick=20)
+
+    decide(turn)
+
+    assert _core_action(turn.plan) is None
+    assert tactic._resource_telemetry["capacity_recovery"] == 0
+
+
+def test_zeroed_recovery_worker_never_requalifies_from_new_cargo() -> None:
+    """旧残余 Worker 清空后再次采集，也不能重新获得 W26 资格。"""
+    state = _state_with_workers(
+        n_workers=25,
+        resources=165,
+        n_vanguards=4,
+        n_rangers=4,
+    )
+    objects = [obj.model_dump(mode="json") for obj in state.objects]
+    old_worker_id = UUID(int=0x2000)
+    new_worker_id = UUID(int=0x2000 + 24)
+    for obj in objects:
+        if obj.get("kind") == "UNIT" and obj.get("id") == str(old_worker_id):
+            obj["cargo"] = 1
+        elif obj.get("kind") == "UNIT" and obj.get("id") == str(new_worker_id):
+            obj["cargo"] = 0
+    confirmed = _state(
+        resources=165,
+        population=33,
+        objects=objects,
+        events=[
+            {
+                "event_id": str(UUID(int=0x7102)),
+                "event_type": "CORE_SPAWN_SUCCEEDED",
+                "tick": 19,
+                "target_id": str(new_worker_id),
+                "values": {"cost": 11},
+            }
+        ],
+    )
+    tactic._capacity_elevator_pending_tick = 19
+    tactic._capacity_elevator_pre_spawn_worker_ids = frozenset(
+        str(worker.id) for worker in _turn(state, tick=20).workers
+        if worker.id != new_worker_id
+    )
+    tactic._process_events(_turn(confirmed, tick=20))
+    assert tactic._capacity_recovery_worker_ids == {str(old_worker_id)}
+
+    emptied_objects = [obj.model_dump(mode="json") for obj in confirmed.objects]
+    for obj in emptied_objects:
+        if obj.get("kind") == "UNIT" and obj.get("id") == str(old_worker_id):
+            obj["cargo"] = 0
+    emptied = _state(resources=165, population=33, objects=emptied_objects)
+    tactic._process_events(_turn(emptied, tick=21))
+    assert tactic._capacity_recovery_worker_ids == set()
+
+    refilled_objects = [obj.model_dump(mode="json") for obj in emptied.objects]
+    for obj in refilled_objects:
+        if obj.get("kind") == "UNIT" and obj.get("id") == str(old_worker_id):
+            obj["cargo"] = 1
+    refilled = _state(resources=165, population=33, objects=refilled_objects)
+    turn = _turn(refilled, tick=22)
+    decide(turn)
+    assert _core_action(turn.plan) is None
+
+
+def test_w25_core_residual_without_exit_does_not_recover() -> None:
+    """残余 Worker 被困在 Core 同格且无出口时不提交 W26。"""
+    state = _state_with_workers(
+        n_workers=25,
+        resources=165,
+        n_vanguards=4,
+        n_rangers=4,
+    )
+    objects = [obj.model_dump(mode="json") for obj in state.objects]
+    old_worker_id = UUID(int=0x2000)
+    new_worker_id = UUID(int=0x2000 + 24)
+    for obj in objects:
+        if obj.get("kind") == "UNIT" and obj.get("id") == str(old_worker_id):
+            obj["position"] = [0, 0]
+            obj["cargo"] = 1
+        elif obj.get("kind") == "UNIT" and obj.get("id") == str(new_worker_id):
+            obj["cargo"] = 0
+    objects.append(
+        {
+            "kind": "OBSTACLE",
+            "positions": [[1, 0], [-1, 0], [0, 1], [0, -1]],
+        }
+    )
+    state = _state(
+        resources=165,
+        population=33,
+        objects=objects,
+        events=[
+            {
+                "event_id": str(UUID(int=0x7103)),
+                "event_type": "CORE_SPAWN_SUCCEEDED",
+                "tick": 19,
+                "target_id": str(new_worker_id),
+                "values": {"cost": 11},
+            }
+        ],
+    )
+    tactic._capacity_elevator_pending_tick = 19
+    tactic._capacity_elevator_pre_spawn_worker_ids = frozenset(
+        str(worker.id) for worker in _turn(state, tick=20).workers
+        if worker.id != new_worker_id
+    )
+    turn = _turn(state, tick=20)
+
+    decide(turn)
+
+    assert _core_action(turn.plan) is None
+    assert tactic._resource_telemetry["capacity_recovery"] == 0
+
+
+def test_w25_without_residual_cargo_stops_capacity_recovery() -> None:
+    """W25 没有待交付货物时不为单纯人口增长再开 W26。"""
+    state = _state_with_workers(
+        n_workers=25,
+        resources=165,
+        n_vanguards=4,
+        n_rangers=4,
+    )
+    turn = _turn(state)
+
+    decide(turn)
+
+    assert _core_action(turn.plan) is None
+    assert tactic._resource_telemetry["capacity_recovery"] == 0
+
+
+def test_w26_is_hard_capacity_recovery_stop() -> None:
+    """W26 之后硬停止，避免容量电梯变成无限 Worker 增长。"""
+    state = _state_with_workers(
+        n_workers=26,
+        resources=170,
+        n_vanguards=4,
+        n_rangers=4,
+    )
+    objects = [obj.model_dump(mode="json") for obj in state.objects]
+    laden = 0
+    for obj in objects:
+        if obj.get("kind") == "UNIT" and obj.get("unit_type") == "WORKER":
+            obj["cargo"] = int(laden < 8)
+            laden += 1
+    state = _state(resources=170, population=34, objects=objects)
+    turn = _turn(state)
+
+    decide(turn)
+
+    assert _core_action(turn.plan) is None
+    assert tactic._resource_telemetry["capacity_recovery"] == 0
+
+
+def test_w25_residual_recovery_stays_blocked_under_enemy() -> None:
+    """敌情出现时优先护核/补军备，不抢资源开 W26。"""
+    state = _state_with_workers(
+        n_workers=25,
+        resources=165,
+        n_vanguards=4,
+        n_rangers=4,
+        threat=True,
+    )
+    objects = [obj.model_dump(mode="json") for obj in state.objects]
+    laden = 0
+    for obj in objects:
+        if obj.get("kind") == "UNIT" and obj.get("unit_type") == "WORKER":
+            obj["cargo"] = int(laden < 8)
+            laden += 1
+    state = _state(resources=165, population=33, objects=objects)
+    turn = _turn(state)
+
+    decide(turn)
+
+    assert _core_action(turn.plan) is None
+    assert tactic._resource_telemetry["capacity_recovery"] == 0
 
 
 def test_full_core_without_all_workers_laden_does_not_use_capacity_elevator() -> None:
@@ -5556,23 +5971,30 @@ def test_monitor_tracks_saturation_and_longest_full_streak(tmp_path) -> None:
         )
 
     log_path = tmp_path / "game.log"
-    lines = [line(10, 10, "full1,elev0")]
+    lines = [line(10, 10, "full1,elev0,rec0")]
     lines.extend(
-        line(tick, 10, "full1,elev1" if tick == 11 else "full1,elev0")
+        line(
+            tick,
+            10,
+            "full1,elev1,rec1"
+            if tick == 11
+            else "full1,elev0,rec0",
+        )
         for tick in range(11, 25)
     )
     lines.extend(
-        [line(25, 9, "full0,elev0"), line(26, 10, "full1,elev0")]
+        [line(25, 9, "full0,elev0,rec0"), line(26, 10, "full1,elev0,rec0")]
     )
     log_path.write_text("".join(lines), encoding="utf-8")
 
-    record = monitor._parse_line(line(11, 10, "full1,elev1"))
+    record = monitor._parse_line(line(11, 10, "full1,elev1,rec1"))
     assert record is not None
-    assert record["sat"] == {"full": 1, "elev": 1}
+    assert record["sat"] == {"full": 1, "elev": 1, "rec": 1}
 
     kpi = monitor.analyze(log_path)
     assert kpi.full_core_loaded_ticks == 16
     assert kpi.capacity_elevator_spawns == 1
+    assert kpi.capacity_recovery_spawns == 1
     assert kpi.idle_gold_streak == 15
     assert any("IDLE_GOLD" in alert for alert in monitor.detect_bottlenecks(kpi))
     assert any("FULL_CORE_LOCK" in alert for alert in monitor.detect_bottlenecks(kpi))

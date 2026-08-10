@@ -105,6 +105,7 @@ class KPI:
     idle_gold_streak: int = 0       # longest run of consecutive capacity-sitting ticks
     full_core_loaded_ticks: int = 0  # ticks with a full Core and every Worker laden
     capacity_elevator_spawns: int = 0  # bounded Worker spawns used to release that lock
+    capacity_recovery_spawns: int = 0  # W26 continuation spawns that clear residual cargo
     resource_drops: int = 0         # ticks where resources fell > RESOURCE_DROP_THRESHOLD w/o spawn
     largest_drop: int = 0
     ticks_with_enemy_visible: int = 0
@@ -451,6 +452,7 @@ def analyze(path: str | Path) -> KPI:
                 sat = rec.get("sat", {})
                 kpi.full_core_loaded_ticks += sat.get("full", 0)
                 kpi.capacity_elevator_spawns += sat.get("elev", 0)
+                kpi.capacity_recovery_spawns += sat.get("rec", 0)
                 eco = rec.get("eco", {})
                 kpi.resource_assignments += eco.get("a", 0)
                 kpi.visible_resource_assignments += eco.get("av", 0)
@@ -748,7 +750,8 @@ def report(kpi: KPI, alerts: list[str]) -> str:
     lines.append(
         f"Saturation     : full Core + all Workers laden "
         f"{kpi.full_core_loaded_ticks} ticks; capacity-elevator spawns "
-        f"{kpi.capacity_elevator_spawns}; longest full streak "
+        f"{kpi.capacity_elevator_spawns} "
+        f"(recovery {kpi.capacity_recovery_spawns}); longest full streak "
         f"{kpi.idle_gold_streak} ticks"
     )
     lines.append(
