@@ -54,6 +54,7 @@ from __future__ import annotations
 
 import heapq
 import json
+import sys
 from collections import Counter, deque
 from dataclasses import dataclass
 from pathlib import Path
@@ -526,6 +527,25 @@ _last_saved_explored: int = 0
 # (15,208) that the tactic had forgotten). Mirrors the reference agent's
 # load_persistent_state/save_state.
 _STATE_PATH = Path(__file__).resolve().parent / "tactic_state.json"
+
+# Flag-file trigger for the lightweight automatic Core-migration controller.
+# When this file exists, `decide()` reads a single ``x,y`` target coordinate
+# from its first line and steps the Core toward it one cell per tick (queueing
+# ``start_move`` and returning immediately so the MOVING-state guard in
+# ``_control_core`` handles the rest). Removing the file aborts migration.
+# This is a pure addition: when the file is absent the decide() path is byte-
+# for-byte identical to the pre-migration behavior.
+MIGRATE_FLAG_PATH = Path(__file__).resolve().parent / "migrate.flag"
+
+# Consecutive ticks the migration controller is willing to wait when all four
+# neighbor cells are blocked (usually by friendly Units clustering around the
+# Core).  After this many stalls it gives up and removes the flag so it does
+# not spin forever.
+MIGRATE_MAX_STALL_TICKS = 30
+
+# Counter reset to 0 whenever a successful step is taken or the flag is
+# removed.  Declared at module scope so it persists across ticks.
+_migrate_stall_ticks: int = 0
 
 
 def _load_persistent_state() -> None:
@@ -4726,6 +4746,107 @@ def _clear_exploration_state() -> None:
     _worker_sector_patrol_start_tick = None
 
 
+def _try_migrate_core(turn: "Turn") -> bool:
+    """Lightweight Core-migration controller driven by a flag file.
+
+    Reads ``MIGRATE_FLAG_PATH`` (a single ``x,y`` target line).  When present
+    and the Core is in NORMAL state, queues one ``start_move`` toward the
+    target and returns ``True`` so the caller short-circuits the rest of
+    ``decide()`` (a MOVING Core cannot spawn/repair/deposit anyway, and the
+    core_action slot is already consumed).  Returns ``False`` — leaving
+    ``decide()`` on its normal path — when the flag is absent, the Core is
+    already at the target, the Core is MOVING, or the Core is None.
+
+    This is a pure addition: when ``MIGRATE_FLAG_PATH`` does not exist the
+    function is a fast ``is_file`` check + early return and the rest of
+    ``decide()`` is byte-for-byte identical to the pre-migration behavior.
+    """
+    global _migrate_stall_ticks
+    import os
+
+    if not MIGRATE_FLAG_PATH.is_file():
+        return False
+
+    core = turn.core
+    if core is None:
+        print("MIGRATE: core is None (respawn), skipping", file=sys.stderr)
+        return False
+
+    if core.view.state != "NORMAL":
+        # MOVING or otherwise busy — wait for the current step to resolve.
+        return False
+
+    # Parse the flag file.
+    try:
+        raw = MIGRATE_FLAG_PATH.read_text(encoding="utf-8").strip()
+        parts = [p.strip() for p in raw.split(",")]
+        if len(parts) != 2:
+            raise ValueError(f"expected 'x,y', got {raw!r}")
+        target = (int(parts[0]), int(parts[1]))
+    except (OSError, ValueError) as exc:
+        print(f"MIGRATE: invalid flag content, flag removed ({exc})", file=sys.stderr)
+        try:
+            MIGRATE_FLAG_PATH.unlink()
+        except OSError:
+            pass
+        return False
+
+    current = (int(core.position[0]), int(core.position[1]))
+    if current == target:
+        print(f"MIGRATE: arrived at {target}, flag removed", file=sys.stderr)
+        try:
+            MIGRATE_FLAG_PATH.unlink()
+        except OSError:
+            pass
+        return False
+
+    # Step toward the target using the existing single-step router so the
+    # Core detours around known obstacles instead of walking into them.
+    # Also block cells occupied by friendly Units (Workers/Vanguards/Rangers)
+    # so the Core does not queue a start_move into a cell that will fail with
+    # CORE_MOVE_START_FAILED.CELL_UNIT_LIMIT (the game rejects Core movement
+    # into a cell already containing a Unit).  The Core's own cell is excluded.
+    blocked: set[tuple[int, int]] = set(_known_obstacles)
+    for unit in turn.units:
+        upos = (int(unit.position[0]), int(unit.position[1]))
+        if upos != current:
+            blocked.add(upos)
+    direction = _step_toward(
+        current,
+        target,
+        frozenset(blocked),
+    )
+    if direction is None:
+        # All four neighbors are blocked — usually by friendly Units
+        # clustering around the Core (patrol/guard logic).  Do NOT delete the
+        # flag immediately: the Units move every tick and will likely clear a
+        # path next tick.  Track consecutive stalls and only give up after a
+        # bounded grace period so a transient cluster does not abort the
+        # migration permanently.
+        _migrate_stall_ticks += 1
+        if _migrate_stall_ticks > MIGRATE_MAX_STALL_TICKS:
+            print(
+                f"MIGRATE: blocked at {current} for {_migrate_stall_ticks} ticks, "
+                f"giving up, flag removed",
+                file=sys.stderr,
+            )
+            try:
+                MIGRATE_FLAG_PATH.unlink()
+            except OSError:
+                pass
+            _migrate_stall_ticks = 0
+        return False
+
+    # A valid step was found — reset the stall counter.
+    _migrate_stall_ticks = 0
+    core.start_move(direction)
+    print(
+        f"MIGRATE: step {current} -> {target} dir={direction.value}",
+        file=sys.stderr,
+    )
+    return True
+
+
 def decide(turn: "Turn") -> None:
     """Queue a complete plan for one Turn based only on its authoritative state.
 
@@ -4744,6 +4865,16 @@ def decide(turn: "Turn") -> None:
     _observe_terrain(turn)
     _observe_resources(turn)
     _observe_enemies(turn)
+
+    # Lightweight Core-migration controller.  When a ``migrate.flag`` file is
+    # present, queue one ``start_move`` toward its target and short-circuit:
+    # a MOVING Core cannot act, and the core_action slot is consumed by the
+    # move.  Workers still move this tick because the rest of ``decide()`` is
+    # skipped — but the next tick the MOVING-state guard (``_control_core``)
+    # handles the transition.  When the flag is absent this is a no-op.
+    if _try_migrate_core(turn):
+        _flush_persistent_state()
+        return
 
     core = turn.core
     if core is None:
