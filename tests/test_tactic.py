@@ -4369,19 +4369,79 @@ def test_capital_sink_requires_authoritative_success_and_repayment_chain() -> No
 
 
 def test_capital_sink_stops_when_price_moves_out_of_reviewed_tier() -> None:
-    """人口/手动扩军把价格推到下一档时，出口必须停止。"""
+    """人口/手动扩军把价格推到未审查档（tier 5+, V=37/R=45）时，出口必须停止。"""
     state = _full_w26_state(
-        resources=180,
-        n_vanguards=5,
+        resources=200,
+        n_vanguards=9,
         n_rangers=5,
     )
-    # W26 + V5 + R5 = population 36, Vanguard price is 29, outside the
-    # reviewed 22/26 experiment tier.
+    # W26 + V9 + R5 = population 40, Vanguard price is 37, outside the
+    # reviewed {22,29}/{26,34} experiment tiers.
     for tick in range(400, 415):
         turn = _turn(state, tick=tick)
         decide(turn)
     assert _core_action(turn.plan) is None
     assert tactic._resource_telemetry.get("capital_sink_price_blocked") == 1
+
+
+def test_capital_sink_allows_tier4_price_after_first_sink() -> None:
+    """第一次沉淀后人口 34→35，第二次沉淀定价为 tier 4 (V=29)，应在允许清单内。"""
+    # pop35 = W26 + V5 + R4 → Vanguard price = 29 (tier 4)
+    state = _full_w26_state(
+        resources=180,
+        n_vanguards=5,
+        n_rangers=4,
+    )
+    assert state.population == 35
+    from arena_hero import unit_cost
+    assert unit_cost(UnitType.VANGUARD, 35) == 29
+
+    # Tier 4 Vanguard costs 29, but 26 Workers with cargo=1 only sum to 26.
+    # Boost 3 Workers to cargo=2 so cargo_total >= 29.
+    objects = [obj.model_dump(mode="json") for obj in state.objects]
+    boosted = 0
+    for obj in objects:
+        if obj.get("kind") == "UNIT" and obj.get("unit_type") == "WORKER":
+            obj["cargo"] = 2
+            boosted += 1
+            if boosted >= 3:
+                break
+    state = _state(
+        resources=180,
+        population=35,
+        objects=objects,
+    )
+
+    for tick in range(500, 514):
+        decide(_turn(state, tick=tick))
+
+    turn = _turn(state, tick=514)
+    decide(turn)
+
+    action = _core_action(turn.plan)
+    assert action is not None
+    assert action.type == "SPAWN"
+    assert action.unit_type == UnitType.VANGUARD
+    assert tactic._resource_telemetry.get("capital_sink_price_blocked", 0) != 1
+
+
+def test_capital_sink_price_block_clears_on_core_destruction() -> None:
+    """Core 被摧毁后 _capital_sink_price_blocked 应清除，允许后续重新武装。"""
+    # 先用 pop40 触发锁定
+    state = _full_w26_state(resources=200, n_vanguards=9, n_rangers=5)
+    for tick in range(600, 615):
+        decide(_turn(state, tick=tick))
+    assert tactic._capital_sink_price_blocked is True
+
+    # Core 被摧毁：core is None
+    destroyed_state = _state(
+        resources=5,
+        population=1,
+        objects=[],  # 无 Core
+    )
+    turn = _turn(destroyed_state, tick=616)
+    decide(turn)
+    assert tactic._capital_sink_price_blocked is False
 
 
 def test_w25_residual_recovery_stays_blocked_under_enemy() -> None:

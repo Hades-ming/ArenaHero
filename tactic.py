@@ -429,8 +429,8 @@ CAPITAL_SINK_STREAK_TICKS = 15
 CAPITAL_SINK_RESERVE = 3
 CAPITAL_SINK_MAX_ETA = CHASE_MAX_TICKS
 CAPITAL_SINK_ALLOWED_COSTS = {
-    UnitType.VANGUARD: 22,
-    UnitType.RANGER: 26,
+    UnitType.VANGUARD: {22, 29},  # tier 3 (pop30-34) + tier 4 (pop35-39)
+    UnitType.RANGER: {26, 34},    # tier 3 (pop30-34) + tier 4 (pop35-39)
 }
 _capital_sink_full_loaded_streak = 0
 _capital_sink_pending_tick: int | None = None
@@ -3803,14 +3803,19 @@ def _try_capital_sink(
         else UnitType.VANGUARD
     )
     expected_cost = unit_cost(unit_type, turn.state.population)
-    # 只做当前已审查的 30-34 人口价格档实验；如果人口或 Manual 生产把
-    # 价格推到下一档，停机等待重新审查，而不是默默扩大资本风险。
-    if expected_cost != CAPITAL_SINK_ALLOWED_COSTS[unit_type]:
+    # 只做当前已审查的价格档实验（tier 3: V=22/R=26, tier 4: V=29/R=34）；
+    # 如果人口或 Manual 生产把价格推到下一档（tier 5+: V=37/R=45+），
+    # 停机等待重新审查，而不是默默扩大资本风险。
+    if expected_cost not in CAPITAL_SINK_ALLOWED_COSTS[unit_type]:
         _capital_sink_price_blocked = True
         _resource_telemetry["capital_sink_price_blocked"] = 1
         return False
     cargo_total = sum(max(0, int(worker.cargo)) for worker in turn.workers)
-    if cargo_total < expected_cost:
+    # tier 3 (V=22) 时 26 个 Worker 各带 1 = 26 >= 22，可直接回补；
+    # tier 4 (V=29) 时 26 < 29，但 Core 满载 175 足以先支付，后续多 Tick
+    # harvest→deposit 回补。只要经济体总资源（Core 存货 + Worker 货载）
+    # 不低于成本两倍，沉淀后仍有充分缓冲，不会把 Core 资源耗尽到危险线。
+    if cargo_total + available_resources < expected_cost * 2:
         return False
     if available_resources < expected_cost + CAPITAL_SINK_RESERVE:
         return False
@@ -4479,6 +4484,7 @@ def _process_events(turn: "Turn") -> None:
         _capital_sink_repaid = 0
         _capital_sink_harvest_workers.clear()
         _capital_sink_chain_workers.clear()
+        _capital_sink_price_blocked = False
 
     current_units = {str(unit.id): unit for unit in turn.units}
     pending_tick = _capital_sink_pending_tick
