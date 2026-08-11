@@ -4368,19 +4368,88 @@ def test_capital_sink_requires_authoritative_success_and_repayment_chain() -> No
     assert tactic._capital_sink_repaid == 0
 
 
-def test_capital_sink_stops_when_price_moves_out_of_reviewed_tier() -> None:
-    """人口/手动扩军把价格推到未审查档（tier 5+, V=37/R=45）时，出口必须停止。"""
+def test_capital_sink_spawns_at_tier5_without_permanent_price_block() -> None:
+    """tier 5 (pop40, V=37/R=45) 在扩展后的 allow-list 内，应触发 SPAWN 而非永久锁死。"""
+    # W26 + V9 + R5 = population 40, Vanguard price is 37 (tier 5), now inside
+    # the extended {22,29,37,48}/{26,34,45,58} allow-list.
     state = _full_w26_state(
         resources=200,
         n_vanguards=9,
         n_rangers=5,
     )
-    # W26 + V9 + R5 = population 40, Vanguard price is 37, outside the
-    # reviewed {22,29}/{26,34} experiment tiers.
-    for tick in range(400, 415):
-        turn = _turn(state, tick=tick)
-        decide(turn)
+    for tick in range(400, 414):
+        decide(_turn(state, tick=tick))
+
+    turn = _turn(state, tick=414)
+    decide(turn)
+    action = _core_action(turn.plan)
+    assert action is not None
+    assert action.type == "SPAWN"
+    assert action.unit_type == UnitType.VANGUARD
+    # 预检不匹配时不再置永久闩锁——价格在清单内当然更不能锁死。
+    assert tactic._capital_sink_price_blocked is False
+    assert tactic._resource_telemetry.get("capital_sink_price_blocked", 0) != 1
+
+
+def test_capital_sink_precheck_mismatch_skips_cycle_without_latching() -> None:
+    """预检价格超出 allow-list（如 tier 7: V=63）时只 return False，不置永久闩锁。"""
+    # W26 + V19 + R5 = population 50, Vanguard price is 63 (tier 7), outside the
+    # extended allow-list {22,29,37,48}/{26,34,45,58}.
+    state = _full_w26_state(
+        resources=200,
+        n_vanguards=19,
+        n_rangers=5,
+    )
+    assert state.population == 50
+    from arena_hero import unit_cost
+    assert unit_cost(UnitType.VANGUARD, 50) == 63
+
+    for tick in range(500, 515):
+        decide(_turn(state, tick=tick))
+    # 预检不匹配：本周期跳过，core_action 为 None。
+    turn = _turn(state, tick=515)
+    decide(turn)
     assert _core_action(turn.plan) is None
+    # 关键断言：不置永久闩锁——下次满核 streak 重新累积时可重试。
+    assert tactic._capital_sink_price_blocked is False
+    assert tactic._resource_telemetry.get("capital_sink_price_blocked", 0) != 1
+
+
+def test_capital_sink_receipt_price_mismatch_still_latches() -> None:
+    """spawn 后回执价格不匹配仍置 _capital_sink_price_blocked（回执闩锁保留）。"""
+    # tier 5 (pop40, V=37) 在 allow-list 内，预检通过、发出 SPAWN 请求。
+    state = _full_w26_state(
+        resources=200,
+        n_vanguards=9,
+        n_rangers=5,
+    )
+    for tick in range(600, 614):
+        decide(_turn(state, tick=tick))
+    turn = _turn(state, tick=614)
+    decide(turn)
+    assert tactic._capital_sink_pending_tick == 614
+    assert tactic._capital_sink_price_blocked is False
+
+    # 回执：CORE_SPAWN_SUCCEEDED 但 cost 与 pending_cost 不匹配 → price_mismatch。
+    mismatched_unit_id = UUID(int=0x3000 + 9)
+    mismatch_event = {
+        "event_id": str(UUID(int=0xA900)),
+        "event_type": "CORE_SPAWN_SUCCEEDED",
+        "tick": 614,
+        "target_id": str(mismatched_unit_id),
+        "values": {"cost": 999},  # 与 pending_cost=37 不匹配
+    }
+    next_turn = _turn(
+        _full_w26_state(
+            resources=163,
+            n_vanguards=10,
+            events=[mismatch_event],
+        ),
+        tick=615,
+    )
+    decide(next_turn)
+    # 回执闩锁保留：真实 spawn 异常仍硬停机。
+    assert tactic._capital_sink_price_blocked is True
     assert tactic._resource_telemetry.get("capital_sink_price_blocked") == 1
 
 
@@ -4427,10 +4496,25 @@ def test_capital_sink_allows_tier4_price_after_first_sink() -> None:
 
 def test_capital_sink_price_block_clears_on_core_destruction() -> None:
     """Core 被摧毁后 _capital_sink_price_blocked 应清除，允许后续重新武装。"""
-    # 先用 pop40 触发锁定
+    # 通过回执 price_mismatch 触发闩锁（预检闩锁已移除，回执闩锁是唯一置锁路径）。
     state = _full_w26_state(resources=200, n_vanguards=9, n_rangers=5)
-    for tick in range(600, 615):
+    for tick in range(600, 614):
         decide(_turn(state, tick=tick))
+    turn = _turn(state, tick=614)
+    decide(turn)
+    assert tactic._capital_sink_pending_tick == 614
+    mismatch_event = {
+        "event_id": str(UUID(int=0xA910)),
+        "event_type": "CORE_SPAWN_SUCCEEDED",
+        "tick": 614,
+        "target_id": str(UUID(int=0x3000 + 9)),
+        "values": {"cost": 999},
+    }
+    receipt_turn = _turn(
+        _full_w26_state(resources=163, n_vanguards=10, events=[mismatch_event]),
+        tick=615,
+    )
+    decide(receipt_turn)
     assert tactic._capital_sink_price_blocked is True
 
     # Core 被摧毁：core is None
@@ -6811,3 +6895,200 @@ def test_play_logs_decision_and_submit_failures_without_exception_text(
     assert lines[1].startswith("t2 ST[SUBMIT_FAILED] ER[API_ERROR]")
     assert lines[2].startswith("t3 ST[SUBMIT_FAILED] ER[UNKNOWN_ERROR]")
     assert all("secret" not in line.lower() for line in lines)
+
+
+def test_low_hp_vanguard_retreats_to_core_even_with_guard_target() -> None:
+    # A 1-HP Vanguard sitting on a Core-adjacent guard cell must step onto the
+    # Core cell this Tick so the next Tick can HEAL, instead of being pinned on
+    # the guard ring by its guard assignment. Regression for the
+    # ``hp <= 1 and target is None`` gate that previously overrode the retreat.
+    state = _state(
+        resources=5,
+        population=1,
+        objects=[
+            {
+                "kind": "CORE",
+                "id": str(CORE_ID),
+                "controlled": True,
+                "owner_username": "arena_hero",
+                "position": [0, 0],
+                "hp": 5,
+                "shield": 5,
+                "state": "NORMAL",
+            },
+            {
+                "kind": "UNIT",
+                "id": str(WORKER_ID),
+                "controlled": True,
+                "position": [5, 5],
+                "hp": 2,
+                "unit_type": "WORKER",
+                "cargo": 0,
+            },
+            {
+                "kind": "UNIT",
+                "id": str(VANGUARD_ID),
+                "controlled": True,
+                "position": [1, 0],
+                "hp": 1,
+                "unit_type": "VANGUARD",
+                "cargo": None,
+            },
+        ],
+    )
+    turn = _turn(state)
+    decide(turn)
+    action = _action(turn.plan, VANGUARD_ID)
+    # The Vanguard is one step EAST of the Core; retreat steps LEFT onto it.
+    assert action is not None
+    assert action.type == "MOVE"
+    assert action.direction == Direction.LEFT
+
+
+def test_low_hp_ranger_retreats_to_core_when_no_shot() -> None:
+    # A 1-HP Ranger with no shootable target must step toward the Core instead
+    # of holding the guard ring or chasing. Previously _control_rangers had no
+    # 1-HP retreat branch at all, so a wounded Ranger never reached the Core
+    # cell and could never satisfy the heal precondition.
+    state = _state(
+        resources=5,
+        population=1,
+        objects=[
+            {
+                "kind": "CORE",
+                "id": str(CORE_ID),
+                "controlled": True,
+                "owner_username": "arena_hero",
+                "position": [0, 0],
+                "hp": 5,
+                "shield": 5,
+                "state": "NORMAL",
+            },
+            {
+                "kind": "UNIT",
+                "id": str(WORKER_ID),
+                "controlled": True,
+                "position": [5, 5],
+                "hp": 2,
+                "unit_type": "WORKER",
+                "cargo": 0,
+            },
+            {
+                "kind": "UNIT",
+                "id": str(RANGER_ID),
+                "controlled": True,
+                "position": [0, 1],
+                "hp": 1,
+                "unit_type": "RANGER",
+                "cargo": None,
+            },
+        ],
+    )
+    turn = _turn(state)
+    decide(turn)
+    action = _action(turn.plan, RANGER_ID)
+    # The Ranger is one step SOUTH of the Core; retreat steps UP onto it.
+    assert action is not None
+    assert action.type == "MOVE"
+    assert action.direction == Direction.UP
+
+
+def test_low_hp_vanguard_on_core_heals_without_being_pulled_off() -> None:
+    # Once the 1-HP Vanguard has stepped onto the Core cell, the next Tick must
+    # HEAL it rather than issue a guard-ring move that would pull it back off
+    # the Core and re-break the heal precondition. Resources are ample (>=3).
+    state = _state(
+        resources=5,
+        population=1,
+        objects=[
+            {
+                "kind": "CORE",
+                "id": str(CORE_ID),
+                "controlled": True,
+                "owner_username": "arena_hero",
+                "position": [0, 0],
+                "hp": 5,
+                "shield": 5,
+                "state": "NORMAL",
+            },
+            {
+                "kind": "UNIT",
+                "id": str(WORKER_ID),
+                "controlled": True,
+                "position": [5, 5],
+                "hp": 2,
+                "unit_type": "WORKER",
+                "cargo": 0,
+            },
+            {
+                "kind": "UNIT",
+                "id": str(VANGUARD_ID),
+                "controlled": True,
+                "position": [0, 0],
+                "hp": 1,
+                "unit_type": "VANGUARD",
+                "cargo": None,
+            },
+        ],
+    )
+    turn = _turn(state)
+    decide(turn)
+    action = _action(turn.plan, VANGUARD_ID)
+    assert action is not None
+    assert action.type == "HEAL"
+
+
+def test_adjacent_low_hp_unit_reservation_protects_heal_resources() -> None:
+    # A 1-HP Unit one step from the Core is about to retreat aboard and heal
+    # next Tick. _reserve_unit_heals must hold its heal cost out of the Core's
+    # available budget so a Core action this Tick cannot spend the resources
+    # the Unit will need. Verify the reservation reduces the returned budget.
+    state = _state(
+        resources=4,
+        population=2,
+        objects=[
+            {
+                "kind": "CORE",
+                "id": str(CORE_ID),
+                "controlled": True,
+                "owner_username": "arena_hero",
+                "position": [0, 0],
+                "hp": 5,
+                "shield": 5,
+                "state": "NORMAL",
+            },
+            {
+                "kind": "UNIT",
+                "id": str(WORKER_ID),
+                "controlled": True,
+                "position": [5, 5],
+                "hp": 2,
+                "unit_type": "WORKER",
+                "cargo": 0,
+            },
+            {
+                "kind": "UNIT",
+                "id": str(VANGUARD_ID),
+                "controlled": True,
+                "position": [1, 0],
+                "hp": 1,
+                "unit_type": "VANGUARD",
+                "cargo": None,
+            },
+            {
+                "kind": "UNIT",
+                "id": str(RANGER_ID),
+                "controlled": True,
+                "position": [0, 1],
+                "hp": 1,
+                "unit_type": "RANGER",
+                "cargo": None,
+            },
+        ],
+    )
+    turn = _turn(state)
+    heal_ids, remaining = tactic._reserve_unit_heals(turn, (0, 0), 4)
+    # Neither Unit is on the Core yet, so neither is in heal_ids (an off-Core
+    # heal() would be illegal), but their heal costs (3 + 1 = 4) are held.
+    assert heal_ids == frozenset()
+    assert remaining == 0

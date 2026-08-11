@@ -429,8 +429,9 @@ CAPITAL_SINK_STREAK_TICKS = 15
 CAPITAL_SINK_RESERVE = 3
 CAPITAL_SINK_MAX_ETA = CHASE_MAX_TICKS
 CAPITAL_SINK_ALLOWED_COSTS = {
-    UnitType.VANGUARD: {22, 29},  # tier 3 (pop30-34) + tier 4 (pop35-39)
-    UnitType.RANGER: {26, 34},    # tier 3 (pop30-34) + tier 4 (pop35-39)
+    # tier 3 (pop30-34) + tier 4 (pop35-39) + tier 5 (pop40-44) + tier 6 (pop45-49)
+    UnitType.VANGUARD: {22, 29, 37, 48},
+    UnitType.RANGER: {26, 34, 45, 58},
 }
 _capital_sink_full_loaded_streak = 0
 _capital_sink_pending_tick: int | None = None
@@ -2876,8 +2877,20 @@ def _reserve_unit_heals(
     enemies = turn.visible_enemies
     obstacles = frozenset(turn.obstacle_cells) | _known_obstacles
     candidates: list[tuple[str, int]] = []
+    # 1-HP Units one step away from the Core will retreat onto the Core cell
+    # this Tick (see the ``hp <= 1`` branches in _control_vanguards and
+    # _control_rangers) and heal next Tick. Reserve their heal cost now so a
+    # Core spawn/repair in between cannot spend the resources they will need,
+    # but do NOT add them to heal_ids: they are not on the Core cell yet and a
+    # heal() issued off-Core is illegal. ``adjacent_reservations`` tracks the
+    # resource hold only.
+    adjacent_reservations: list[tuple[str, int]] = []
+    cx, cy = core_pos
     for unit in sorted(turn.units, key=lambda item: str(item.id)):
-        if unit.position != core_pos:
+        on_core = unit.position == core_pos
+        manhattan = abs(unit.position[0] - cx) + abs(unit.position[1] - cy)
+        adjacent = manhattan == 1
+        if not on_core and not adjacent:
             continue
         # Combat has higher value than recovery in a contested Tick.  A legal
         # attack is resolved before Unit HEAL, so do not reserve resources for
@@ -2897,8 +2910,12 @@ def _reserve_unit_heals(
             missing = 2 - unit.hp
         else:
             continue
-        if missing > 0:
+        if missing <= 0:
+            continue
+        if on_core:
             candidates.append((str(unit.id), missing))
+        else:
+            adjacent_reservations.append((str(unit.id), missing))
 
     reserved: set[str] = set()
     remaining = max(0, available_resources)
@@ -2906,6 +2923,13 @@ def _reserve_unit_heals(
         if cost > remaining:
             continue
         reserved.add(unit_id)
+        remaining -= cost
+    # Apply the adjacent-Core hold after the on-Core heals so a Unit already
+    # standing on the Core always wins the resource it needs this Tick; the
+    # adjacent Units only need it next Tick once they have stepped aboard.
+    for _unit_id, cost in adjacent_reservations:
+        if cost > remaining:
+            continue
         remaining -= cost
     return frozenset(reserved), remaining
 
@@ -3031,7 +3055,14 @@ def _control_vanguards(
         # A Vanguard at full HP (4) can absorb one more hit before dying; a 1-HP
         # Vanguard is dead after one more sweep. Regroup toward the Core when
         # critically damaged so a raider cannot one-shot our body-block.
-        if hp <= 1 and target is None:
+        #
+        # The earlier ``and target is None`` gate pinned a 1-HP Vanguard onto
+        # its guard cell (a Core-adjacent cell, never the Core cell itself) and
+        # so the heal precondition ``position == core_pos`` could never be met.
+        # Drop the gate: a 1-HP Vanguard always steps toward the Core first,
+        # ignoring its guard assignment for this one Tick, so the next Tick can
+        # heal instead of dying on the guard ring.
+        if hp <= 1 and vanguard.position != core_pos:
             step = _step_toward(
                 vanguard.position, core_pos,
                 (obstacles | enemy_positions | friendly_full) - {vanguard.position},
@@ -3498,6 +3529,29 @@ def _control_rangers(
         if should_heal:
             ranger.heal()
             continue
+        # 1-HP retreat-to-Core fallback (mirrors the Vanguard block at the
+        # equivalent control point). A Ranger at 1 HP is one hit from death;
+        # rebuilding costs 12 resources vs 1 to heal. The heal precondition is
+        # ``position == core_pos``, but the guard/chase/patrol logic below holds
+        # the Ranger on the Core-adjacent guard ring or a chase cell and never
+        # lets it step onto the Core cell. Insert the retreat BEFORE the guard
+        # branch so a critically wounded Ranger prioritises reaching the Core
+        # over holding the ring or chasing a target it cannot shoot this Tick.
+        if ranger.hp <= 1 and tuple(ranger.position) != core_pos:
+            enemy_positions_retreat = frozenset(
+                enemy.position for enemy in enemies
+            )
+            step = _step_toward(
+                ranger.position,
+                core_pos,
+                (obstacles | enemy_positions_retreat | friendly_full)
+                - {tuple(ranger.position)},
+                avoid=None,
+            )
+            if step is not None:
+                _record_pos(rid, ranger.position)
+                _queue_combat_move(ranger, step, reserved_destinations)
+            continue
         # The FIRST Ranger is the dedicated Core guard: hold a choke near the
         # Core with a clear cardinal line to the Core cell, preferring cells
         # that cover visible enemies too. 8th review: old ring-orbit guard
@@ -3803,12 +3857,12 @@ def _try_capital_sink(
         else UnitType.VANGUARD
     )
     expected_cost = unit_cost(unit_type, turn.state.population)
-    # 只做当前已审查的价格档实验（tier 3: V=22/R=26, tier 4: V=29/R=34）；
-    # 如果人口或 Manual 生产把价格推到下一档（tier 5+: V=37/R=45+），
-    # 停机等待重新审查，而不是默默扩大资本风险。
+    # Population crossing into a higher tier is normal fleet progression, not a
+    # permanently unsafe regime. A price outside the reviewed allow-list only
+    # skips this cycle; the next full streak naturally re-attempts at the new
+    # price. The receipt-side latch (CORE_SPAWN price_mismatch) still hard-stops
+    # a genuinely broken spawn, so the safety guarantee survives.
     if expected_cost not in CAPITAL_SINK_ALLOWED_COSTS[unit_type]:
-        _capital_sink_price_blocked = True
-        _resource_telemetry["capital_sink_price_blocked"] = 1
         return False
     cargo_total = sum(max(0, int(worker.cargo)) for worker in turn.workers)
     # tier 3 (V=22) 时 26 个 Worker 各带 1 = 26 >= 22，可直接回补；
