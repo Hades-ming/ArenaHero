@@ -1173,3 +1173,40 @@
   解读为资源收益已改善。
 - **可复用判断**：容量增加只证明“有空间”，不证明“有收入”。人口、生产事件和旧货搬运都不能替代
   新采集入核；任何资本消耗出口都要把权威成本、回本金额、完整链路和安全护栏绑定在同一观察窗口内。
+
+## L82 — guard step dist<2 遗漏 friendly_full 致 Core 格占据死锁
+
+- **基线**：t96292 最后一次正常 deposit（r230/230 满核），t96721 spawn 第 7 个 Ranger（R6→R7，
+  cost=58）后 r 降至 172/235。此后 t96722..t100147 连续 **3856 tick 零 deposit**，
+  27 个 loaded Worker 全部带货等待，Core 有 58 容量空置但无法存入。CELL_UNIT_LIMIT 累计 ~1772 次。
+- **根因（多方独立核验收敛）**：`_guard_step` 的 dist<2 分支（tactic.py:3471，原行号 3463）
+  调用 `_step_away_from(pos, core_pos, blocked, avoid=avoid)` 时 `blocked = obstacles|enemy_positions`
+  **不含 `friendly_full`**，而 dist 2-3 分支（line 3487+）和 chase/patrol 分支均已正确检查。
+  新 spawn 的 Ranger `03131272` 落在 Core 格 (339,121)，每 tick `_step_away_from` 选向 N 邻格
+  (339,120)——该格 2/2 friendly-full——服务端返回 CELL_UNIT_LIMIT → Ranger 永久卡在 Core 格 →
+  `core_colocated≥1` → deposit admission（tactic.py:2583）误触发拦截 laden Worker → 零 deposit。
+  admission 是二级放大器，非根因；guard step bug 不修，combat unit 仍物理占据 Core 格，仅修
+  admission 无法解除 deposit 通道阻断（Worker 仍踏不上 Core 格）。
+- **修复（commit 220b380，已 push）**：
+  1. tactic.py:3471 `blocked | friendly_full` —— 主路径选向时排除满格邻格。
+  2. tactic.py:3478-3491 fallback 循环 + `cnxt == core_pos: continue` 守卫 —— 当主路径 LOS
+     失败时遍历四方向找非满邻格，且永不退回 Core 格（审核员回归点补充）。
+  3. 3 个回归测试：dist<2 避满 / 全满 hold / dist-1 不退回 Core。证伪力已验证（撤修复→FAIL）。
+  4. 258 tests 全绿，零回归。
+- **CANARY 成功（live restart t100148）**：
+  - t100147（restart 前）：U03131272 plan=move:UP→CELL_UNIT_LIMIT，pos=339,121（Core 格），零 deposit。
+  - t100148（restart 后首 tick）：U03131272 plan=move:**RIGHT**，UNIT_MOVE_SUCCEEDED pos=340,121（移离 Core 格）。
+  - t100150：**首笔 DEPOSIT_SUCCEEDED**，actor=549ba4a3，pos=339,121，r 177→178。距 restart 仅 2 tick。
+  - t100151..t100279：连续 deposit，r 177→210（+33，~130 tick 内 33 笔 deposit）。
+  - U03131272 此后正常巡逻（pos 在 336-344 范围移动），不再回到 Core 格。
+  - CELL_UNIT_LIMIT 最后出现在 t100271，且主体是多个 Worker 的正常移动竞争（非 03131272 死锁循环）。
+- **教训（可复用判断）**：
+  1. **分支对称性检查**：同一函数的多个距离分支（dist<2 / dist 2-3 / chase / patrol）必须对
+     `friendly_full` 处理一致。任何分支遗漏会导致该距离段的 unit 卡死。新增分支时对照已有分支。
+  2. **admission 是放大器非根因**：deposit admission（2583）在 `core_colocated≥1` 时触发，但
+     `core_colocated≥1` 的根因是 combat unit 卡在 Core 格。修根因（guard step）→ `core_colocated=0`
+     → admission 不触发 → 死锁解除。admission 转潜伏态后续硬化，不在本次范围。
+  3. **commit→restart gap = 纯损失**：修复 t100000 前已就绪工作区，t100148 才 restart。3856 tick
+     死锁中大部分损失发生在此 gap。止血纪律：静态验收通过后立即 commit→restart，不留 gap。
+  4. **死锁诊断 vs 正常周期**：capital sink 正常 idle ~144 tick 是 ~500 tick 振荡的一部分；
+     零 deposit > 500 tick ×7 倍即排除"正常 sink idle"，判为结构性死锁。
