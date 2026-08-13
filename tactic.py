@@ -3460,11 +3460,35 @@ def _guard_step(
         # Adjacent to the Core: drift outward to a dist-2/3 cell that can
         # shoot the Core; in a corner the adjacent cell may be the only legal
         # spot, so hold it if nothing reachable has a line to the Core.
-        step = _step_away_from(pos, core_pos, blocked, avoid=avoid)
+        #
+        # The guard is most often here because it spawned ON the Core cell
+        # (Core + 1 unit = 2/2), which blocks every laden Worker from
+        # depositing. Step `_step_away_from` must skip friendly-full neighbors
+        # (CELL_UNIT_LIMIT = 2) or it picks a 2/2 neighbor, the server rejects
+        # the move, and the guard stays on the Core cell forever — a deposit
+        # deadlock. Merge `friendly_full` into the blocked set so the outward
+        # step only ever targets a cell with a free slot.
+        step = _step_away_from(pos, core_pos, blocked | friendly_full, avoid=avoid)
         if step is not None:
             nxt = (pos[0] + step.delta[0], pos[1] + step.delta[1])
             if _manhattan(nxt, core_pos) <= 3 and _can_shoot(nxt, core_pos, obstacles):
                 return step
+            # The outward step clears the Core cell but cannot shoot it
+            # (blocked LOS). Vacating still unblocks deposit, so accept any
+            # non-friendly-full neighbor before stalling on the Core cell.
+            for d in DIRECTIONS:
+                cnxt = (pos[0] + d.delta[0], pos[1] + d.delta[1])
+                if cnxt == core_pos:
+                    # Never fall back onto the Core cell itself — that is the
+                    # failure mode this fix exists to prevent (guard re-enters
+                    # Core, blocks deposit, next tick repeats dist<2). Hold at
+                    # dist-1 rather than move back to dist-0.
+                    continue
+                if cnxt in blocked or cnxt in friendly_full:
+                    continue
+                if avoid is not None and cnxt in avoid:
+                    continue
+                return d
         return None
     # At dist 2-3: score candidate cells.
     best_dir: Direction | None = None

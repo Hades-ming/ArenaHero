@@ -7092,3 +7092,189 @@ def test_adjacent_low_hp_unit_reservation_protects_heal_resources() -> None:
     # heal() would be illegal), but their heal costs (3 + 1 = 4) are held.
     assert heal_ids == frozenset()
     assert remaining == 0
+
+
+def test_guard_step_dist_lt_2_avoids_friendly_full() -> None:
+    # Regression for the Core-cell occupation deadlock (t96722+, 3300+ tick zero
+    # deposit). A guard Ranger spawned ON the Core cell (Core + guard = 2/2)
+    # must step off so laden Workers can deposit. Before the fix the dist<2
+    # branch of _guard_step called _step_away_from WITHOUT friendly_full, so it
+    # picked the North neighbor (UP, the first DIRECTIONS entry) even though
+    # that cell was already 2/2 friendly-full -> the server rejected the move
+    # with CELL_UNIT_LIMIT every tick and the guard stayed on the Core cell
+    # forever, blocking all deposits. The guard must instead pick a neighbor
+    # with a free slot (S/E/W here).
+    friendly_a = UUID(int=0x8001)
+    friendly_b = UUID(int=0x8002)
+    state = _state(
+        resources=5,
+        population=3,
+        objects=[
+            {
+                "kind": "CORE",
+                "id": str(CORE_ID),
+                "controlled": True,
+                "owner_username": "arena_hero",
+                "position": [0, 0],
+                "hp": 5,
+                "shield": 5,
+                "state": "NORMAL",
+            },
+            {
+                "kind": "UNIT",
+                "id": str(RANGER_ID),
+                "controlled": True,
+                "position": [0, 0],  # guard on the Core cell (dist 0 < 2)
+                "hp": 2,
+                "unit_type": "RANGER",
+                "cargo": None,
+            },
+            {
+                "kind": "UNIT",
+                "id": str(friendly_a),
+                "controlled": True,
+                "position": [0, -1],  # North neighbor, 2/2 friendly-full
+                "hp": 2,
+                "unit_type": "WORKER",
+                "cargo": 0,
+            },
+            {
+                "kind": "UNIT",
+                "id": str(friendly_b),
+                "controlled": True,
+                "position": [0, -1],
+                "hp": 2,
+                "unit_type": "WORKER",
+                "cargo": 0,
+            },
+        ],
+    )
+    turn = _turn(state)
+    decide(turn)
+    action = _action(turn.plan, RANGER_ID)
+    # The guard must MOVE off the Core cell (unblock the deposit lane).
+    assert action is not None
+    assert action.type == "MOVE"
+    # Its destination must NOT be the friendly-full North neighbor (0, -1).
+    ddx, ddy = action.direction.delta
+    assert action.direction != Direction.UP
+    nxt = (0 + ddx, 0 + ddy)
+    assert nxt != (0, -1)
+
+
+def test_guard_step_dist_lt_2_all_neighbors_full() -> None:
+    # Boundary case A from the H-eco-8 contract: when EVERY Core neighbor is
+    # friendly-full (2/2) there is no legal move off the Core cell — any step
+    # would be rejected by CELL_UNIT_LIMIT. The guard must NOT respond with a
+    # direction pointing back toward the Core cell (it is already on it), and
+    # must not fabricate a move into a full cell. Returning None (hold position)
+    # is the only correct outcome; this is not a deadlock the guard can break
+    # by moving, and it must not spam CELL_UNIT_LIMIT.
+    friendly_cells = [(0, -1), (0, 1), (1, 0), (-1, 0)]
+    objects = [
+        {
+            "kind": "CORE",
+            "id": str(CORE_ID),
+            "controlled": True,
+            "owner_username": "arena_hero",
+            "position": [0, 0],
+            "hp": 5,
+            "shield": 5,
+            "state": "NORMAL",
+        },
+        {
+            "kind": "UNIT",
+            "id": str(RANGER_ID),
+            "controlled": True,
+            "position": [0, 0],  # guard on the Core cell
+            "hp": 2,
+            "unit_type": "RANGER",
+            "cargo": None,
+        },
+    ]
+    uid = 0x9000
+    for cell in friendly_cells:
+        for _ in range(2):
+            objects.append(
+                {
+                    "kind": "UNIT",
+                    "id": str(UUID(int=uid)),
+                    "controlled": True,
+                    "position": list(cell),
+                    "hp": 2,
+                    "unit_type": "WORKER",
+                    "cargo": 0,
+                }
+            )
+            uid += 1
+    state = _state(resources=5, population=5, objects=objects)
+    turn = _turn(state)
+    decide(turn)
+    action = _action(turn.plan, RANGER_ID)
+    # No legal move exists; the guard holds position (no MOVE action emitted
+    # for the guard). It must not MOVE into any of the four full neighbors.
+    if action is not None:
+        ddx, ddy = action.direction.delta
+        nxt = (0 + ddx, 0 + ddy)
+        assert nxt not in friendly_cells
+
+
+def test_guard_step_dist_lt_2_fallback_never_reenters_core() -> None:
+    # Reviewer regression guard: when the guard is at dist-1 (not on the Core
+    # cell) and every dist-2 "away" neighbor is friendly-full, `_step_away_from`
+    # returns the only open cell — the Core cell itself (LEFT from (1,0) ->
+    # (0,0)). That step fails `_can_shoot` (dist 0 has no fire line), so the
+    # fallback loop runs. Without the `core_pos` guard the loop would move the
+    # Ranger back onto the Core cell — exactly the deposit-blocking failure
+    # mode this fix exists to prevent. The fallback must skip `core_pos` and
+    # hold at dist-1 instead.
+    objects = [
+        {
+            "kind": "CORE",
+            "id": str(CORE_ID),
+            "controlled": True,
+            "owner_username": "arena_hero",
+            "position": [0, 0],
+            "hp": 5,
+            "shield": 5,
+            "state": "NORMAL",
+        },
+        {
+            "kind": "UNIT",
+            "id": str(RANGER_ID),
+            "controlled": True,
+            "position": [1, 0],  # guard at dist-1, East of Core
+            "hp": 2,
+            "unit_type": "RANGER",
+            "cargo": None,
+        },
+    ]
+    # Fill all three dist-2 "away" neighbors so `_step_away_from`'s only open
+    # cell is the Core cell (0,0) — the reentry we must NOT take.
+    away_cells = [(2, 0), (1, -1), (1, 1)]
+    uid = 0x9000
+    for cell in away_cells:
+        for _ in range(2):
+            objects.append(
+                {
+                    "kind": "UNIT",
+                    "id": str(UUID(int=uid)),
+                    "controlled": True,
+                    "position": list(cell),
+                    "hp": 2,
+                    "unit_type": "WORKER",
+                    "cargo": 0,
+                }
+            )
+            uid += 1
+    state = _state(resources=5, population=5, objects=objects)
+    turn = _turn(state)
+    decide(turn)
+    action = _action(turn.plan, RANGER_ID)
+    # The guard must not reenter the Core cell (0,0). With every away cell
+    # full and the Core cell off-limits, there is no legal move — hold at
+    # dist-1 (no MOVE action) rather than step back onto the Core.
+    if action is not None:
+        ddx, ddy = action.direction.delta
+        nxt = (1 + ddx, 0 + ddy)
+        assert nxt != (0, 0)
