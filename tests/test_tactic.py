@@ -7278,3 +7278,159 @@ def test_guard_step_dist_lt_2_fallback_never_reenters_core() -> None:
         ddx, ddy = action.direction.delta
         nxt = (1 + ddx, 0 + ddy)
         assert nxt != (0, 0)
+
+
+def _vanguard_overflow_objects(extra_on_core_neighbors: list[tuple[int, int]]) -> tuple[dict, list]:
+    """Build a state mirroring the capital-sink overflow deadlock (CONTRACT-L87).
+
+    Twelve Vanguards fill the 12-cell guard pool (4 adjacent + 8 support) so the
+    thirteenth Vanguard — spawned ON the Core cell by ``core.spawn`` — gets
+    ``target=None`` from ``_vanguard_guard_targets`` and previously fell through
+    to ``continue`` (wait), pinning the Core cell and deadlocking deposit for
+    3122 ticks (game.log t101877–t104998). Returns the Core-object list and the
+    unit objects so each test can append neighbor-fill Workers.
+    """
+    objects = [
+        {
+            "kind": "CORE",
+            "id": str(CORE_ID),
+            "controlled": True,
+            "owner_username": "arena_hero",
+            "position": [0, 0],
+            "hp": 5,
+            "shield": 5,
+            "state": "NORMAL",
+        },
+        # The overflow Vanguard, spawned on the Core cell (Core + Vanguard = 2/2).
+        {
+            "kind": "UNIT",
+            "id": str(VANGUARD_ID),
+            "controlled": True,
+            "position": [0, 0],
+            "hp": 4,
+            "unit_type": "VANGUARD",
+            "cargo": None,
+        },
+    ]
+    # 12 more Vanguards at a distance fill the guard pool to capacity.
+    for i in range(12):
+        objects.append(
+            {
+                "kind": "UNIT",
+                "id": str(UUID(int=0x8000 + i)),
+                "controlled": True,
+                "position": [10 + i, 10],
+                "hp": 4,
+                "unit_type": "VANGUARD",
+                "cargo": None,
+            }
+        )
+    uid = 0x9000
+    for cell in extra_on_core_neighbors:
+        for _ in range(2):
+            objects.append(
+                {
+                    "kind": "UNIT",
+                    "id": str(UUID(int=uid)),
+                    "controlled": True,
+                    "position": list(cell),
+                    "hp": 2,
+                    "unit_type": "WORKER",
+                    "cargo": 0,
+                }
+            )
+            uid += 1
+    population = 14 + len(extra_on_core_neighbors) * 2
+    return _state(resources=5, population=population, objects=objects), objects
+
+
+def test_vanguard_on_core_cell_steps_away_avoids_friendly_full() -> None:
+    # Regression for CONTRACT-L87 (capital-sink spawn-on-Core deadlock,
+    # game.log t101877–t104998, 3122-tick zero deposit). An overflow Vanguard
+    # (pool of 12 already filled) spawned ON the Core cell gets ``target=None``
+    # and previously fell through to ``continue`` (wait), pinning the Core cell.
+    # Before the fix the dist=0 branch did not exist, so the Vanguard waited
+    # forever. With one North neighbor friendly-full (2/2) and S/E/W open, the
+    # Vanguard must step to a NON-full neighbor (unblock the deposit lane) and
+    # never pick the full North cell.
+    state, _ = _vanguard_overflow_objects([(0, -1)])  # North neighbor 2/2 full
+    turn = _turn(state)
+    decide(turn)
+    action = _action(turn.plan, VANGUARD_ID)
+    assert action is not None
+    assert action.type == "MOVE"
+    ddx, ddy = action.direction.delta
+    nxt = (0 + ddx, 0 + ddy)
+    # Must vacate the Core cell and must NOT enter the friendly-full North cell.
+    assert nxt != (0, 0)
+    assert nxt != (0, -1)
+
+
+def test_vanguard_on_core_cell_all_neighbors_full_waits() -> None:
+    # Boundary case for CONTRACT-L87: when EVERY Core neighbor is friendly-full
+    # (2/2) there is no legal step off the Core cell — any move would be
+    # rejected by CELL_UNIT_LIMIT. The Vanguard must hold (no MOVE into a full
+    # cell) rather than spam rejected moves, preserving the existing fallback.
+    state, _ = _vanguard_overflow_objects(
+        [(0, -1), (0, 1), (1, 0), (-1, 0)]  # all four Core neighbors 2/2 full
+    )
+    turn = _turn(state)
+    decide(turn)
+    action = _action(turn.plan, VANGUARD_ID)
+    # No legal move exists; the Vanguard holds position and must not MOVE into
+    # any of the four full neighbors.
+    full_neighbors = {(0, -1), (0, 1), (1, 0), (-1, 0)}
+    if action is not None:
+        assert action.type == "MOVE"
+        ddx, ddy = action.direction.delta
+        nxt = (0 + ddx, 0 + ddy)
+        assert nxt not in full_neighbors
+
+
+def test_vanguard_on_core_cell_with_target_still_exits_first() -> None:
+    # Non-regression for CONTRACT-L88: when ``_vanguard_guard_targets`` DOES
+    # assign the Core-cell Vanguard a guard target (a dist-2 support cell), the
+    # dist=0 exit branch must still fire and step the Vanguard OFF the Core cell
+    # without breaking the move-off behavior. Note: this test does NOT
+    # independently prove the exit branch's necessity — a single Vanguard with a
+    # real target also moves off the Core cell via the existing target/A*
+    # fallback path. The decisive regression that proves the exit branch is
+    # necessary is ``test_vanguard_on_core_cell_steps_away_avoids_friendly_full``
+    # (which FAILS without the branch). This test guards against the exit branch
+    # accidentally suppressing the move when a target IS assigned.
+    state = _state(
+        resources=0,
+        population=2,
+        objects=[
+            {
+                "kind": "CORE",
+                "id": str(CORE_ID),
+                "controlled": True,
+                "owner_username": "arena_hero",
+                "position": [0, 0],
+                "hp": 5,
+                "shield": 5,
+                "state": "NORMAL",
+            },
+            {
+                "kind": "UNIT",
+                "id": str(VANGUARD_ID),
+                "controlled": True,
+                "position": [0, 0],  # on the Core cell, full HP, no enemy
+                "hp": 4,
+                "unit_type": "VANGUARD",
+                "cargo": None,
+            },
+        ],
+    )
+    turn = _turn(state)
+    # A guard target IS assigned here (single Vanguard, open pool).
+    assert tactic._vanguard_guard_targets(turn, (0, 0)).get(str(VANGUARD_ID)) is not None
+    decide(turn)
+    action = _action(turn.plan, VANGUARD_ID)
+    # The exit branch must still move the Vanguard OFF the Core cell first.
+    assert action is not None
+    assert action.type == "MOVE"
+    ddx, ddy = action.direction.delta
+    nxt = (0 + ddx, 0 + ddy)
+    assert nxt != (0, 0)

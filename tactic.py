@@ -3091,6 +3091,30 @@ def _control_vanguards(
             if step is not None:
                 _queue_combat_move(vanguard, step, reserved_destinations)
             continue
+        # A Vanguard that landed ON the Core cell (capital sink ``core.spawn``
+        # deposits the new unit there, Core + Vanguard = 2/2) blocks laden
+        # Workers from depositing. With no enemy to sweep and full HP, every
+        # downstream path below either leaves it on the Core cell or assigns a
+        # guard target the Core cell itself cannot path out of (A* blocked set
+        # includes ``core_pos``). Mirror the Ranger ``_guard_step`` dist<2 fix
+        # (commit 220b380): step off the Core cell toward a neighbor with a free
+        # slot, merging ``friendly_full`` so we never pick a 2/2 neighbor and
+        # re-deadlock. Only triggers at full-ish HP; the hp<=1 regroup above
+        # already routes critically damaged Vanguards onto the heal path first.
+        if vanguard.position == core_pos and hp > 1:
+            blocked = (
+                obstacles | enemy_positions | friendly_full | {core_pos}
+            ) - {tuple(vanguard.position)}
+            step = _step_away_from(
+                vanguard.position,
+                core_pos,
+                blocked,
+                avoid=_avoid_set(str(vanguard.id)),
+            )
+            if step is not None and _queue_combat_move(
+                vanguard, step, reserved_destinations
+            ):
+                continue
         if target is None or target == vanguard.position:
             continue
         blocked = (
