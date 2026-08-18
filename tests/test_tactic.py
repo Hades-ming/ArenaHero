@@ -5962,6 +5962,80 @@ def test_empty_worker_fallback_never_steps_into_core(monkeypatch) -> None:
     assert _action(turn.plan, WORKER_ID) is None
 
 
+def test_empty_worker_on_core_friendly_full_neighbor_exits_not_into_full(
+    monkeypatch,
+) -> None:
+    # Regression for CONTRACT-L2801: an EMPTY Worker that just deposited and
+    # now sits on the Core cell must not step into a friendly-full (2/2) Core
+    # neighbor when every upstream path (A* / greedy / explore sweep) yields no
+    # step and control falls through to the empty-worker fallback. Game.log
+    # t121611-121622 showed Worker e1bd6d pinned on the Core cell for 11 ticks:
+    # the North neighbor (Core's UP) was held 2/2 by two friendly combat units,
+    # but ``empty_fallback_blocked`` omitted ``friendly_full``, so
+    # ``_step_away_from`` picked UP (max Manhattan gain, unmarked) and the SDK
+    # rejected every move with CELL_UNIT_LIMIT. With LEFT/SOUTH/EAST open, the
+    # fallback must steer the Worker to a NON-full neighbor.
+    objects: list[dict[str, Any]] = [
+        {
+            "kind": "CORE",
+            "id": str(CORE_ID),
+            "controlled": True,
+            "owner_username": "arena_hero",
+            "position": [0, 0],
+            "hp": 5,
+            "shield": 5,
+            "state": "NORMAL",
+        },
+        {
+            "kind": "UNIT",
+            "id": str(WORKER_ID),
+            "controlled": True,
+            "position": [0, 0],  # empty Worker parked ON the Core cell
+            "hp": 2,
+            "unit_type": "WORKER",
+            "cargo": 0,
+        },
+    ]
+    # Two friendly combat units share the North neighbor (0,-1) -> 2/2 full,
+    # exactly the live t121610-121622 O[]@339,120 condition (translated to the
+    # test origin). LEFT (-1,0), SOUTH (0,1), EAST (1,0) stay open.
+    for slot in range(2):
+        objects.append(
+            {
+                "kind": "UNIT",
+                "id": str(UUID(int=0x6100 + slot)),
+                "controlled": True,
+                "position": [0, -1],
+                "hp": 4,
+                "unit_type": "VANGUARD",
+                "cargo": None,
+            }
+        )
+    state = _state(resources=0, population=3, objects=objects)
+    turn = _turn(state)
+    # Force every upstream empty-Worker path to yield nothing so control lands
+    # in the L2801 fallback — the only branch whose blocked set omitted
+    # ``friendly_full`` before the fix.
+    monkeypatch.setattr(
+        tactic,
+        "_astar_step_result",
+        lambda *args, **kwargs: (None, False),
+    )
+    monkeypatch.setattr(tactic, "_explore_step", lambda *args, **kwargs: None)
+
+    decide(turn)
+
+    action = _action(turn.plan, WORKER_ID)
+    # A legal off-Core step exists (three open neighbors); the fallback must
+    # take one and must NOT pick the friendly-full North cell.
+    assert action is not None
+    assert action.type == "MOVE"
+    ddx, ddy = action.direction.delta
+    nxt = (0 + ddx, 0 + ddy)
+    assert nxt != (0, 0)  # vacate the Core cell
+    assert nxt != (0, -1)  # never into the 2/2 friendly-full North neighbor
+
+
 def test_laden_worker_backs_off_when_ring_would_wall_in_core() -> None:
     # User suggestion: when the Core cell is occupied, keep at least one
     # adjacent slot open so the occupant can always leave. Here the Core cell

@@ -2798,7 +2798,14 @@ def _control_workers(turn: "Turn", core_pos: tuple[int, int]) -> None:
             # (12,215)/(12,216)/(13,216) for 20+ ticks). Force a step toward any
             # open adjacent cell, but keep the Core cell blocked for an empty
             # Worker. Only a laden Worker may enter the Core to deposit.
-            empty_fallback_blocked = reserved_away | {core_pos}
+            # CONTRACT-L2801: merge ``friendly_full`` so the fallback never picks
+            # a 2/2 neighbor. Mirrors L82 (Ranger) / L88 (Vanguard): an empty
+            # Worker depositing then sitting on the Core cell repeatedly stepped
+            # UP into a friendly-full (2/2 combat-unit) neighbor, hit
+            # CELL_UNIT_LIMIT, and stayed pinned for 11 ticks (game.log
+            # t121611-121622). ``friendly_full`` is in scope (defined above from
+            # ``turn.units``) and already gates the laden/empty A* blocked sets.
+            empty_fallback_blocked = reserved_away | friendly_full | {core_pos}
             step = _step_away_from(pos, core_pos, empty_fallback_blocked, avoid=None)
             if step is None:
                 step = _step_toward(pos, core_pos, empty_fallback_blocked, avoid=None)
