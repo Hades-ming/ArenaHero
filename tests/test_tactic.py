@@ -4368,6 +4368,94 @@ def test_capital_sink_requires_authoritative_success_and_repayment_chain() -> No
     assert tactic._capital_sink_repaid == 0
 
 
+def test_capital_sink_unlocks_on_full_core_during_cooldown() -> None:
+    """CONTRACT-SINK-ESCAPE: 满核 + 冷却期 + rep<cost → 满核逃脱分支解锁冷却。
+
+    复现死锁态：冷却中（waiting_repay=True，production_tick 已设）但
+    repaid < pending_cost 且无 chain_workers（正常三元合取不满足），
+    同时 Core 满核（r >= cap）。满核逃脱分支应强制解锁并执行完整重置。
+    """
+    # 驱动 capital-sink 触发 + 确认 spawn 成功进入冷却态。
+    for tick in range(500, 514):
+        decide(_turn(_full_w26_state(), tick=tick))
+    confirmed_turn = _turn(_full_w26_state(), tick=514)
+    decide(confirmed_turn)
+    assert tactic._capital_sink_pending_tick == 514
+
+    new_vanguard_id = UUID(int=0x3000 + 4)
+    success = {
+        "event_id": str(UUID(int=0xA010)),
+        "event_type": "CORE_SPAWN_SUCCEEDED",
+        "tick": 514,
+        "target_id": str(new_vanguard_id),
+        "values": {"cost": 22},
+    }
+    cooldown_turn = _turn(
+        _full_w26_state(resources=148, n_vanguards=5, events=[success]),
+        tick=515,
+    )
+    decide(cooldown_turn)
+    assert tactic._capital_sink_waiting_repay is True
+    assert tactic._capital_sink_production_tick == 514
+    assert tactic._capital_sink_pending_cost == 22
+
+    # 模拟死锁态：spawn 消费后 Core 曾降至 148，冷却期间 Core 重新涨满（满核时
+    # deposit amount=0，DEPOSIT_SUCCEEDED 不触发，repaid 停滞）。此时满核
+    # （resources=175 == cap for pop 26+5+4=35），repaid 仍差 1，chain_workers
+    # 为空 —— 正常解锁路径不可达，只能靠满核逃脱分支。
+    tactic._capital_sink_repaid = 21
+    tactic._capital_sink_chain_workers.clear()
+    full_core_turn = _turn(
+        _full_w26_state(resources=175, n_vanguards=5),
+        tick=516,
+    )
+    decide(full_core_turn)
+
+    assert tactic._capital_sink_waiting_repay is False
+    assert tactic._capital_sink_repaid == 0
+    assert tactic._capital_sink_pending_cost is None
+    assert tactic._capital_sink_production_tick is None
+    assert tactic._capital_sink_chain_workers == set()
+
+
+def test_capital_sink_remains_locked_when_not_full_core() -> None:
+    """CONTRACT-SINK-ESCAPE 对照：非满核 + rep<cost + 无 chain → 冷却不解锁。
+
+    证明满核逃脱分支是必要条件，而非无条件解锁。
+    """
+    for tick in range(600, 614):
+        decide(_turn(_full_w26_state(), tick=tick))
+    decide(_turn(_full_w26_state(), tick=614))
+    assert tactic._capital_sink_pending_tick == 614
+
+    new_vanguard_id = UUID(int=0x3000 + 4)
+    success = {
+        "event_id": str(UUID(int=0xA020)),
+        "event_type": "CORE_SPAWN_SUCCEEDED",
+        "tick": 614,
+        "target_id": str(new_vanguard_id),
+        "values": {"cost": 22},
+    }
+    cooldown_turn = _turn(
+        _full_w26_state(resources=148, n_vanguards=5, events=[success]),
+        tick=615,
+    )
+    decide(cooldown_turn)
+    assert tactic._capital_sink_waiting_repay is True
+
+    # 非满核：resources=174 < cap=175（pop 26+5+4=35）。repaid 差 1，无 chain。
+    tactic._capital_sink_repaid = 21
+    tactic._capital_sink_chain_workers.clear()
+    partial_turn = _turn(
+        _full_w26_state(resources=174, n_vanguards=5),
+        tick=616,
+    )
+    decide(partial_turn)
+
+    assert tactic._capital_sink_waiting_repay is True
+    assert tactic._capital_sink_repaid == 21
+
+
 def test_capital_sink_spawns_at_tier5_without_permanent_price_block() -> None:
     """tier 5 (pop40, V=37/R=45) 在扩展后的 allow-list 内，应触发 SPAWN 而非永久锁死。"""
     # W26 + V9 + R5 = population 40, Vanguard price is 37 (tier 5), now inside

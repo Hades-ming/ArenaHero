@@ -4677,10 +4677,20 @@ def _process_events(turn: "Turn") -> None:
                 _capital_sink_repaid += max(0, amount)
                 if actor_id is not None and actor_id in _capital_sink_harvest_workers:
                     _capital_sink_chain_workers.add(actor_id)
+        # CONTRACT-SINK-ESCAPE: capital-sink 冷却的 chicken-and-egg 死锁逃脱。
+        # 满核时（r >= cap）deposit amount=0，不触发 DEPOSIT_SUCCEEDED，
+        # _capital_sink_repaid 永不递增，冷却永不解锁 → capital sink 永久关闭
+        # → Core 永满零吞吐（tactic 内部无内生逃脱路径，实测死锁 1057 tick 仅
+        # 人类 rcv[MANUAL] spawn 可破）。满核逃脱分支强制解锁冷却，使同 tick
+        # L4204 _try_capital_sink 重新触发 spawn 降 r 释放容量（自限性：r 降到
+        # cap 以下后 L3907 门控自然关闭，无 spawn 风暴）。与 L3907 满核判定同口径。
         if (
             _capital_sink_pending_cost is not None
-            and _capital_sink_repaid >= _capital_sink_pending_cost
-            and _capital_sink_chain_workers
+            and (
+                (_capital_sink_repaid >= _capital_sink_pending_cost
+                 and _capital_sink_chain_workers)
+                or turn.resources >= turn.resource_capacity
+            )
         ):
             _capital_sink_waiting_repay = False
             _capital_sink_production_tick = None
